@@ -126,15 +126,12 @@ async function onVoiceAuthComplete(mfccFeatures) {
         const result = await Api.verifyVoice(authUsername, mfccFeatures);
 
         if (result.authenticated) {
-            // ✅ Voice passed
             showSuccess("Speech Biometrics", result.confidence);
         } else {
-            // ❌ Voice failed — move to security question
             recordFailedAttempt();
-            status.textContent = 
+            status.textContent =
                 `❌ Voice failed (confidence: ${(result.confidence * 100).toFixed(1)}%)`;
             status.className = "text-center text-sm mb-4 text-red-400";
-
             setTimeout(() => moveToSecurityAuth(), 1500);
         }
 

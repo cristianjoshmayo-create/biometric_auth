@@ -66,81 +66,79 @@ const SpeechCapture = {
     },
 
     async processAudio(audioBlob) {
-        const status = document.getElementById("voice-status");
-        status.textContent = "⚙️ Processing audio...";
+    const status = document.getElementById("voice-status");
+    status.textContent = "⚙️ Processing audio...";
 
-        // ✅ Detect format from actual mime type
-        const mimeType = audioBlob.type || "audio/webm";
-        let format = "webm"; // default
+    const mimeType = audioBlob.type || "audio/webm";
+    let format = "webm";
+    if (mimeType.includes("webm")) format = "webm";
+    else if (mimeType.includes("ogg")) format = "ogg";
+    else if (mimeType.includes("mp4")) format = "mp4";
+    else if (mimeType.includes("wav")) format = "wav";
 
-        if (mimeType.includes("webm")) format = "webm";
-        else if (mimeType.includes("ogg")) format = "ogg";
-        else if (mimeType.includes("mp4")) format = "mp4";
-        else if (mimeType.includes("wav")) format = "wav";
+    console.log("Audio format:", format, "Size:", audioBlob.size);
 
-        console.log("Sending format:", format);
+    const base64Audio = await this.blobToBase64(audioBlob);
 
-        const base64Audio = await this.blobToBase64(audioBlob);
+    try {
+        // Step 1 — Always extract MFCC first via enroll endpoint
+        const mfccResponse = await fetch(
+            "http://127.0.0.1:8000/api/enroll/extract-mfcc", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                audio_data: base64Audio,
+                audio_format: format,
+                username: typeof authUsername !== 'undefined'
+                          ? authUsername
+                          : typeof currentUsername !== 'undefined'
+                          ? currentUsername
+                          : ""
+            })
+        });
 
-        try {
-            const response = await fetch("http://127.0.0.1:8000/api/enroll/extract-mfcc", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ 
-                    audio_data: base64Audio,
-                    audio_format: format,       // ✅ send format to backend
-                    username: currentUsername 
-                })
-            });
+        const mfccResult = await mfccResponse.json();
+        console.log("MFCC result:", mfccResult);
 
-            const result = await response.json();
-            console.log("MFCC result:", result);
-
-            if (result.success) {
-                status.textContent = `✅ Recording processed!`;
-
-                // Check which page we're on
-                if (typeof onVoiceAuthComplete === 'function') {
-                    // Login page — verify voice
-                    onVoiceAuthComplete(result.mfcc_features);
-                } else if (typeof onVoiceRecorded === 'function') {
-                    // Enrollment page — save voice
-                    onVoiceRecorded(result.mfcc_features);
-                    this.currentAttempt++;
-
-                    const btn = document.getElementById("record-btn");
-                    if (this.currentAttempt <= this.maxAttempts) {
-                        btn.textContent = `🎤 Record Again (${this.currentAttempt}/${this.maxAttempts})`;
-                        btn.disabled = false;
-                        btn.onclick = startRecording;
-                    } else {
-                        btn.disabled = true;
-                        btn.textContent = "✅ All recordings done";
-                        btn.classList.replace("bg-red-600", "bg-gray-600");
-                    }
-                }
-                this.currentAttempt++;
-
-                const btn = document.getElementById("record-btn");
-                if (this.currentAttempt <= this.maxAttempts) {
-                    btn.textContent = `🎤 Record Again (${this.currentAttempt}/${this.maxAttempts})`;
-                    btn.disabled = false;
-                    btn.onclick = startRecording;
-                } else {
-                    btn.disabled = true;
-                    btn.textContent = "✅ All recordings done";
-                    btn.classList.replace("bg-red-600", "bg-gray-600");
-                }
-            } else {
-                status.textContent = "❌ Failed: " + (result.detail || "Try again");
-                console.error("Server error:", result.detail);
-            }
-
-        } catch (err) {
-            console.error("Fetch error:", err);
-            status.textContent = "❌ Could not connect to server.";
+        if (!mfccResult.success) {
+            status.textContent = "❌ Failed: " + (mfccResult.detail || "Try again");
+            return;
         }
-    },
+
+        const mfccFeatures = mfccResult.mfcc_features;
+
+        // Step 2 — Detect which page we're on and call correct function
+        if (typeof onVoiceAuthComplete === 'function') {
+            // ── LOGIN PAGE ──
+            // MFCC extracted, now verify against stored template
+            status.textContent = "⏳ Verifying voice...";
+            onVoiceAuthComplete(mfccFeatures);
+
+        } else if (typeof onVoiceRecorded === 'function') {
+            // ── ENROLLMENT PAGE ──
+            // MFCC extracted, save it
+            status.textContent = `✅ Recording ${this.currentAttempt} processed!`;
+            onVoiceRecorded(mfccFeatures);
+            this.currentAttempt++;
+
+            const btn = document.getElementById("record-btn");
+            if (this.currentAttempt <= this.maxAttempts) {
+                btn.textContent =
+                    `🎤 Record Again (${this.currentAttempt}/${this.maxAttempts})`;
+                btn.disabled = false;
+                btn.onclick = startRecording;
+            } else {
+                btn.disabled = true;
+                btn.textContent = "✅ All recordings done";
+                btn.classList.replace("bg-red-600", "bg-gray-600");
+            }
+        }
+
+    } catch (err) {
+        console.error("Audio processing error:", err);
+        status.textContent = "❌ Could not connect to server.";
+    }
+},
 
     blobToBase64(blob) {
         return new Promise((resolve, reject) => {

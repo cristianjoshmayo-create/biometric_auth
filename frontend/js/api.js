@@ -52,13 +52,16 @@ const Api = {
     },
 
     async verifyVoice(username, mfccFeatures) {
-        const res = await fetch(`${API_BASE}/auth/voice`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username, mfcc_features: mfccFeatures })
-        });
-        return res.json();
-    },
+    const res = await fetch(`${API_BASE}/auth/voice`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+            username, 
+            mfcc_features: mfccFeatures 
+        })
+    });
+    return res.json();
+},
 
     async getSecurityQuestion(username) {
         const res = await fetch(`${API_BASE}/auth/security-question/${username}`);
