@@ -37,7 +37,6 @@ async function submitKeystrokeAuth() {
     const input = document.getElementById("keystroke-input");
     const status = document.getElementById("keystroke-status");
 
-    // Validate phrase
     if (!KeystrokeCapture.validatePhrase(input.value)) {
         status.textContent = "❌ Phrase doesn't match. Type exactly as shown.";
         status.className = "text-center text-sm mb-4 text-red-400";
@@ -48,7 +47,7 @@ async function submitKeystrokeAuth() {
     }
 
     const features = KeystrokeCapture.extractFeatures();
-    if (!features || features.totalKeys < 5) {
+    if (!features) {
         status.textContent = "❌ Not enough data. Try again.";
         return;
     }
@@ -57,17 +56,15 @@ async function submitKeystrokeAuth() {
     status.className = "text-center text-sm mb-4 text-yellow-400";
 
     try {
+        // Send ALL features to backend for RF model
         const result = await Api.verifyKeystroke(authUsername, features);
 
         if (result.authenticated) {
-            // ✅ Keystroke passed
             showSuccess("Keystroke Dynamics", result.confidence);
         } else {
-            // ❌ Keystroke failed — move to voice
             recordFailedAttempt();
             status.textContent = `❌ Keystroke failed (confidence: ${(result.confidence * 100).toFixed(1)}%)`;
             status.className = "text-center text-sm mb-4 text-red-400";
-
             setTimeout(() => moveToVoiceAuth(), 1500);
         }
 
@@ -77,7 +74,6 @@ async function submitKeystrokeAuth() {
         status.className = "text-center text-sm mb-4 text-red-400";
     }
 }
-
 // ── Step 2: Voice Auth ────────────────────────────────────
 function moveToVoiceAuth() {
     document.getElementById("keystroke-section").classList.add("hidden");

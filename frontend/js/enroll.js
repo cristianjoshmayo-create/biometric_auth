@@ -84,25 +84,60 @@ async function saveKeystrokeEnrollment() {
     const status = document.getElementById("keystroke-status");
     status.textContent = "💾 Saving keystroke profile...";
 
-    // Average features across 3 attempts
-    const avgDwell = averageArrays(keystrokeAttempts.map(a => a.dwellTimes));
-    const avgFlight = averageArrays(keystrokeAttempts.map(a => a.flightTimes));
-    const avgSpeed = keystrokeAttempts.reduce((s, a) => s + a.typingSpeed, 0)
-                     / keystrokeAttempts.length;
+    // Average all features across 3 attempts
+    const avgFeature = (key) =>
+        keystrokeAttempts.reduce((s, a) => s + (a[key] || 0), 0) / keystrokeAttempts.length;
+
+    const avgDwell = averageArrays(keystrokeAttempts.map(a => a.dwell_times));
+    const avgFlight = averageArrays(keystrokeAttempts.map(a => a.flight_times));
 
     try {
-        // First create the user
         await Api.enrollUser(currentUsername);
 
-        // Then save keystroke template
         const result = await Api.enrollKeystroke(currentUsername, {
             dwell_times: avgDwell,
             flight_times: avgFlight,
-            typing_speed: avgSpeed
+            typing_speed: avgFeature('typing_speed'),
+            
+            // All 40+ features
+            dwell_mean: avgFeature('dwell_mean'),
+            dwell_std: avgFeature('dwell_std'),
+            dwell_median: avgFeature('dwell_median'),
+            dwell_min: avgFeature('dwell_min'),
+            dwell_max: avgFeature('dwell_max'),
+            flight_mean: avgFeature('flight_mean'),
+            flight_std: avgFeature('flight_std'),
+            flight_median: avgFeature('flight_median'),
+            p2p_mean: avgFeature('p2p_mean'),
+            p2p_std: avgFeature('p2p_std'),
+            r2r_mean: avgFeature('r2r_mean'),
+            r2r_std: avgFeature('r2r_std'),
+            digraph_th: avgFeature('digraph_th'),
+            digraph_he: avgFeature('digraph_he'),
+            digraph_in: avgFeature('digraph_in'),
+            digraph_er: avgFeature('digraph_er'),
+            digraph_an: avgFeature('digraph_an'),
+            digraph_ed: avgFeature('digraph_ed'),
+            digraph_to: avgFeature('digraph_to'),
+            digraph_it: avgFeature('digraph_it'),
+            typing_speed_cpm: avgFeature('typing_speed_cpm'),
+            typing_duration: avgFeature('typing_duration'),
+            rhythm_mean: avgFeature('rhythm_mean'),
+            rhythm_std: avgFeature('rhythm_std'),
+            rhythm_cv: avgFeature('rhythm_cv'),
+            pause_count: avgFeature('pause_count'),
+            pause_mean: avgFeature('pause_mean'),
+            backspace_ratio: avgFeature('backspace_ratio'),
+            backspace_count: avgFeature('backspace_count'),
+            hand_alternation_ratio: avgFeature('hand_alternation_ratio'),
+            same_hand_sequence_mean: avgFeature('same_hand_sequence_mean'),
+            finger_transition_ratio: avgFeature('finger_transition_ratio'),
+            seek_time_mean: avgFeature('seek_time_mean'),
+            seek_time_count: avgFeature('seek_time_count')
         });
 
         if (result.success) {
-            status.textContent = "✅ Keystroke profile saved!";
+            status.textContent = "✅ Keystroke profile saved with 40+ features!";
             setTimeout(() => moveToVoiceEnrollment(), 1000);
         } else {
             status.textContent = "❌ Error: " + (result.detail || "Unknown error");

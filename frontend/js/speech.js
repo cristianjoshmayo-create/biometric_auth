@@ -1,4 +1,5 @@
 // frontend/js/speech.js
+// Voice recording with REAL-TIME Voice Activity Detection
 
 const SpeechCapture = {
     mediaRecorder: null,
@@ -6,6 +7,19 @@ const SpeechCapture = {
     isRecording: false,
     currentAttempt: 1,
     maxAttempts: 3,
+    
+    // VAD parameters
+    audioContext: null,
+    analyser: null,
+    microphone: null,
+    javascriptNode: null,
+    silenceStart: null,
+    voiced: false,
+    
+    // Thresholds
+    VOICE_THRESHOLD: 0.02,      // RMS threshold for voice detection
+    SILENCE_DURATION: 1000,      // 1 second of silence = stop recording
+    MIN_VOICE_DURATION: 1500,    // Need at least 1.5 seconds of voice
 
     async startRecording() {
         try {
@@ -13,132 +27,244 @@ const SpeechCapture = {
                 audio: {
                     channelCount: 1,
                     echoCancellation: true,
-                    noiseSuppression: true
+                    noiseSuppression: true,
+                    autoGainControl: true  // Normalize volume
                 }
             });
 
-            this.audioChunks = [];
-            this.mediaRecorder = new MediaRecorder(stream);
-            this.isRecording = true;
+            // Set up audio analysis
+            this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            this.analyser = this.audioContext.createAnalyser();
+            this.microphone = this.audioContext.createMediaStreamSource(stream);
+            this.javascriptNode = this.audioContext.createScriptProcessor(2048, 1, 1);
 
-            this.mediaRecorder.ondataavailable = (event) => {
-                if (event.data.size > 0) {
-                    this.audioChunks.push(event.data);
+            this.analyser.smoothingTimeConstant = 0.3;
+            this.analyser.fftSize = 1024;
+
+            this.microphone.connect(this.analyser);
+            this.analyser.connect(this.javascriptNode);
+            this.javascriptNode.connect(this.audioContext.destination);
+
+            // Real-time audio level monitoring
+            const self = this;
+            let voiceDetectedTime = null;
+            
+            this.javascriptNode.onaudioprocess = function() {
+                const array = new Uint8Array(self.analyser.frequencyBinCount);
+                self.analyser.getByteFrequencyData(array);
+                
+                // Calculate RMS (volume level)
+                let sum = 0;
+                for (let i = 0; i < array.length; i++) {
+                    sum += array[i] * array[i];
+                }
+                const rms = Math.sqrt(sum / array.length) / 255;
+
+                // Update status indicator
+                self.updateVolumeIndicator(rms);
+
+                // Voice activity detection
+                if (rms > self.VOICE_THRESHOLD) {
+                    // Voice detected
+                    if (!self.voiced) {
+                        console.log("🎤 Voice detected, starting recording...");
+                        self.voiced = true;
+                        voiceDetectedTime = Date.now();
+                        
+                        // Start actual MediaRecorder
+                        if (!self.isRecording) {
+                            self.startActualRecording(stream);
+                        }
+                    }
+                    self.silenceStart = null;
+                    
+                } else {
+                    // Silence detected
+                    if (self.voiced) {
+                        if (self.silenceStart === null) {
+                            self.silenceStart = Date.now();
+                        } else {
+                            const silenceDuration = Date.now() - self.silenceStart;
+                            
+                            // Stop if silence too long
+                            if (silenceDuration > self.SILENCE_DURATION) {
+                                const voiceDuration = self.silenceStart - voiceDetectedTime;
+                                
+                                if (voiceDuration >= self.MIN_VOICE_DURATION) {
+                                    console.log(`✅ Voice recording complete (${voiceDuration}ms)`);
+                                    self.stopRecording();
+                                } else {
+                                    console.log(`⚠️ Voice too short (${voiceDuration}ms), continuing...`);
+                                    self.silenceStart = null;
+                                }
+                            }
+                        }
+                    }
                 }
             };
-
-            this.mediaRecorder.onstop = () => {
-                // ✅ Use actual mime type browser recorded with
-                const mimeType = this.mediaRecorder.mimeType || 'audio/webm';
-                const audioBlob = new Blob(this.audioChunks, { type: mimeType });
-
-                console.log("Recorded mime type:", mimeType);
-                console.log("Audio blob size:", audioBlob.size, "bytes");
-
-                this.processAudio(audioBlob);
-                stream.getTracks().forEach(track => track.stop());
-            };
-
-            this.mediaRecorder.start();
-
-            // Auto-stop after 4 seconds
-            setTimeout(() => {
-                if (this.isRecording) {
-                    this.stopRecording();
-                }
-            }, 4000);
 
             return true;
 
         } catch (err) {
             console.error("Microphone error:", err);
             document.getElementById("voice-status").textContent = 
-                "❌ Microphone access denied. Please allow microphone and try again.";
+                "❌ Microphone access denied. Please allow microphone.";
             return false;
         }
+    },
+
+    startActualRecording(stream) {
+        this.audioChunks = [];
+        this.mediaRecorder = new MediaRecorder(stream);
+        this.isRecording = true;
+
+        this.mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+                this.audioChunks.push(event.data);
+            }
+        };
+
+        this.mediaRecorder.onstop = () => {
+            const mimeType = this.mediaRecorder.mimeType || 'audio/webm';
+            const audioBlob = new Blob(this.audioChunks, { type: mimeType });
+            
+            console.log("Recording mime type:", mimeType);
+            console.log("Audio blob size:", audioBlob.size);
+            
+            this.processAudio(audioBlob);
+
+            // Clean up
+            stream.getTracks().forEach(track => track.stop());
+            if (this.audioContext) {
+                this.audioContext.close();
+            }
+        };
+
+        this.mediaRecorder.start();
+        
+        // Safety timeout (max 10 seconds)
+        setTimeout(() => {
+            if (this.isRecording) {
+                console.log("⏱️ Max duration reached, stopping...");
+                this.stopRecording();
+            }
+        }, 10000);
     },
 
     stopRecording() {
         if (this.mediaRecorder && this.isRecording) {
             this.mediaRecorder.stop();
             this.isRecording = false;
+            this.voiced = false;
+            
+            if (this.javascriptNode) {
+                this.javascriptNode.disconnect();
+            }
+            if (this.analyser) {
+                this.analyser.disconnect();
+            }
+            if (this.microphone) {
+                this.microphone.disconnect();
+            }
+        }
+    },
+
+    updateVolumeIndicator(level) {
+        // Visual feedback for user
+        const indicator = document.getElementById("recording-indicator");
+        if (!indicator) return;
+
+        if (level > this.VOICE_THRESHOLD) {
+            // Voice detected - show green
+            indicator.style.backgroundColor = '#10b981';
+            indicator.classList.remove('animate-pulse');
+        } else {
+            // Silence - show red pulsing
+            indicator.style.backgroundColor = '#ef4444';
+            indicator.classList.add('animate-pulse');
         }
     },
 
     async processAudio(audioBlob) {
-    const status = document.getElementById("voice-status");
-    status.textContent = "⚙️ Processing audio...";
+        const status = document.getElementById("voice-status");
+        status.textContent = "⚙️ Processing audio...";
 
-    const mimeType = audioBlob.type || "audio/webm";
-    let format = "webm";
-    if (mimeType.includes("webm")) format = "webm";
-    else if (mimeType.includes("ogg")) format = "ogg";
-    else if (mimeType.includes("mp4")) format = "mp4";
-    else if (mimeType.includes("wav")) format = "wav";
+        const mimeType = audioBlob.type || "audio/webm";
+        let format = "webm";
+        if (mimeType.includes("webm")) format = "webm";
+        else if (mimeType.includes("ogg")) format = "ogg";
+        else if (mimeType.includes("mp4")) format = "mp4";
+        else if (mimeType.includes("wav")) format = "wav";
 
-    console.log("Audio format:", format, "Size:", audioBlob.size);
+        console.log("Sending format:", format, "Size:", audioBlob.size);
 
-    const base64Audio = await this.blobToBase64(audioBlob);
+        const base64Audio = await this.blobToBase64(audioBlob);
 
-    try {
-        // Step 1 — Always extract MFCC first via enroll endpoint
-        const mfccResponse = await fetch(
-            "http://127.0.0.1:8000/api/enroll/extract-mfcc", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                audio_data: base64Audio,
-                audio_format: format,
-                username: typeof authUsername !== 'undefined'
-                          ? authUsername
-                          : typeof currentUsername !== 'undefined'
-                          ? currentUsername
-                          : ""
-            })
-        });
+        try {
+            // Extract MFCC from backend
+            const response = await fetch(
+                "http://127.0.0.1:8000/api/enroll/extract-mfcc", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    audio_data: base64Audio,
+                    audio_format: format,
+                    username: typeof authUsername !== 'undefined'
+                              ? authUsername
+                              : typeof currentUsername !== 'undefined'
+                              ? currentUsername
+                              : ""
+                })
+            });
 
-        const mfccResult = await mfccResponse.json();
-        console.log("MFCC result:", mfccResult);
+            const result = await response.json();
+            console.log("MFCC result:", result);
 
-        if (!mfccResult.success) {
-            status.textContent = "❌ Failed: " + (mfccResult.detail || "Try again");
-            return;
-        }
-
-        const mfccFeatures = mfccResult.mfcc_features;
-
-        // Step 2 — Detect which page we're on and call correct function
-        if (typeof onVoiceAuthComplete === 'function') {
-            // ── LOGIN PAGE ──
-            // MFCC extracted, now verify against stored template
-            status.textContent = "⏳ Verifying voice...";
-            onVoiceAuthComplete(mfccFeatures);
-
-        } else if (typeof onVoiceRecorded === 'function') {
-            // ── ENROLLMENT PAGE ──
-            // MFCC extracted, save it
-            status.textContent = `✅ Recording ${this.currentAttempt} processed!`;
-            onVoiceRecorded(mfccFeatures);
-            this.currentAttempt++;
-
-            const btn = document.getElementById("record-btn");
-            if (this.currentAttempt <= this.maxAttempts) {
-                btn.textContent =
-                    `🎤 Record Again (${this.currentAttempt}/${this.maxAttempts})`;
+            if (!result.success) {
+                status.textContent = "❌ " + (result.detail || "Try again");
+                status.className = "text-center text-sm mb-4 text-red-400";
+                
+                // Reset button for retry
+                const btn = document.getElementById("record-btn");
                 btn.disabled = false;
-                btn.onclick = startRecording;
-            } else {
-                btn.disabled = true;
-                btn.textContent = "✅ All recordings done";
-                btn.classList.replace("bg-red-600", "bg-gray-600");
+                btn.textContent = "🎤 Try Again";
+                return;
             }
-        }
 
-    } catch (err) {
-        console.error("Audio processing error:", err);
-        status.textContent = "❌ Could not connect to server.";
-    }
-},
+            const mfccFeatures = result.mfcc_features;
+
+            // Detect which page and call appropriate function
+            if (typeof onVoiceAuthComplete === 'function') {
+                // LOGIN PAGE
+                status.textContent = "⏳ Verifying voice...";
+                onVoiceAuthComplete(mfccFeatures);
+
+            } else if (typeof onVoiceRecorded === 'function') {
+                // ENROLLMENT PAGE
+                status.textContent = `✅ Recording ${this.currentAttempt} processed!`;
+                status.className = "text-center text-sm mb-4 text-green-400";
+                onVoiceRecorded(mfccFeatures);
+                this.currentAttempt++;
+
+                const btn = document.getElementById("record-btn");
+                if (this.currentAttempt <= this.maxAttempts) {
+                    btn.textContent = 
+                        `🎤 Record Again (${this.currentAttempt}/${this.maxAttempts})`;
+                    btn.disabled = false;
+                    btn.onclick = startRecording;
+                } else {
+                    btn.disabled = true;
+                    btn.textContent = "✅ All recordings done";
+                    btn.classList.replace("bg-red-600", "bg-gray-600");
+                }
+            }
+
+        } catch (err) {
+            console.error("Audio processing error:", err);
+            status.textContent = "❌ Could not connect to server.";
+            status.className = "text-center text-sm mb-4 text-red-400";
+        }
+    },
 
     blobToBase64(blob) {
         return new Promise((resolve, reject) => {
@@ -157,34 +283,29 @@ const SpeechCapture = {
         this.isRecording = false;
         this.currentAttempt = 1;
         this.mediaRecorder = null;
+        this.voiced = false;
+        this.silenceStart = null;
+        
+        if (this.audioContext) {
+            this.audioContext.close();
+            this.audioContext = null;
+        }
     }
 };
 
-// Global function called by the HTML button
+// Global function called by HTML button
 function startRecording() {
     const btn = document.getElementById("record-btn");
     const indicator = document.getElementById("recording-indicator");
     const status = document.getElementById("voice-status");
 
-    if (SpeechCapture.isRecording) {
-        SpeechCapture.stopRecording();
-        btn.textContent = "🎤 Start Recording";
-        indicator.classList.add("hidden");
-        return;
-    }
-
-    btn.textContent = "⏹ Stop Recording";
-    btn.classList.replace("bg-red-600", "bg-red-800");
+    btn.disabled = true;
+    btn.textContent = "🎤 Listening for voice...";
+    btn.classList.replace("bg-red-600", "bg-yellow-600");
     indicator.classList.remove("hidden");
-    status.textContent = "🔴 Recording... (4 seconds)";
+    indicator.style.backgroundColor = '#ef4444';
+    status.textContent = "🎤 Speak now - recording will start when voice detected";
+    status.className = "text-center text-sm mb-4 text-yellow-400";
 
-    SpeechCapture.startRecording().then(started => {
-        if (started) {
-            setTimeout(() => {
-                btn.textContent = "🎤 Start Recording";
-                btn.classList.replace("bg-red-800", "bg-red-600");
-                indicator.classList.add("hidden");
-            }, 4200);
-        }
-    });
+    SpeechCapture.startRecording();
 }
