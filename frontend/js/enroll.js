@@ -1,37 +1,11 @@
 // frontend/js/enroll.js
-// Controls the enrollment flow across all 3 steps
-//
-// FIXES APPLIED:
-//
-//  KEYSTROKE BUG 1 — saveKeystrokeEnrollment() averaged all 3 attempts into ONE
-//                    DB row → training saw "Enrollment attempts: 1" → model had
-//                    no real profile to learn from.
-//                    FIX: submitKeystroke() now POSTs each attempt immediately
-//                    (same pattern as the fixed voice enrollment below).
-//
-//  KEYSTROKE BUG 2 — saveKeystrokeEnrollment() sent 6 WRONG digraphs:
-//                    digraph_in, digraph_er, digraph_an, digraph_ed, digraph_to, digraph_it
-//                    None appear in "biometric voice keystroke authentication" → always 0.
-//                    FIX: all 27 correct phrase digraphs now sent per attempt.
-//
-//  KEYSTROKE BUG 3 — shift_lag_mean/std/count and 7 normalized ratio features
-//                    were never sent at all during enrollment.
-//                    FIX: all included in each per-attempt POST.
-//
-//  VOICE BUG 1 — onVoiceRecorded() collected all 3 into an array and averaged
-//                them into ONE row at the end → DB always had 1 row.
-//                FIX: POSTs each attempt to /enroll/voice immediately.
-//
-//  VOICE BUG 2 — Api.enrollVoice() was only sending mfcc_features (13 values).
-//                FIX: full 34-feature dict sent per attempt.
 
 let currentUsername = "";
+let currentPassword = "";  // ← ADDED
 
-// Keystroke — POST each attempt immediately
 let currentKeystrokeAttempt = 1;
 const KEYSTROKE_TARGET = 3;
 
-// Voice — track server-confirmed count
 let voiceAttemptsSaved = 0;
 const VOICE_TARGET = 3;
 
@@ -47,13 +21,64 @@ function startEnrollment() {
 
     document.getElementById("username-section").classList.add("hidden");
     document.getElementById("step-indicator").classList.remove("hidden");
+    document.getElementById("password-section").classList.remove("hidden");  // ← UPDATED
+
+    document.getElementById("step1-dot").querySelector("div")
+        .classList.replace("bg-gray-700", "bg-purple-600");
+}
+
+// ── Step 1: Password Enrollment ← ADDED ──────────────────────────────────
+async function submitPassword() {
+    const password = document.getElementById("password-input").value;
+    const confirm  = document.getElementById("password-confirm").value;
+    const status   = document.getElementById("password-status");
+
+    if (password.length < 8) {
+        status.textContent = "❌ Password must be at least 8 characters.";
+        status.className   = "text-center text-sm mb-4 text-red-400";
+        return;
+    }
+    if (password !== confirm) {
+        status.textContent = "❌ Passwords do not match.";
+        status.className   = "text-center text-sm mb-4 text-red-400";
+        return;
+    }
+
+    status.textContent = "⏳ Saving...";
+    status.className   = "text-center text-sm mb-4 text-yellow-400";
+
+    try {
+        const result = await Api.enrollUser(currentUsername, password);  // ← UPDATED
+
+        if (result.success) {
+            currentPassword = password;
+            status.textContent = "✅ Account created!";
+            status.className   = "text-center text-sm mb-4 text-green-400";
+            setTimeout(() => moveToKeystrokeEnrollment(), 800);
+        } else {
+            status.textContent = "❌ " + (result.detail || "Failed.");
+            status.className   = "text-center text-sm mb-4 text-red-400";
+        }
+    } catch (err) {
+        status.textContent = "❌ Network error.";
+        status.className   = "text-center text-sm mb-4 text-red-400";
+        console.error("Password enroll error:", err);
+    }
+}
+
+// ── Step 2: Keystroke Enrollment ──────────────────────────────────────────
+function moveToKeystrokeEnrollment() {  // ← ADDED (was previously inline in startEnrollment)
+    document.getElementById("password-section").classList.add("hidden");
     document.getElementById("keystroke-section").classList.remove("hidden");
+
+    document.getElementById("step2-dot").querySelector("div")
+        .classList.replace("bg-gray-700", "bg-purple-600");
+    document.getElementById("progress-line").style.width = "100%";
 
     KeystrokeCapture.attach("keystroke-input");
     document.getElementById("keystroke-status").textContent = "Start typing when ready";
 }
 
-// ── Step 1: Keystroke Enrollment ──────────────────────────────────────────
 async function submitKeystroke() {
     const input  = document.getElementById("keystroke-input");
     const status = document.getElementById("keystroke-status");
@@ -78,17 +103,10 @@ async function submitKeystroke() {
     status.className = "text-center text-sm mb-4 text-yellow-400";
 
     try {
-        if (currentKeystrokeAttempt === 1) {
-            await Api.enrollUser(currentUsername);
-        }
-
-        // FIX: POST immediately with all correct features.
-        // OLD: collected all 3, averaged, posted ONE row with 6 wrong digraphs.
         const result = await Api.enrollKeystroke(currentUsername, {
             dwell_times:  features.dwell_times,
             flight_times: features.flight_times,
             typing_speed: features.typing_speed,
-
             dwell_mean:    features.dwell_mean,
             dwell_std:     features.dwell_std,
             dwell_median:  features.dwell_median,
@@ -101,8 +119,6 @@ async function submitKeystroke() {
             p2p_std:       features.p2p_std,
             r2r_mean:      features.r2r_mean,
             r2r_std:       features.r2r_std,
-
-            // FIX: 27 correct phrase digraphs (was 6 wrong ones)
             digraph_th: features.digraph_th || 0,
             digraph_he: features.digraph_he || 0,
             digraph_bi: features.digraph_bi || 0,
@@ -130,7 +146,6 @@ async function submitKeystroke() {
             digraph_ca: features.digraph_ca || 0,
             digraph_at: features.digraph_at || 0,
             digraph_on: features.digraph_on || 0,
-
             typing_speed_cpm:        features.typing_speed_cpm,
             typing_duration:         features.typing_duration,
             rhythm_mean:             features.rhythm_mean,
@@ -145,8 +160,6 @@ async function submitKeystroke() {
             finger_transition_ratio: features.finger_transition_ratio,
             seek_time_mean:          features.seek_time_mean,
             seek_time_count:         features.seek_time_count,
-
-            // FIX: shift-lag + normalized features (were never sent before)
             shift_lag_mean:   features.shift_lag_mean   || 0,
             shift_lag_std:    features.shift_lag_std    || 0,
             shift_lag_count:  features.shift_lag_count  || 0,
@@ -197,22 +210,18 @@ async function submitKeystroke() {
     }
 }
 
-// ── Step 2: Voice Enrollment ──────────────────────────────────────────────
+// ── Step 3: Voice Enrollment ──────────────────────────────────────────────
 function moveToVoiceEnrollment() {
     document.getElementById("keystroke-section").classList.add("hidden");
     document.getElementById("voice-section").classList.remove("hidden");
 
-    document.getElementById("step2-dot").querySelector("div")
+    document.getElementById("step3-dot").querySelector("div")
         .classList.replace("bg-gray-700", "bg-purple-600");
-    document.getElementById("progress-line").style.width = "100%";
+    document.getElementById("progress-line2").style.width = "100%";
 
     updateVoiceAttemptUI(0);
 }
 
-// Called by speech.js after EACH recording completes.
-// FIX: OLD signature was onVoiceRecorded(mfccFeatures) — a plain 13-element array.
-//      All 3 were collected locally then averaged into ONE row at the end.
-//      NEW: receives fullFeatureDict (34 features), POSTs immediately each time.
 async function onVoiceRecorded(fullFeatureDict) {
     const status = document.getElementById("voice-status");
 
@@ -283,14 +292,14 @@ function updateVoiceAttemptUI(count) {
     }
 }
 
-// ── Step 3: Security Question ─────────────────────────────────────────────
+// ── Step 4: Security Question ─────────────────────────────────────────────
 function moveToSecurityQuestion() {
     document.getElementById("voice-section").classList.add("hidden");
     document.getElementById("security-section").classList.remove("hidden");
 
-    document.getElementById("step3-dot").querySelector("div")
+    document.getElementById("step4-dot").querySelector("div")
         .classList.replace("bg-gray-700", "bg-purple-600");
-    document.getElementById("progress-line2").style.width = "100%";
+    document.getElementById("progress-line3").style.width = "100%";
 }
 
 async function submitSecurityQuestion() {
@@ -316,7 +325,6 @@ async function submitSecurityQuestion() {
     }
 }
 
-// ── Helper: average multiple arrays (kept for any other uses) ─────────────
 function averageArrays(arrays) {
     if (!arrays || arrays.length === 0) return [];
     const minLen = Math.min(...arrays.map(a => a.length));

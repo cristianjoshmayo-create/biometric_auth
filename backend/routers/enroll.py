@@ -4,12 +4,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List, Optional
+from sqlalchemy import func
 import hashlib
 import base64
 import numpy as np
 import librosa
 import tempfile
 import os
+import bcrypt  # ← ADDED
 
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion
@@ -22,6 +24,7 @@ router = APIRouter()
 
 class UserCreate(BaseModel):
     username: str
+    password: str  # ← ADDED
 
 class KeystrokeEnroll(BaseModel):
     username: str
@@ -119,10 +122,9 @@ class AudioData(BaseModel):
     username:     Optional[str] = None
 
 
-# NEW: used by POST /re-enroll/clear
 class ClearEnrollPayload(BaseModel):
     username: str
-    confirm:  str  # must be "yes-delete"
+    confirm:  str
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -134,7 +136,17 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.username == payload.username).first()
     if existing:
         return {"success": True, "message": "User already exists", "user_id": existing.id}
-    new_user = User(username=payload.username)
+
+    # ← ADDED: validate and hash password
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    hashed = bcrypt.hashpw(
+        payload.password.encode('utf-8'),
+        bcrypt.gensalt()
+    ).decode('utf-8')
+
+    new_user = User(username=payload.username, password_hash=hashed)  # ← UPDATED
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
@@ -151,9 +163,15 @@ def enroll_keystroke(payload: KeystrokeEnroll, db: Session = Depends(get_db)):
         KeystrokeTemplate.user_id == user.id
     ).count()
 
+    max_order = db.query(func.max(KeystrokeTemplate.sample_order)).filter(
+        KeystrokeTemplate.user_id == user.id
+    ).scalar() or 0
+
     template = KeystrokeTemplate(
         user_id        = user.id,
         attempt_number = existing_count + 1,
+        source         = "enrollment",
+        sample_order   = max_order + 1,
         dwell_times    = payload.dwell_times,
         flight_times   = payload.flight_times,
         typing_speed   = payload.typing_speed,

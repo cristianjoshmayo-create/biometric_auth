@@ -1,16 +1,14 @@
-// frontend/js/api.js
-
 const API_BASE = "http://127.0.0.1:8000/api";
 
 const Api = {
 
     // ── Enrollment ────────────────────────────────────────────────────────
 
-    async enrollUser(username) {
+    async enrollUser(username, password) {  // ← UPDATED: added password param
         const res = await fetch(`${API_BASE}/enroll/user`, {
             method:  "POST",
             headers: { "Content-Type": "application/json" },
-            body:    JSON.stringify({ username })
+            body:    JSON.stringify({ username, password })  // ← UPDATED
         });
         return res.json();
     },
@@ -20,15 +18,6 @@ const Api = {
             method:  "POST",
             headers: { "Content-Type": "application/json" },
             body:    JSON.stringify({ username, ...features })
-        });
-        return res.json();
-    },
-
-    async enrollKeystroke(username, features) {
-        const res = await fetch(`${API_BASE}/enroll/keystroke`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username, ...features })
         });
         return res.json();
     },
@@ -63,8 +52,18 @@ const Api = {
         return res.json();
     },
 
-    // ── Authentication ────────────────────────────────────
-     async verifyKeystroke(username, features) {
+    // ── Authentication ────────────────────────────────────────────────────
+
+    async verifyPassword(username, password) {  // ← ADDED
+        const res = await fetch(`${API_BASE}/auth/password`, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({ username, password })
+        });
+        return res.json();
+    },
+
+    async verifyKeystroke(username, features) {
         const res = await fetch(`${API_BASE}/auth/keystroke`, {
             method:  "POST",
             headers: { "Content-Type": "application/json" },

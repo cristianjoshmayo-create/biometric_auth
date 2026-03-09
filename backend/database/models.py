@@ -12,10 +12,11 @@ from database.db import Base
 class User(Base):
     __tablename__ = "users"
 
-    id         = Column(Integer, primary_key=True, index=True)
-    username   = Column(String(100), unique=True, nullable=False)
-    is_flagged = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=func.now())
+    id            = Column(Integer, primary_key=True, index=True)
+    username      = Column(String(100), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=True)  # ← ADD THIS
+    is_flagged    = Column(Boolean, default=False)
+    created_at    = Column(DateTime, default=func.now())
 
     keystroke_template = relationship("KeystrokeTemplate", back_populates="user")
     voice_template     = relationship("VoiceTemplate",     back_populates="user")

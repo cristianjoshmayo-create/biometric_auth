@@ -2,35 +2,39 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import func  # ← ADD THIS
+from sqlalchemy import func
 from pydantic import BaseModel
 from typing import List, Optional
 import numpy as np
 import hashlib
 import pickle
 import os
-import sys           # ← ADD THIS
-import subprocess    # ← ADD THIS
+import sys
+import subprocess
+import bcrypt  # ← ADDED
 
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion, AuthLog
 
 router = APIRouter()
 
-# ─── Configuration ────────────────────────────────────────
-MAX_SAMPLES = 50  # Rolling window size for adaptive learning
+MAX_SAMPLES = 50
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SCHEMAS
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ← ADDED
+class PasswordAuth(BaseModel):
+    username: str
+    password: str
+
 
 class KeystrokeAuth(BaseModel):
     username: str
     dwell_times:  List[float]
     flight_times: List[float]
     typing_speed: float = 0
-
-    # Core timing
     dwell_mean:    float = 0
     dwell_std:     float = 0
     dwell_median:  float = 0
@@ -43,11 +47,6 @@ class KeystrokeAuth(BaseModel):
     p2p_std:       float = 0
     r2r_mean:      float = 0
     r2r_std:       float = 0
-
-    # FIX: correct digraphs from "biometric voice keystroke authentication"
-    # OLD had: digraph_in, digraph_er, digraph_an, digraph_ed, digraph_to, digraph_it
-    # None of these appear in the phrase so they were always 0 at auth time,
-    # causing a feature vector mismatch with the trained model every single login.
     digraph_th: float = 0
     digraph_he: float = 0
     digraph_bi: float = 0
@@ -75,8 +74,6 @@ class KeystrokeAuth(BaseModel):
     digraph_ca: float = 0
     digraph_at: float = 0
     digraph_on: float = 0
-
-    # Behavioral
     typing_speed_cpm:        float = 0
     typing_duration:         float = 0
     rhythm_mean:             float = 0
@@ -91,9 +88,6 @@ class KeystrokeAuth(BaseModel):
     finger_transition_ratio: float = 0
     seek_time_mean:          float = 0
     seek_time_count:         float = 0
-
-    # FIX: entirely missing from old schema — RF model trained on these features,
-    # sending 0 for all of them degraded every prediction.
     shift_lag_mean:   float = 0
     shift_lag_std:    float = 0
     shift_lag_count:  float = 0
@@ -106,9 +100,6 @@ class KeystrokeAuth(BaseModel):
     shift_lag_norm:   float = 0
 
 
-# FIX: old VoiceAuth only had mfcc_features (13 values).
-# The trained model uses 34 features — the missing 21 were always 0
-# at auth time, which is why every voice was accepted.
 class VoiceAuth(BaseModel):
     username:      str
     mfcc_features: List[float]
@@ -174,6 +165,47 @@ def log_attempt(db, user_id, method, confidence, result):
     )
     db.add(log)
     db.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PASSWORD AUTH  ← ADDED
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/password")
+def verify_password(payload: PasswordAuth, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == payload.username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.is_flagged:
+        raise HTTPException(status_code=403, detail="Account flagged")
+    if not user.password_hash:
+        raise HTTPException(status_code=400, detail="No password set for this user")
+
+    authenticated = bcrypt.checkpw(
+        payload.password.encode('utf-8'),
+        user.password_hash.encode('utf-8')
+    )
+
+    print(f"[password] '{payload.username}' → {'PASS' if authenticated else 'FAIL'}")
+
+    log_attempt(db, user.id, "password",
+                1.0 if authenticated else 0.0,
+                "granted" if authenticated else "denied")
+
+    if not authenticated:
+        total_denials = db.query(AuthLog).filter(
+            AuthLog.user_id == user.id,
+            AuthLog.auth_method == "password",
+            AuthLog.result == "denied"
+        ).count()
+        if total_denials >= 5:
+            user.is_flagged = True
+            db.commit()
+
+    return {
+        "authenticated": bool(authenticated),
+        "confidence":    1.0 if authenticated else 0.0
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

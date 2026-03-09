@@ -1,12 +1,6 @@
 // frontend/js/auth_flow.js
-// Controls the progressive authentication flow (Design 3)
-//
-// FIX: onVoiceAuthComplete(mfccFeatures) was passing a plain 13-element array
-//      to Api.verifyVoice(). The backend VoiceAuth schema now requires all 34
-//      features. speech.js now calls onVoiceAuthComplete(fullFeatureDict),
-//      and this file forwards that full object to Api.verifyVoice().
 
-let authUsername = "";
+let authUsername   = "";
 let failedAttempts = 0;
 const MAX_ATTEMPTS = 3;
 
@@ -22,19 +16,63 @@ function startLogin() {
 
     document.getElementById("username-section").classList.add("hidden");
     document.getElementById("step-indicator").classList.remove("hidden");
-    document.getElementById("keystroke-section").classList.remove("hidden");
+    document.getElementById("password-section").classList.remove("hidden");  // ← UPDATED
     document.getElementById("attempts-indicator").classList.remove("hidden");
+
+    document.getElementById("dot-password")
+        .classList.replace("bg-gray-700", "bg-purple-600");  // ← UPDATED
+}
+
+// ── Step 1: Password Auth ← ADDED ────────────────────────
+async function submitPasswordAuth() {
+    const password = document.getElementById("password-input").value;
+    const status   = document.getElementById("password-status");
+
+    if (!password) {
+        status.textContent = "Please enter your password.";
+        status.className   = "text-center text-sm mb-4 text-red-400";
+        return;
+    }
+
+    status.textContent = "⏳ Verifying password...";
+    status.className   = "text-center text-sm mb-4 text-yellow-400";
+
+    try {
+        const result = await Api.verifyPassword(authUsername, password);
+
+        if (result.authenticated) {
+            status.textContent = "✅ Password verified!";
+            status.className   = "text-center text-sm mb-4 text-green-400";
+            setTimeout(() => moveToKeystrokeAuth(), 800);
+        } else {
+            recordFailedAttempt();
+            status.textContent = "❌ Incorrect password.";
+            status.className   = "text-center text-sm mb-4 text-red-400";
+
+            if (failedAttempts >= MAX_ATTEMPTS) {
+                setTimeout(() => moveToSecurityAuth(), 1500);
+            }
+        }
+    } catch (err) {
+        console.error(err);
+        status.textContent = "❌ Server error. Try again.";
+        status.className   = "text-center text-sm mb-4 text-red-400";
+    }
+}
+
+// ── Step 2: Keystroke Auth ────────────────────────────────
+function moveToKeystrokeAuth() {  // ← ADDED
+    document.getElementById("password-section").classList.add("hidden");
+    document.getElementById("keystroke-section").classList.remove("hidden");
 
     document.getElementById("dot-keystroke")
         .classList.replace("bg-gray-700", "bg-purple-600");
+    document.getElementById("line-1").style.width = "100%";
 
     KeystrokeCapture.attach("keystroke-input");
-
-    document.getElementById("keystroke-status").textContent =
-        "Start typing when ready";
+    document.getElementById("keystroke-status").textContent = "Start typing when ready";
 }
 
-// ── Step 1: Keystroke Auth ────────────────────────────────
 async function submitKeystrokeAuth() {
     const input  = document.getElementById("keystroke-input");
     const status = document.getElementById("keystroke-status");
@@ -78,14 +116,14 @@ async function submitKeystrokeAuth() {
     }
 }
 
-// ── Step 2: Voice Auth ────────────────────────────────────
+// ── Step 3: Voice Auth ────────────────────────────────────
 function moveToVoiceAuth() {
     document.getElementById("keystroke-section").classList.add("hidden");
     document.getElementById("voice-section").classList.remove("hidden");
 
     document.getElementById("dot-voice")
         .classList.replace("bg-gray-700", "bg-purple-600");
-    document.getElementById("line-1").style.width = "100%";
+    document.getElementById("line-2").style.width = "100%";
 }
 
 function startVoiceAuth() {
@@ -116,18 +154,12 @@ function startVoiceAuth() {
     });
 }
 
-// FIX: old signature was onVoiceAuthComplete(mfccFeatures) — plain 13-element array.
-//      speech.js now calls this with fullFeatureDict (all 34 features).
-//      Api.verifyVoice() and auth.py VoiceAuth schema both updated to match.
 async function onVoiceAuthComplete(fullFeatureDict) {
     const status = document.getElementById("voice-status");
     status.textContent = "⏳ Verifying voice pattern...";
     status.className = "text-center text-sm mb-4 text-yellow-400";
 
     try {
-        // FIX: was Api.verifyVoice(authUsername, mfccFeatures)
-        //      → only sent 13 MFCC values, model saw 21 zeroes → accepted everyone.
-        // NOW: passes the full 34-feature dict from speech.js.
         const result = await Api.verifyVoice(authUsername, fullFeatureDict);
 
         if (result.authenticated) {
@@ -147,14 +179,14 @@ async function onVoiceAuthComplete(fullFeatureDict) {
     }
 }
 
-// ── Step 3: Security Question Auth ───────────────────────
+// ── Step 4: Security Question Auth ───────────────────────
 async function moveToSecurityAuth() {
     document.getElementById("voice-section").classList.add("hidden");
     document.getElementById("security-section").classList.remove("hidden");
 
     document.getElementById("dot-security")
         .classList.replace("bg-gray-700", "bg-purple-600");
-    document.getElementById("line-2").style.width = "100%";
+    document.getElementById("line-3").style.width = "100%";  // ← UPDATED
 
     try {
         const result = await Api.getSecurityQuestion(authUsername);
@@ -222,9 +254,9 @@ function showDenied() {
 
 function hideAllSections() {
     const sections = [
-        "username-section", "keystroke-section",
-        "voice-section", "security-section",
-        "success-section", "denied-section"
+        "username-section", "password-section",   // ← UPDATED
+        "keystroke-section", "voice-section",
+        "security-section", "success-section", "denied-section"
     ];
     sections.forEach(id => {
         document.getElementById(id).classList.add("hidden");
@@ -242,13 +274,15 @@ function resetLogin() {
         if (dot) dot.classList.replace("bg-red-500", "bg-gray-700");
     });
 
-    ["dot-keystroke", "dot-voice", "dot-security"].forEach(id => {
-        document.getElementById(id)
-            .classList.replace("bg-purple-600", "bg-gray-700");
+    ["dot-password", "dot-keystroke",               // ← UPDATED
+     "dot-voice", "dot-security"].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.replace("bg-purple-600", "bg-gray-700");
     });
 
     document.getElementById("line-1").style.width = "0%";
     document.getElementById("line-2").style.width = "0%";
+    document.getElementById("line-3").style.width = "0%";  // ← ADDED
 
     hideAllSections();
     document.getElementById("username-section").classList.remove("hidden");
