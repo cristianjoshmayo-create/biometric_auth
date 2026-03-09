@@ -2,17 +2,21 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import func  # ← ADD THIS
 from pydantic import BaseModel
 from typing import List, Optional
 import numpy as np
 import hashlib
 import pickle
 import os
+import sys           # ← ADD THIS
+import subprocess    # ← ADD THIS
 
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion, AuthLog
 
-router = APIRouter()
+# ─── Configuration ────────────────────────────────────────
+MAX_SAMPLES = 50  # Rolling window size for adaptive learning
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SCHEMAS
@@ -190,26 +194,18 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             with open(model_path, 'rb') as f:
                 model_data = pickle.load(f)
 
-            # FIX: old code used model_data['model'], model_data['scaler'],
-            # and model_data['genuine_features'] — none of these keys exist.
-            # train_keystroke_rf.py saves: 'pipeline', 'feature_names', 'profile_mean'.
-            # The KeyError silently fell through to confidence=0.5 → always denied.
-            pipeline     = model_data['pipeline']      # was: model_data['model']
+            pipeline     = model_data['pipeline']
             feat_names   = model_data['feature_names']
-            profile_mean = model_data['profile_mean']  # was: model_data['genuine_features']
-            threshold    = model_data['threshold']     # use saved EER threshold
+            profile_mean = model_data['profile_mean']
+            threshold    = model_data['threshold']
 
-            # Build feature vector in the exact order the model was trained on
             vec = np.array([
                 float(getattr(payload, name, 0.0) or 0.0)
                 for name in feat_names
             ]).reshape(1, -1)
 
-            # Pipeline includes the scaler — no separate scaler.transform() needed
             rf_score = float(pipeline.predict_proba(vec)[0][1])
 
-            # Mahalanobis proximity to enrolled profile
-            # (replaces cosine similarity which was always ~0.95 → inflated every score)
             profile_std = model_data.get('profile_std', None)
             if profile_std is not None and len(profile_std) == len(profile_mean):
                 safe_std  = np.where(profile_std < 1e-6, 1e-6, profile_std)
@@ -220,10 +216,8 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                 scale     = np.linalg.norm(profile_mean) + 1e-9
                 mah_score = float(max(0, 1 - diff / scale))
 
-            # Fused: 65% RF + 35% proximity
             confidence = 0.65 * rf_score + 0.35 * mah_score
 
-            # Adaptive threshold based on login history
             login_count = db.query(AuthLog).filter(
                 AuthLog.user_id == user.id,
                 AuthLog.result == "granted",
@@ -249,12 +243,10 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
         except Exception as e:
             print(f"[keystroke] RF model error: {e}")
             import traceback; traceback.print_exc()
-            # Hard fail — don't silently grant access on model errors
             confidence    = 0.0
             authenticated = False
 
     else:
-        # No model trained yet — simple dwell-time similarity fallback
         print(f"[keystroke] No RF model for '{payload.username}', using fallback")
         template = db.query(KeystrokeTemplate).filter(
             KeystrokeTemplate.user_id == user.id
@@ -271,6 +263,159 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
     log_attempt(db, user.id, "keystroke", confidence,
                 "granted" if authenticated else "denied")
 
+    # ═════════════════════════════════════════════════════════════════
+    # ADAPTIVE LEARNING: Save login sample + Auto-retrain
+    # ═════════════════════════════════════════════════════════════════
+
+    if authenticated:
+        # Get current sample count
+        total_samples = db.query(KeystrokeTemplate).filter(
+            KeystrokeTemplate.user_id == user.id
+        ).count()
+
+        # Delete oldest if at limit (rolling window)
+        if total_samples >= MAX_SAMPLES:
+            oldest = db.query(KeystrokeTemplate).filter(
+                KeystrokeTemplate.user_id == user.id
+            ).order_by(KeystrokeTemplate.sample_order.asc()).first()
+            if oldest:
+                print(f"  🗑️ Deleting oldest sample (order={oldest.sample_order})")
+                db.delete(oldest)
+                db.flush()
+
+        # Get next order number
+        max_order = db.query(func.max(KeystrokeTemplate.sample_order)).filter(
+            KeystrokeTemplate.user_id == user.id
+        ).scalar() or 0
+
+        # Save new login sample with all features
+        new_sample = KeystrokeTemplate(
+            user_id=user.id,
+            attempt_number=min(total_samples + 1, MAX_SAMPLES),
+            source="login",
+            sample_order=max_order + 1,
+            dwell_times=payload.dwell_times,
+            flight_times=payload.flight_times,
+            typing_speed=payload.typing_speed,
+            dwell_mean=payload.dwell_mean,
+            dwell_std=payload.dwell_std,
+            dwell_median=payload.dwell_median,
+            dwell_min=payload.dwell_min,
+            dwell_max=payload.dwell_max,
+            flight_mean=payload.flight_mean,
+            flight_std=payload.flight_std,
+            flight_median=payload.flight_median,
+            p2p_mean=payload.p2p_mean,
+            p2p_std=payload.p2p_std,
+            r2r_mean=payload.r2r_mean,
+            r2r_std=payload.r2r_std,
+            digraph_th=payload.digraph_th,
+            digraph_he=payload.digraph_he,
+            digraph_bi=payload.digraph_bi,
+            digraph_io=payload.digraph_io,
+            digraph_om=payload.digraph_om,
+            digraph_me=payload.digraph_me,
+            digraph_et=payload.digraph_et,
+            digraph_tr=payload.digraph_tr,
+            digraph_ri=payload.digraph_ri,
+            digraph_ic=payload.digraph_ic,
+            digraph_vo=payload.digraph_vo,
+            digraph_oi=payload.digraph_oi,
+            digraph_ce=payload.digraph_ce,
+            digraph_ke=payload.digraph_ke,
+            digraph_ey=payload.digraph_ey,
+            digraph_ys=payload.digraph_ys,
+            digraph_st=payload.digraph_st,
+            digraph_ro=payload.digraph_ro,
+            digraph_ok=payload.digraph_ok,
+            digraph_au=payload.digraph_au,
+            digraph_ut=payload.digraph_ut,
+            digraph_en=payload.digraph_en,
+            digraph_nt=payload.digraph_nt,
+            digraph_ti=payload.digraph_ti,
+            digraph_ca=payload.digraph_ca,
+            digraph_at=payload.digraph_at,
+            digraph_on=payload.digraph_on,
+            typing_speed_cpm=payload.typing_speed_cpm,
+            typing_duration=payload.typing_duration,
+            rhythm_mean=payload.rhythm_mean,
+            rhythm_std=payload.rhythm_std,
+            rhythm_cv=payload.rhythm_cv,
+            pause_count=payload.pause_count,
+            pause_mean=payload.pause_mean,
+            backspace_ratio=payload.backspace_ratio,
+            backspace_count=payload.backspace_count,
+            hand_alternation_ratio=payload.hand_alternation_ratio,
+            same_hand_sequence_mean=payload.same_hand_sequence_mean,
+            finger_transition_ratio=payload.finger_transition_ratio,
+            seek_time_mean=payload.seek_time_mean,
+            seek_time_count=payload.seek_time_count,
+            shift_lag_mean=payload.shift_lag_mean,
+            shift_lag_std=payload.shift_lag_std,
+            shift_lag_count=payload.shift_lag_count,
+            dwell_mean_norm=payload.dwell_mean_norm,
+            dwell_std_norm=payload.dwell_std_norm,
+            flight_mean_norm=payload.flight_mean_norm,
+            flight_std_norm=payload.flight_std_norm,
+            p2p_std_norm=payload.p2p_std_norm,
+            r2r_mean_norm=payload.r2r_mean_norm,
+            shift_lag_norm=payload.shift_lag_norm,
+        )
+        db.add(new_sample)
+        db.commit()
+
+        updated_count = db.query(KeystrokeTemplate).filter(
+            KeystrokeTemplate.user_id == user.id
+        ).count()
+
+        print(f"  💾 Saved login sample (total: {updated_count}/{MAX_SAMPLES})")
+
+        # Determine adaptive retrain interval
+        login_count_total = db.query(AuthLog).filter(
+            AuthLog.user_id == user.id,
+            AuthLog.auth_method == "keystroke",
+            AuthLog.result == "granted"
+        ).count()
+
+        if updated_count <= 10:
+            retrain_interval = 2   # Every 2 logins (fast bootstrap)
+        elif updated_count <= 30:
+            retrain_interval = 5   # Every 5 logins (learning phase)
+        else:
+            retrain_interval = 10  # Every 10 logins (mature phase)
+
+        should_retrain = False
+        retrain_reason = ""
+
+        # Check interval-based retraining
+        if login_count_total % retrain_interval == 0:
+            should_retrain = True
+            retrain_reason = f"interval ({retrain_interval} logins)"
+
+        # Also retrain at key milestones
+        milestones = [10, 20, 30, 40, 50]
+        if updated_count in milestones:
+            should_retrain = True
+            retrain_reason = f"milestone ({updated_count} samples)"
+
+        if should_retrain:
+            print(f"  🔄 Triggering retrain: {retrain_reason}")
+            try:
+                script_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                    'ml', 'train_keystroke_rf.py'
+                )
+                subprocess.Popen(
+                    [sys.executable, script_path, payload.username],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                )
+                print(f"  ✅ Retraining started in background")
+            except Exception as e:
+                print(f"  ⚠️ Retrain failed: {e}")
+
+    # Handle failed attempts
     if not authenticated:
         total_denials = db.query(AuthLog).filter(
             AuthLog.user_id == user.id,
