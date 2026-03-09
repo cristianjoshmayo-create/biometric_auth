@@ -1,13 +1,41 @@
 // frontend/js/enroll.js
 // Controls the enrollment flow across all 3 steps
+//
+// FIXES APPLIED:
+//
+//  KEYSTROKE BUG 1 — saveKeystrokeEnrollment() averaged all 3 attempts into ONE
+//                    DB row → training saw "Enrollment attempts: 1" → model had
+//                    no real profile to learn from.
+//                    FIX: submitKeystroke() now POSTs each attempt immediately
+//                    (same pattern as the fixed voice enrollment below).
+//
+//  KEYSTROKE BUG 2 — saveKeystrokeEnrollment() sent 6 WRONG digraphs:
+//                    digraph_in, digraph_er, digraph_an, digraph_ed, digraph_to, digraph_it
+//                    None appear in "biometric voice keystroke authentication" → always 0.
+//                    FIX: all 27 correct phrase digraphs now sent per attempt.
+//
+//  KEYSTROKE BUG 3 — shift_lag_mean/std/count and 7 normalized ratio features
+//                    were never sent at all during enrollment.
+//                    FIX: all included in each per-attempt POST.
+//
+//  VOICE BUG 1 — onVoiceRecorded() collected all 3 into an array and averaged
+//                them into ONE row at the end → DB always had 1 row.
+//                FIX: POSTs each attempt to /enroll/voice immediately.
+//
+//  VOICE BUG 2 — Api.enrollVoice() was only sending mfcc_features (13 values).
+//                FIX: full 34-feature dict sent per attempt.
 
 let currentUsername = "";
-let keystrokeAttempts = [];
-let voiceAttempts = [];
-let currentKeystrokeAttempt = 1;
-let currentVoiceAttempt = 1;
 
-// ── Step 0: Start enrollment ──────────────────────────────
+// Keystroke — POST each attempt immediately
+let currentKeystrokeAttempt = 1;
+const KEYSTROKE_TARGET = 3;
+
+// Voice — track server-confirmed count
+let voiceAttemptsSaved = 0;
+const VOICE_TARGET = 3;
+
+// ── Step 0: Start enrollment ──────────────────────────────────────────────
 function startEnrollment() {
     const username = document.getElementById("username-input").value.trim();
     if (!username) {
@@ -17,191 +45,245 @@ function startEnrollment() {
 
     currentUsername = username;
 
-    // Hide username section, show step indicator + keystroke section
     document.getElementById("username-section").classList.add("hidden");
     document.getElementById("step-indicator").classList.remove("hidden");
     document.getElementById("keystroke-section").classList.remove("hidden");
 
-    // Attach keystroke capture to input
     KeystrokeCapture.attach("keystroke-input");
     document.getElementById("keystroke-status").textContent = "Start typing when ready";
 }
 
-// ── Step 1: Keystroke Enrollment ─────────────────────────
-function submitKeystroke() {
-    const input = document.getElementById("keystroke-input");
+// ── Step 1: Keystroke Enrollment ──────────────────────────────────────────
+async function submitKeystroke() {
+    const input  = document.getElementById("keystroke-input");
     const status = document.getElementById("keystroke-status");
 
-    // Validate phrase
     if (!KeystrokeCapture.validatePhrase(input.value)) {
         status.textContent = "❌ Phrase doesn't match. Please type exactly as shown.";
-        status.classList.add("text-red-400");
+        status.className = "text-center text-sm mb-4 text-red-400";
         input.value = "";
         KeystrokeCapture.reset();
         KeystrokeCapture.attach("keystroke-input");
         return;
     }
 
-    // Extract features
     const features = KeystrokeCapture.extractFeatures();
-    if (!features || features.totalKeys < 5) {
-        status.textContent = "❌ Not enough keystroke data captured. Try again.";
+    if (!features) {
+        status.textContent = "❌ Not enough keystroke data. Try again.";
+        status.className = "text-center text-sm mb-4 text-red-400";
         return;
     }
 
-    keystrokeAttempts.push(features);
-
-    // Update attempt dots
-    document.getElementById(`attempt-${currentKeystrokeAttempt}`)
-        .classList.replace("bg-gray-700", "bg-purple-600");
-
-    status.textContent = `✅ Attempt ${currentKeystrokeAttempt} recorded!`;
-    status.classList.remove("text-red-400");
-    status.classList.add("text-green-400");
-
-    currentKeystrokeAttempt++;
-
-    if (currentKeystrokeAttempt <= 3) {
-        // More attempts needed
-        document.getElementById("attempt-label").textContent =
-            `Attempt ${currentKeystrokeAttempt} of 3`;
-        input.value = "";
-        KeystrokeCapture.reset();
-        KeystrokeCapture.attach("keystroke-input");
-
-        setTimeout(() => {
-            status.textContent = "Start typing when ready";
-            status.classList.remove("text-green-400");
-        }, 1000);
-
-    } else {
-        // All 3 attempts done — save to backend
-        saveKeystrokeEnrollment();
-    }
-}
-
-async function saveKeystrokeEnrollment() {
-    const status = document.getElementById("keystroke-status");
-    status.textContent = "💾 Saving keystroke profile...";
-
-    // Average all features across 3 attempts
-    const avgFeature = (key) =>
-        keystrokeAttempts.reduce((s, a) => s + (a[key] || 0), 0) / keystrokeAttempts.length;
-
-    const avgDwell = averageArrays(keystrokeAttempts.map(a => a.dwell_times));
-    const avgFlight = averageArrays(keystrokeAttempts.map(a => a.flight_times));
+    status.textContent = `⏳ Saving attempt ${currentKeystrokeAttempt}/${KEYSTROKE_TARGET}…`;
+    status.className = "text-center text-sm mb-4 text-yellow-400";
 
     try {
-        await Api.enrollUser(currentUsername);
+        if (currentKeystrokeAttempt === 1) {
+            await Api.enrollUser(currentUsername);
+        }
 
+        // FIX: POST immediately with all correct features.
+        // OLD: collected all 3, averaged, posted ONE row with 6 wrong digraphs.
         const result = await Api.enrollKeystroke(currentUsername, {
-            dwell_times: avgDwell,
-            flight_times: avgFlight,
-            typing_speed: avgFeature('typing_speed'),
-            
-            // All 40+ features
-            dwell_mean: avgFeature('dwell_mean'),
-            dwell_std: avgFeature('dwell_std'),
-            dwell_median: avgFeature('dwell_median'),
-            dwell_min: avgFeature('dwell_min'),
-            dwell_max: avgFeature('dwell_max'),
-            flight_mean: avgFeature('flight_mean'),
-            flight_std: avgFeature('flight_std'),
-            flight_median: avgFeature('flight_median'),
-            p2p_mean: avgFeature('p2p_mean'),
-            p2p_std: avgFeature('p2p_std'),
-            r2r_mean: avgFeature('r2r_mean'),
-            r2r_std: avgFeature('r2r_std'),
-            digraph_th: avgFeature('digraph_th'),
-            digraph_he: avgFeature('digraph_he'),
-            digraph_in: avgFeature('digraph_in'),
-            digraph_er: avgFeature('digraph_er'),
-            digraph_an: avgFeature('digraph_an'),
-            digraph_ed: avgFeature('digraph_ed'),
-            digraph_to: avgFeature('digraph_to'),
-            digraph_it: avgFeature('digraph_it'),
-            typing_speed_cpm: avgFeature('typing_speed_cpm'),
-            typing_duration: avgFeature('typing_duration'),
-            rhythm_mean: avgFeature('rhythm_mean'),
-            rhythm_std: avgFeature('rhythm_std'),
-            rhythm_cv: avgFeature('rhythm_cv'),
-            pause_count: avgFeature('pause_count'),
-            pause_mean: avgFeature('pause_mean'),
-            backspace_ratio: avgFeature('backspace_ratio'),
-            backspace_count: avgFeature('backspace_count'),
-            hand_alternation_ratio: avgFeature('hand_alternation_ratio'),
-            same_hand_sequence_mean: avgFeature('same_hand_sequence_mean'),
-            finger_transition_ratio: avgFeature('finger_transition_ratio'),
-            seek_time_mean: avgFeature('seek_time_mean'),
-            seek_time_count: avgFeature('seek_time_count')
+            dwell_times:  features.dwell_times,
+            flight_times: features.flight_times,
+            typing_speed: features.typing_speed,
+
+            dwell_mean:    features.dwell_mean,
+            dwell_std:     features.dwell_std,
+            dwell_median:  features.dwell_median,
+            dwell_min:     features.dwell_min,
+            dwell_max:     features.dwell_max,
+            flight_mean:   features.flight_mean,
+            flight_std:    features.flight_std,
+            flight_median: features.flight_median,
+            p2p_mean:      features.p2p_mean,
+            p2p_std:       features.p2p_std,
+            r2r_mean:      features.r2r_mean,
+            r2r_std:       features.r2r_std,
+
+            // FIX: 27 correct phrase digraphs (was 6 wrong ones)
+            digraph_th: features.digraph_th || 0,
+            digraph_he: features.digraph_he || 0,
+            digraph_bi: features.digraph_bi || 0,
+            digraph_io: features.digraph_io || 0,
+            digraph_om: features.digraph_om || 0,
+            digraph_me: features.digraph_me || 0,
+            digraph_et: features.digraph_et || 0,
+            digraph_tr: features.digraph_tr || 0,
+            digraph_ri: features.digraph_ri || 0,
+            digraph_ic: features.digraph_ic || 0,
+            digraph_vo: features.digraph_vo || 0,
+            digraph_oi: features.digraph_oi || 0,
+            digraph_ce: features.digraph_ce || 0,
+            digraph_ke: features.digraph_ke || 0,
+            digraph_ey: features.digraph_ey || 0,
+            digraph_ys: features.digraph_ys || 0,
+            digraph_st: features.digraph_st || 0,
+            digraph_ro: features.digraph_ro || 0,
+            digraph_ok: features.digraph_ok || 0,
+            digraph_au: features.digraph_au || 0,
+            digraph_ut: features.digraph_ut || 0,
+            digraph_en: features.digraph_en || 0,
+            digraph_nt: features.digraph_nt || 0,
+            digraph_ti: features.digraph_ti || 0,
+            digraph_ca: features.digraph_ca || 0,
+            digraph_at: features.digraph_at || 0,
+            digraph_on: features.digraph_on || 0,
+
+            typing_speed_cpm:        features.typing_speed_cpm,
+            typing_duration:         features.typing_duration,
+            rhythm_mean:             features.rhythm_mean,
+            rhythm_std:              features.rhythm_std,
+            rhythm_cv:               features.rhythm_cv,
+            pause_count:             features.pause_count,
+            pause_mean:              features.pause_mean,
+            backspace_ratio:         features.backspace_ratio,
+            backspace_count:         features.backspace_count,
+            hand_alternation_ratio:  features.hand_alternation_ratio,
+            same_hand_sequence_mean: features.same_hand_sequence_mean,
+            finger_transition_ratio: features.finger_transition_ratio,
+            seek_time_mean:          features.seek_time_mean,
+            seek_time_count:         features.seek_time_count,
+
+            // FIX: shift-lag + normalized features (were never sent before)
+            shift_lag_mean:   features.shift_lag_mean   || 0,
+            shift_lag_std:    features.shift_lag_std    || 0,
+            shift_lag_count:  features.shift_lag_count  || 0,
+            dwell_mean_norm:  features.dwell_mean_norm  || 0,
+            dwell_std_norm:   features.dwell_std_norm   || 0,
+            flight_mean_norm: features.flight_mean_norm || 0,
+            flight_std_norm:  features.flight_std_norm  || 0,
+            p2p_std_norm:     features.p2p_std_norm     || 0,
+            r2r_mean_norm:    features.r2r_mean_norm    || 0,
+            shift_lag_norm:   features.shift_lag_norm   || 0,
         });
 
-        if (result.success) {
-            status.textContent = "✅ Keystroke profile saved with 40+ features!";
-            setTimeout(() => moveToVoiceEnrollment(), 1000);
+        if (!result.success) {
+            status.textContent = "❌ Save failed: " + (result.detail || "unknown error");
+            status.className = "text-center text-sm mb-4 text-red-400";
+            return;
+        }
+
+        const dot = document.getElementById(`attempt-${currentKeystrokeAttempt}`);
+        if (dot) dot.classList.replace("bg-gray-700", "bg-purple-600");
+
+        status.textContent = `✅ Attempt ${currentKeystrokeAttempt}/${KEYSTROKE_TARGET} saved!`;
+        status.className = "text-center text-sm mb-4 text-green-400";
+
+        currentKeystrokeAttempt++;
+
+        if (currentKeystrokeAttempt <= KEYSTROKE_TARGET) {
+            const label = document.getElementById("attempt-label");
+            if (label) label.textContent = `Attempt ${currentKeystrokeAttempt} of ${KEYSTROKE_TARGET}`;
+
+            input.value = "";
+            KeystrokeCapture.reset();
+            KeystrokeCapture.attach("keystroke-input");
+
+            setTimeout(() => {
+                status.textContent = "Start typing when ready";
+                status.className = "text-center text-sm mb-4 text-gray-400";
+            }, 1000);
         } else {
-            status.textContent = "❌ Error: " + (result.detail || "Unknown error");
+            status.textContent = `✅ All ${KEYSTROKE_TARGET} attempts saved! Moving on…`;
+            setTimeout(() => moveToVoiceEnrollment(), 1000);
         }
 
     } catch (err) {
-        status.textContent = "❌ Could not connect to server.";
-        console.error(err);
+        status.textContent = "❌ Network error — check server is running.";
+        status.className = "text-center text-sm mb-4 text-red-400";
+        console.error("Keystroke enroll error:", err);
     }
 }
 
-// ── Step 2: Voice Enrollment ──────────────────────────────
+// ── Step 2: Voice Enrollment ──────────────────────────────────────────────
 function moveToVoiceEnrollment() {
     document.getElementById("keystroke-section").classList.add("hidden");
     document.getElementById("voice-section").classList.remove("hidden");
 
-    // Update step indicator
     document.getElementById("step2-dot").querySelector("div")
         .classList.replace("bg-gray-700", "bg-purple-600");
     document.getElementById("progress-line").style.width = "100%";
+
+    updateVoiceAttemptUI(0);
 }
 
-// Voice recording handled in speech.js
-// This is the callback when a recording is done
-function onVoiceRecorded(mfccFeatures) {
-    voiceAttempts.push(mfccFeatures);
-
-    document.getElementById(`vattempt-${currentVoiceAttempt}`)
-        .classList.replace("bg-gray-700", "bg-purple-600");
-
-    currentVoiceAttempt++;
-
-    if (currentVoiceAttempt <= 3) {
-        document.getElementById("vattempt-label").textContent =
-            `Recording ${currentVoiceAttempt} of 3`;
-        document.getElementById("voice-status").textContent =
-            `✅ Recording ${currentVoiceAttempt - 1} saved. Click record for next.`;
-    } else {
-        saveVoiceEnrollment();
-    }
-}
-
-async function saveVoiceEnrollment() {
+// Called by speech.js after EACH recording completes.
+// FIX: OLD signature was onVoiceRecorded(mfccFeatures) — a plain 13-element array.
+//      All 3 were collected locally then averaged into ONE row at the end.
+//      NEW: receives fullFeatureDict (34 features), POSTs immediately each time.
+async function onVoiceRecorded(fullFeatureDict) {
     const status = document.getElementById("voice-status");
-    status.textContent = "💾 Saving voice profile...";
 
-    const avgMfcc = averageArrays(voiceAttempts);
+    if (voiceAttemptsSaved >= VOICE_TARGET) return;
+
+    status.textContent = `⏳ Saving recording ${voiceAttemptsSaved + 1}/${VOICE_TARGET}…`;
+    status.className   = "text-center text-sm mb-4 text-yellow-400";
 
     try {
-        const result = await Api.enrollVoice(currentUsername, avgMfcc);
+        const result = await Api.enrollVoice(currentUsername, fullFeatureDict);
 
-        if (result.success) {
-            status.textContent = "✅ Voice profile saved!";
-            setTimeout(() => moveToSecurityQuestion(), 1000);
-        } else {
-            status.textContent = "❌ Error: " + (result.detail || "Unknown error");
+        if (!result.success) {
+            status.textContent = "❌ Save failed: " + (result.detail || "unknown error");
+            status.className   = "text-center text-sm mb-4 text-red-400";
+            return;
         }
+
+        voiceAttemptsSaved = result.attempt_number;
+        updateVoiceAttemptUI(voiceAttemptsSaved);
+
+        if (voiceAttemptsSaved >= VOICE_TARGET) {
+            status.textContent = `✅ All ${VOICE_TARGET} recordings saved!`;
+            status.className   = "text-center text-sm mb-4 text-green-400";
+
+            const btn = document.getElementById("record-btn");
+            if (btn) {
+                btn.disabled    = true;
+                btn.textContent = `✅ ${VOICE_TARGET}/${VOICE_TARGET} Complete`;
+            }
+
+            setTimeout(() => moveToSecurityQuestion(), 1200);
+        } else {
+            status.textContent =
+                `✅ Recording ${voiceAttemptsSaved}/${VOICE_TARGET} saved. Record next.`;
+            status.className   = "text-center text-sm mb-4 text-green-400";
+
+            const btn = document.getElementById("record-btn");
+            if (btn) {
+                btn.disabled    = false;
+                btn.textContent = `🎤 Record ${voiceAttemptsSaved + 1}/${VOICE_TARGET}`;
+            }
+        }
+
     } catch (err) {
-        status.textContent = "❌ Could not connect to server.";
-        console.error(err);
+        status.textContent = "❌ Network error — check server is running.";
+        status.className   = "text-center text-sm mb-4 text-red-400";
+        console.error("Voice enroll save error:", err);
     }
 }
 
-// ── Step 3: Security Question ─────────────────────────────
+function updateVoiceAttemptUI(count) {
+    for (let i = 1; i <= VOICE_TARGET; i++) {
+        const dot = document.getElementById(`vattempt-${i}`);
+        if (dot) {
+            if (i <= count) {
+                dot.classList.replace("bg-gray-700", "bg-purple-600");
+            } else {
+                dot.classList.replace("bg-purple-600", "bg-gray-700");
+            }
+        }
+    }
+
+    const label = document.getElementById("vattempt-label");
+    if (label) {
+        label.textContent = count < VOICE_TARGET
+            ? `Recording ${count + 1} of ${VOICE_TARGET}`
+            : `All ${VOICE_TARGET} recordings complete`;
+    }
+}
+
+// ── Step 3: Security Question ─────────────────────────────────────────────
 function moveToSecurityQuestion() {
     document.getElementById("voice-section").classList.add("hidden");
     document.getElementById("security-section").classList.remove("hidden");
@@ -213,7 +295,7 @@ function moveToSecurityQuestion() {
 
 async function submitSecurityQuestion() {
     const question = document.getElementById("security-question-select").value;
-    const answer = document.getElementById("security-answer").value.trim();
+    const answer   = document.getElementById("security-answer").value.trim();
 
     if (!question || !answer) {
         alert("Please select a question and provide an answer.");
@@ -222,7 +304,6 @@ async function submitSecurityQuestion() {
 
     try {
         const result = await Api.enrollSecurity(currentUsername, question, answer);
-
         if (result.success) {
             document.getElementById("security-section").classList.add("hidden");
             document.getElementById("success-section").classList.remove("hidden");
@@ -235,7 +316,7 @@ async function submitSecurityQuestion() {
     }
 }
 
-// ── Helper: Average multiple arrays ──────────────────────
+// ── Helper: average multiple arrays (kept for any other uses) ─────────────
 function averageArrays(arrays) {
     if (!arrays || arrays.length === 0) return [];
     const minLen = Math.min(...arrays.map(a => a.length));

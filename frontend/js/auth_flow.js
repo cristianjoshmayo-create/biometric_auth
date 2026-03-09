@@ -1,5 +1,10 @@
 // frontend/js/auth_flow.js
 // Controls the progressive authentication flow (Design 3)
+//
+// FIX: onVoiceAuthComplete(mfccFeatures) was passing a plain 13-element array
+//      to Api.verifyVoice(). The backend VoiceAuth schema now requires all 34
+//      features. speech.js now calls onVoiceAuthComplete(fullFeatureDict),
+//      and this file forwards that full object to Api.verifyVoice().
 
 let authUsername = "";
 let failedAttempts = 0;
@@ -15,17 +20,14 @@ function startLogin() {
 
     authUsername = username;
 
-    // Show step indicator and keystroke section
     document.getElementById("username-section").classList.add("hidden");
     document.getElementById("step-indicator").classList.remove("hidden");
     document.getElementById("keystroke-section").classList.remove("hidden");
     document.getElementById("attempts-indicator").classList.remove("hidden");
 
-    // Activate step 1 dot
     document.getElementById("dot-keystroke")
         .classList.replace("bg-gray-700", "bg-purple-600");
 
-    // Attach keystroke capture
     KeystrokeCapture.attach("keystroke-input");
 
     document.getElementById("keystroke-status").textContent =
@@ -34,7 +36,7 @@ function startLogin() {
 
 // ── Step 1: Keystroke Auth ────────────────────────────────
 async function submitKeystrokeAuth() {
-    const input = document.getElementById("keystroke-input");
+    const input  = document.getElementById("keystroke-input");
     const status = document.getElementById("keystroke-status");
 
     if (!KeystrokeCapture.validatePhrase(input.value)) {
@@ -49,6 +51,7 @@ async function submitKeystrokeAuth() {
     const features = KeystrokeCapture.extractFeatures();
     if (!features) {
         status.textContent = "❌ Not enough data. Try again.";
+        status.className = "text-center text-sm mb-4 text-red-400";
         return;
     }
 
@@ -56,14 +59,14 @@ async function submitKeystrokeAuth() {
     status.className = "text-center text-sm mb-4 text-yellow-400";
 
     try {
-        // Send ALL features to backend for RF model
         const result = await Api.verifyKeystroke(authUsername, features);
 
         if (result.authenticated) {
             showSuccess("Keystroke Dynamics", result.confidence);
         } else {
             recordFailedAttempt();
-            status.textContent = `❌ Keystroke failed (confidence: ${(result.confidence * 100).toFixed(1)}%)`;
+            status.textContent =
+                `❌ Keystroke failed (confidence: ${(result.confidence * 100).toFixed(1)}%)`;
             status.className = "text-center text-sm mb-4 text-red-400";
             setTimeout(() => moveToVoiceAuth(), 1500);
         }
@@ -74,21 +77,21 @@ async function submitKeystrokeAuth() {
         status.className = "text-center text-sm mb-4 text-red-400";
     }
 }
+
 // ── Step 2: Voice Auth ────────────────────────────────────
 function moveToVoiceAuth() {
     document.getElementById("keystroke-section").classList.add("hidden");
     document.getElementById("voice-section").classList.remove("hidden");
 
-    // Update step indicator
     document.getElementById("dot-voice")
         .classList.replace("bg-gray-700", "bg-purple-600");
     document.getElementById("line-1").style.width = "100%";
 }
 
 function startVoiceAuth() {
-    const btn = document.getElementById("record-btn");
+    const btn       = document.getElementById("record-btn");
     const indicator = document.getElementById("recording-indicator");
-    const status = document.getElementById("voice-status");
+    const status    = document.getElementById("voice-status");
 
     if (SpeechCapture.isRecording) {
         SpeechCapture.stopRecording();
@@ -113,13 +116,19 @@ function startVoiceAuth() {
     });
 }
 
-// Called from speech.js after recording is processed
-async function onVoiceAuthComplete(mfccFeatures) {
+// FIX: old signature was onVoiceAuthComplete(mfccFeatures) — plain 13-element array.
+//      speech.js now calls this with fullFeatureDict (all 34 features).
+//      Api.verifyVoice() and auth.py VoiceAuth schema both updated to match.
+async function onVoiceAuthComplete(fullFeatureDict) {
     const status = document.getElementById("voice-status");
     status.textContent = "⏳ Verifying voice pattern...";
+    status.className = "text-center text-sm mb-4 text-yellow-400";
 
     try {
-        const result = await Api.verifyVoice(authUsername, mfccFeatures);
+        // FIX: was Api.verifyVoice(authUsername, mfccFeatures)
+        //      → only sent 13 MFCC values, model saw 21 zeroes → accepted everyone.
+        // NOW: passes the full 34-feature dict from speech.js.
+        const result = await Api.verifyVoice(authUsername, fullFeatureDict);
 
         if (result.authenticated) {
             showSuccess("Speech Biometrics", result.confidence);
@@ -134,6 +143,7 @@ async function onVoiceAuthComplete(mfccFeatures) {
     } catch (err) {
         console.error(err);
         status.textContent = "❌ Server error. Try again.";
+        status.className = "text-center text-sm mb-4 text-red-400";
     }
 }
 
@@ -142,12 +152,10 @@ async function moveToSecurityAuth() {
     document.getElementById("voice-section").classList.add("hidden");
     document.getElementById("security-section").classList.remove("hidden");
 
-    // Update step indicator
     document.getElementById("dot-security")
         .classList.replace("bg-gray-700", "bg-purple-600");
     document.getElementById("line-2").style.width = "100%";
 
-    // Fetch the user's security question from backend
     try {
         const result = await Api.getSecurityQuestion(authUsername);
         if (result.question) {
@@ -172,15 +180,14 @@ async function submitSecurityAuth() {
     }
 
     status.textContent = "⏳ Verifying answer...";
+    status.className = "text-center text-sm mb-4 text-yellow-400";
 
     try {
         const result = await Api.verifySecurityQuestion(authUsername, answer);
 
         if (result.authenticated) {
-            // ✅ Security question passed
             showSuccess("Security Question", result.confidence);
         } else {
-            // ❌ All methods failed
             recordFailedAttempt();
             showDenied();
         }
@@ -188,6 +195,7 @@ async function submitSecurityAuth() {
     } catch (err) {
         console.error(err);
         status.textContent = "❌ Server error. Try again.";
+        status.className = "text-center text-sm mb-4 text-red-400";
     }
 }
 
@@ -199,9 +207,7 @@ function recordFailedAttempt() {
 }
 
 function showSuccess(method, confidence) {
-    // Hide all sections
     hideAllSections();
-
     document.getElementById("success-section").classList.remove("hidden");
     document.getElementById("success-method").textContent =
         `Verified via: ${method}`;
@@ -227,27 +233,23 @@ function hideAllSections() {
 
 function resetLogin() {
     failedAttempts = 0;
-    authUsername = "";
+    authUsername   = "";
     KeystrokeCapture.reset();
     SpeechCapture.reset();
 
-    // Reset fail dots
     [1, 2, 3].forEach(i => {
         const dot = document.getElementById(`fail-${i}`);
         if (dot) dot.classList.replace("bg-red-500", "bg-gray-700");
     });
 
-    // Reset step dots
     ["dot-keystroke", "dot-voice", "dot-security"].forEach(id => {
         document.getElementById(id)
             .classList.replace("bg-purple-600", "bg-gray-700");
     });
 
-    // Reset lines
     document.getElementById("line-1").style.width = "0%";
     document.getElementById("line-2").style.width = "0%";
 
-    // Show username section
     hideAllSections();
     document.getElementById("username-section").classList.remove("hidden");
     document.getElementById("step-indicator").classList.add("hidden");

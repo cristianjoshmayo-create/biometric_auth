@@ -26,19 +26,15 @@ class User(Base):
 class KeystrokeTemplate(Base):
     __tablename__ = "keystroke_templates"
 
-    id      = Column(Integer, primary_key=True)
-    # CHANGED: removed unique=True so multiple enrollment attempts can be stored
-    # per user. attempt_number + enrollment_session track which attempt this is.
+    id                 = Column(Integer, primary_key=True)
     user_id            = Column(Integer, ForeignKey("users.id"), nullable=False)
-    attempt_number     = Column(Integer, default=1)   # 1,2,3... per session
-    enrollment_session = Column(Integer, default=1)   # increments on re-enroll
+    attempt_number     = Column(Integer, default=1)
+    enrollment_session = Column(Integer, default=1)
 
-    # ── Raw timing arrays ────────────────────────────────────────────────
     dwell_times  = Column(ARRAY(Float), nullable=False)
     flight_times = Column(ARRAY(Float), nullable=False)
     typing_speed = Column(Float, default=0)
 
-    # ── Core timing features ─────────────────────────────────────────────
     dwell_mean   = Column(Float, default=0)
     dwell_std    = Column(Float, default=0)
     dwell_median = Column(Float, default=0)
@@ -51,15 +47,11 @@ class KeystrokeTemplate(Base):
 
     p2p_mean = Column(Float, default=0)
     p2p_std  = Column(Float, default=0)
-
     r2r_mean = Column(Float, default=0)
     r2r_std  = Column(Float, default=0)
 
-    # ── Digraphs — updated to match phrase "Biometric Voice Keystroke Authentication"
-    # Old dead digraphs (th, he kept — they DO appear; er/an/ed/to/it removed)
     digraph_th = Column(Float, default=0)
     digraph_he = Column(Float, default=0)
-    # New digraphs actually present in the phrase
     digraph_bi = Column(Float, default=0)
     digraph_io = Column(Float, default=0)
     digraph_om = Column(Float, default=0)
@@ -86,33 +78,25 @@ class KeystrokeTemplate(Base):
     digraph_at = Column(Float, default=0)
     digraph_on = Column(Float, default=0)
 
-    # ── Behavioral features ───────────────────────────────────────────────
-    typing_speed_cpm = Column(Float, default=0)
-    typing_duration  = Column(Float, default=0)
-    rhythm_mean      = Column(Float, default=0)
-    rhythm_std       = Column(Float, default=0)
-    rhythm_cv        = Column(Float, default=0)
-    pause_count      = Column(Float, default=0)
-    pause_mean       = Column(Float, default=0)
+    typing_speed_cpm        = Column(Float, default=0)
+    typing_duration         = Column(Float, default=0)
+    rhythm_mean             = Column(Float, default=0)
+    rhythm_std              = Column(Float, default=0)
+    rhythm_cv               = Column(Float, default=0)
+    pause_count             = Column(Float, default=0)
+    pause_mean              = Column(Float, default=0)
+    backspace_ratio         = Column(Float, default=0)
+    backspace_count         = Column(Float, default=0)
+    hand_alternation_ratio  = Column(Float, default=0)
+    same_hand_sequence_mean = Column(Float, default=0)
+    finger_transition_ratio = Column(Float, default=0)
+    seek_time_mean          = Column(Float, default=0)
+    seek_time_count         = Column(Float, default=0)
 
-    backspace_ratio          = Column(Float, default=0)
-    backspace_count          = Column(Float, default=0)
-    hand_alternation_ratio   = Column(Float, default=0)
-    same_hand_sequence_mean  = Column(Float, default=0)
-    finger_transition_ratio  = Column(Float, default=0)
-    seek_time_mean           = Column(Float, default=0)
-    seek_time_count          = Column(Float, default=0)
-
-    # ── NEW: shift-key lag features ───────────────────────────────────────
-    # Time between Shift press and the capital letter key
-    # Phrase has 4 capital letters → strong consistent signal
     shift_lag_mean  = Column(Float, default=0)
     shift_lag_std   = Column(Float, default=0)
     shift_lag_count = Column(Float, default=0)
 
-    # ── NEW: normalized ratio features (speed-independent) ───────────────
-    # These make the model learn rhythm pattern not absolute timing
-    # Critical for reducing FFR across sessions
     dwell_mean_norm  = Column(Float, default=0)
     dwell_std_norm   = Column(Float, default=0)
     flight_mean_norm = Column(Float, default=0)
@@ -122,18 +106,38 @@ class KeystrokeTemplate(Base):
     shift_lag_norm   = Column(Float, default=0)
 
     enrolled_at = Column(DateTime, default=func.now())
-
     user = relationship("User", back_populates="keystroke_template")
 
 
 class VoiceTemplate(Base):
     __tablename__ = "voice_templates"
 
-    id            = Column(Integer, primary_key=True)
-    user_id       = Column(Integer, ForeignKey("users.id"), unique=True)
-    mfcc_features = Column(ARRAY(Float), nullable=False)
-    enrolled_at   = Column(DateTime, default=func.now())
+    id             = Column(Integer, primary_key=True)
+    user_id        = Column(Integer, ForeignKey("users.id"), nullable=False)
+    attempt_number = Column(Integer, default=1)
 
+    # 13 MFCC means — spectral shape of voice
+    mfcc_features = Column(ARRAY(Float), nullable=False)
+    # 13 MFCC stds — how much each coefficient varies (new)
+    mfcc_std      = Column(ARRAY(Float), default=list)
+
+    # Pitch — fundamental frequency, highly speaker-specific
+    pitch_mean = Column(Float, default=0)
+    pitch_std  = Column(Float, default=0)
+
+    # Speaking rate — how fast the phrase is spoken
+    speaking_rate = Column(Float, default=0)
+
+    # Energy
+    energy_mean = Column(Float, default=0)
+    energy_std  = Column(Float, default=0)
+
+    # Spectral
+    zcr_mean               = Column(Float, default=0)
+    spectral_centroid_mean = Column(Float, default=0)
+    spectral_rolloff_mean  = Column(Float, default=0)
+
+    enrolled_at = Column(DateTime, default=func.now())
     user = relationship("User", back_populates="voice_template")
 
 

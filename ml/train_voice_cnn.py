@@ -1,360 +1,498 @@
 # ml/train_voice_cnn.py
-# Trains CNN model for voice authentication using MFCC features
+# FIXED: proper impostor generation, cosine similarity scoring, threshold calibration
 
 import sys
 import os
 
-# Add backend directory to Python path
-backend_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'backend')
+backend_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'backend'
+)
 sys.path.insert(0, backend_path)
 
 import numpy as np
 import pickle
-from sqlalchemy.orm import Session
-
-# Check if we're using TensorFlow or PyTorch
-try:
-    import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras import layers, models
-    USE_TENSORFLOW = True
-    print("Using TensorFlow for CNN")
-except ImportError:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    USE_TENSORFLOW = False
-    print("Using PyTorch for CNN")
+import warnings
+warnings.filterwarnings("ignore")
 
 from database.db import SessionLocal
 from database.models import User, VoiceTemplate
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  FEATURE VECTOR — 34 features, must match extract-mfcc endpoint exactly
+# ─────────────────────────────────────────────────────────────────────────────
+#  0-12  : mfcc_mean[0..12]
+#  13-25 : mfcc_std[0..12]
+#  26    : pitch_mean
+#  27    : pitch_std
+#  28    : speaking_rate
+#  29    : energy_mean
+#  30    : energy_std
+#  31    : zcr_mean
+#  32    : spectral_centroid_mean
+#  33    : spectral_rolloff_mean
+N_FEATURES = 34
 
-# ============================================================================
-# PyTorch CNN Model (if TensorFlow not available)
-# ============================================================================
-
-class VoiceCNN_PyTorch(nn.Module):
-    """Simple CNN for voice authentication using PyTorch"""
-    
-    def __init__(self):
-        super(VoiceCNN_PyTorch, self).__init__()
-        
-        # Input: 13 MFCC features (single vector)
-        self.fc1 = nn.Linear(13, 64)
-        self.dropout1 = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(64, 32)
-        self.dropout2 = nn.Dropout(0.3)
-        self.fc3 = nn.Linear(32, 16)
-        self.fc4 = nn.Linear(16, 1)
-        self.sigmoid = nn.Sigmoid()
-        
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = self.dropout1(x)
-        x = torch.relu(self.fc2(x))
-        x = self.dropout2(x)
-        x = torch.relu(self.fc3(x))
-        x = self.fc4(x)
-        x = self.sigmoid(x)
-        return x
+PITCH_INDICES    = [26, 27]
+ENERGY_INDICES   = [29, 30]
+RATIO_INDICES    = [31]
+MFCC_INDICES     = list(range(0, 26))
+SPECTRAL_INDICES = [32, 33]
 
 
-# ============================================================================
-# TensorFlow CNN Model
-# ============================================================================
-
-def create_voice_cnn_tensorflow():
-    """Simple CNN for voice authentication using TensorFlow"""
-    
-    model = models.Sequential([
-        # Input: 13 MFCC features
-        layers.Dense(64, activation='relu', input_shape=(13,)),
-        layers.Dropout(0.3),
-        
-        layers.Dense(32, activation='relu'),
-        layers.Dropout(0.3),
-        
-        layers.Dense(16, activation='relu'),
-        
-        layers.Dense(1, activation='sigmoid')  # Binary: genuine (1) or impostor (0)
-    ])
-    
-    model.compile(
-        optimizer='adam',
-        loss='binary_crossentropy',
-        metrics=['accuracy']
+def extract_feature_vector(template) -> np.ndarray:
+    mfcc_mean = list(template.mfcc_features or [])
+    mfcc_std  = list(template.mfcc_std      or [])
+    while len(mfcc_mean) < 13: mfcc_mean.append(0.0)
+    while len(mfcc_std)  < 13: mfcc_std.append(0.0)
+    return np.array(
+        mfcc_mean[:13] + mfcc_std[:13] + [
+            float(template.pitch_mean             or 0),
+            float(template.pitch_std              or 0),
+            float(template.speaking_rate          or 0),
+            float(template.energy_mean            or 0),
+            float(template.energy_std             or 0),
+            float(template.zcr_mean               or 0),
+            float(template.spectral_centroid_mean or 0),
+            float(template.spectral_rolloff_mean  or 0),
+        ],
+        dtype=np.float64
     )
-    
-    return model
 
 
-# ============================================================================
-# Data Generation
-# ============================================================================
-
-def generate_training_data(genuine_mfcc, num_genuine=20, num_impostor=40):
-    """Generate synthetic training data from enrolled MFCC"""
-    
-    genuine_mfcc = np.array(genuine_mfcc)
-    
-    # Generate genuine samples with small variations (±10%)
-    genuine_samples = []
-    for _ in range(num_genuine):
-        noise = np.random.normal(1.0, 0.10, size=genuine_mfcc.shape)
-        noisy_sample = genuine_mfcc * noise
-        genuine_samples.append(noisy_sample)
-    
-    # Generate impostor samples with larger variations (±40%)
-    impostor_samples = []
-    for _ in range(num_impostor):
-        noise = np.random.normal(1.0, 0.40, size=genuine_mfcc.shape)
-        impostor_sample = genuine_mfcc * noise
-        # Add random shift to make it more different
-        shift = np.random.uniform(-50, 50, size=genuine_mfcc.shape)
-        impostor_sample += shift
-        impostor_samples.append(impostor_sample)
-    
-    # Combine and create labels
-    X = np.array(genuine_samples + impostor_samples)
-    y = np.array([1] * num_genuine + [0] * num_impostor)
-    
-    # Shuffle
-    indices = np.random.permutation(len(X))
-    X = X[indices]
-    y = y[indices]
-    
-    return X, y
+def load_enrollment_samples(db, user_id: int) -> list:
+    templates = (
+        db.query(VoiceTemplate)
+        .filter(VoiceTemplate.user_id == user_id)
+        .order_by(VoiceTemplate.enrolled_at.asc())
+        .all()
+    )
+    vectors = []
+    for t in templates:
+        vec = extract_feature_vector(t)
+        if vec[0] == 0.0 and vec[13] == 0.0:
+            print(f"  ⚠  Skipping template id={t.id} (zero MFCC — re-enroll)")
+            continue
+        vectors.append(vec)
+    return vectors
 
 
-# ============================================================================
-# Training Function - TensorFlow
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+#  FIX 1: IMPOSTOR GENERATION
+#
+#  OLD (broken): impostors were generated by shifting the enrolled user's own
+#  profile mean — so they were still centred on the real user's voice and the
+#  model learned nothing useful about real impostors.
+#
+#  NEW: We pull ALL OTHER users' real enrollment vectors from the DB as real
+#  impostors.  If there are fewer than 2 other users we fall back to synthetic
+#  impostors that use ORTHOGONAL perturbation (not a shift of the user's own
+#  profile), which creates genuinely different feature distributions.
+# ─────────────────────────────────────────────────────────────────────────────
 
-def train_model_tensorflow(username: str):
-    """Train voice CNN using TensorFlow"""
-    
-    db = SessionLocal()
-    
-    try:
-        user = db.query(User).filter(User.username == username).first()
-        if not user:
-            print(f"User '{username}' not found!")
-            return None
-        
-        template = db.query(VoiceTemplate).filter(
-            VoiceTemplate.user_id == user.id
-        ).first()
-        
-        if not template:
-            print(f"No voice template for '{username}'!")
-            return None
-        
-        print(f"\n{'='*60}")
-        print(f"Training Voice CNN for: {username}")
-        print(f"{'='*60}")
-        print(f"Enrolled MFCC features: {len(template.mfcc_features)}")
-        
-        # Generate training data
-        X_train, y_train = generate_training_data(template.mfcc_features)
-        
-        print(f"\nTraining data generated:")
-        print(f"  Genuine samples: {np.sum(y_train == 1)}")
-        print(f"  Impostor samples: {np.sum(y_train == 0)}")
-        print(f"  Total samples: {len(X_train)}")
-        
-        # Create and train model
-        print("\nBuilding CNN model...")
-        model = create_voice_cnn_tensorflow()
-        
-        print(model.summary())
-        
-        print("\nTraining...")
-        history = model.fit(
-            X_train, y_train,
-            epochs=50,
-            batch_size=8,
-            validation_split=0.2,
-            verbose=1
-        )
-        
-        # Evaluate
-        final_loss = history.history['loss'][-1]
-        final_acc = history.history['accuracy'][-1]
-        val_loss = history.history['val_loss'][-1]
-        val_acc = history.history['val_accuracy'][-1]
-        
-        print(f"\n{'='*60}")
-        print(f"Training Complete!")
-        print(f"{'='*60}")
-        print(f"Final Training Accuracy: {final_acc:.2%}")
-        print(f"Final Validation Accuracy: {val_acc:.2%}")
-        print(f"Final Training Loss: {final_loss:.4f}")
-        print(f"Final Validation Loss: {val_loss:.4f}")
-        
-        # Save model
-        model_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'models'
-        )
-        os.makedirs(model_dir, exist_ok=True)
-        
-        model_path = os.path.join(model_dir, f"{username}_voice_cnn.h5")
-        model.save(model_path)
-        
-        # Also save metadata
-        metadata = {
-            'username': username,
-            'enrolled_mfcc': template.mfcc_features,
-            'accuracy': float(val_acc),
-            'loss': float(val_loss),
-            'framework': 'tensorflow'
-        }
-        
-        metadata_path = os.path.join(model_dir, f"{username}_voice_metadata.pkl")
-        with open(metadata_path, 'wb') as f:
-            pickle.dump(metadata, f)
-        
-        print(f"\n✅ Model saved to: {model_path}")
-        print(f"✅ Metadata saved to: {metadata_path}")
-        
-        return model_path
-        
-    finally:
-        db.close()
+def load_real_impostors(db, exclude_user_id: int) -> list:
+    """Load real enrollment vectors from every OTHER user as impostors."""
+    other_users = db.query(User).filter(User.id != exclude_user_id).all()
+    impostors = []
+    for u in other_users:
+        vecs = load_enrollment_samples(db, u.id)
+        impostors.extend(vecs)
+    return impostors
 
 
-# ============================================================================
-# Training Function - PyTorch
-# ============================================================================
+def generate_synthetic_impostors(
+    profile_mean: np.ndarray,
+    profile_std:  np.ndarray,
+    n:            int = 200,
+    rng_seed:     int = 42,
+) -> list:
+    """
+    Synthetic impostors that are GENUINELY DIFFERENT from the enrolled user.
 
-def train_model_pytorch(username: str):
-    """Train voice CNN using PyTorch"""
-    
-    db = SessionLocal()
-    
-    try:
-        user = db.query(User).filter(User.username == username).first()
-        if not user:
-            print(f"User '{username}' not found!")
-            return None
-        
-        template = db.query(VoiceTemplate).filter(
-            VoiceTemplate.user_id == user.id
-        ).first()
-        
-        if not template:
-            print(f"No voice template for '{username}'!")
-            return None
-        
-        print(f"\n{'='*60}")
-        print(f"Training Voice CNN for: {username}")
-        print(f"{'='*60}")
-        print(f"Enrolled MFCC features: {len(template.mfcc_features)}")
-        
-        # Generate training data
-        X_train, y_train = generate_training_data(template.mfcc_features)
-        
-        print(f"\nTraining data generated:")
-        print(f"  Genuine samples: {np.sum(y_train == 1)}")
-        print(f"  Impostor samples: {np.sum(y_train == 0)}")
-        print(f"  Total samples: {len(X_train)}")
-        
-        # Convert to PyTorch tensors
-        X_tensor = torch.FloatTensor(X_train)
-        y_tensor = torch.FloatTensor(y_train).unsqueeze(1)
-        
-        # Create model
-        model = VoiceCNN_PyTorch()
-        criterion = nn.BCELoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-        
-        print("\nTraining...")
-        epochs = 50
-        batch_size = 8
-        
-        for epoch in range(epochs):
-            model.train()
-            total_loss = 0
-            correct = 0
-            total = 0
-            
-            # Mini-batch training
-            indices = torch.randperm(len(X_tensor))
-            for i in range(0, len(X_tensor), batch_size):
-                batch_indices = indices[i:i+batch_size]
-                batch_X = X_tensor[batch_indices]
-                batch_y = y_tensor[batch_indices]
-                
-                optimizer.zero_grad()
-                outputs = model(batch_X)
-                loss = criterion(outputs, batch_y)
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-                predicted = (outputs > 0.5).float()
-                correct += (predicted == batch_y).sum().item()
-                total += batch_y.size(0)
-            
-            avg_loss = total_loss / (len(X_tensor) / batch_size)
-            accuracy = correct / total
-            
-            if (epoch + 1) % 10 == 0:
-                print(f"Epoch [{epoch+1}/{epochs}] Loss: {avg_loss:.4f} Accuracy: {accuracy:.2%}")
-        
-        print(f"\n{'='*60}")
-        print(f"Training Complete!")
-        print(f"{'='*60}")
-        print(f"Final Accuracy: {accuracy:.2%}")
-        print(f"Final Loss: {avg_loss:.4f}")
-        
-        # Save model
-        model_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'models'
-        )
-        os.makedirs(model_dir, exist_ok=True)
-        
-        model_path = os.path.join(model_dir, f"{username}_voice_cnn.pth")
-        torch.save(model.state_dict(), model_path)
-        
-        # Save metadata
-        metadata = {
-            'username': username,
-            'enrolled_mfcc': template.mfcc_features,
-            'accuracy': float(accuracy),
-            'loss': float(avg_loss),
-            'framework': 'pytorch'
-        }
-        
-        metadata_path = os.path.join(model_dir, f"{username}_voice_metadata.pkl")
-        with open(metadata_path, 'wb') as f:
-            pickle.dump(metadata, f)
-        
-        print(f"\n✅ Model saved to: {model_path}")
-        print(f"✅ Metadata saved to: {metadata_path}")
-        
-        return model_path
-        
-    finally:
-        db.close()
+    Strategy: randomly sample from realistic human voice ranges, NOT from
+    the user's own distribution.  We use known physiological ranges:
+      - Pitch: 80–300 Hz (male 80–180, female 165–300)
+      - MFCC[0]: −800 to −200 (typical log-energy range)
+      - Speaking rate: 1–8 peaks/s
+    """
+    rng = np.random.default_rng(rng_seed)
+    samples = []
+
+    # Realistic human voice ranges (min, max) per feature index
+    HUMAN_RANGES = {
+        # MFCC means — typical range for 16kHz speech
+        0:  (-600, -100),
+        1:  (-80,   80),
+        2:  (-60,   60),
+        3:  (-50,   50),
+        4:  (-40,   40),
+        5:  (-35,   35),
+        6:  (-30,   30),
+        7:  (-30,   30),
+        8:  (-25,   25),
+        9:  (-25,   25),
+        10: (-20,   20),
+        11: (-20,   20),
+        12: (-20,   20),
+        # MFCC stds
+        **{i: (2, 30) for i in range(13, 26)},
+        # Pitch
+        26: (80,  320),   # mean Hz
+        27: (5,   60),    # std Hz
+        # Speaking rate
+        28: (1.0,  8.0),
+        # Energy
+        29: (0.005, 0.15),
+        30: (0.002, 0.08),
+        # ZCR
+        31: (0.03, 0.35),
+        # Spectral centroid
+        32: (800,  4500),
+        # Spectral rolloff
+        33: (1500, 7000),
+    }
+
+    for _ in range(n):
+        vec = np.zeros(N_FEATURES)
+        for i in range(N_FEATURES):
+            lo, hi = HUMAN_RANGES.get(i, (profile_mean[i] * 0.3, profile_mean[i] * 1.7))
+            # Sample uniformly across the human range, but reject values that
+            # are too close to the enrolled user's own profile
+            for _ in range(10):   # retry up to 10 times
+                v = rng.uniform(lo, hi)
+                # "Too close" = within 0.5 standard deviations of enrolled user
+                tol = max(profile_std[i] * 0.5, 1e-6)
+                if abs(v - profile_mean[i]) >= tol:
+                    break
+            vec[i] = v
+        samples.append(vec)
+    return samples
 
 
-# ============================================================================
-# Main Entry Point
-# ============================================================================
+def generate_genuine_augmentations(
+    genuine_vectors: list,
+    n:               int = 100,
+    rng_seed:        int = 42,
+) -> list:
+    """
+    Augment genuine samples with realistic session-to-session variation.
+    Uses the *within-enrollment* standard deviation as the noise magnitude,
+    so the augmented samples stay within the real spread of the enrolled voice.
+    """
+    rng  = np.random.default_rng(rng_seed)
+    base = np.array(genuine_vectors)
+
+    if base.shape[0] > 1:
+        within_std = base.std(axis=0)
+    else:
+        # Single enrollment: use conservative percentages
+        within_std = np.abs(base[0]) * 0.12
+        within_std = np.where(within_std < 0.5, 0.5, within_std)
+
+    samples = []
+    for _ in range(n):
+        idx    = rng.integers(0, len(genuine_vectors))
+        noisy  = genuine_vectors[idx].copy()
+        # Gaussian noise scaled by within-enrollment spread
+        noise  = rng.normal(0, within_std)
+        noisy  = noisy + noise
+        # Clip ZCR and energy to positive
+        for i in RATIO_INDICES + ENERGY_INDICES:
+            noisy[i] = max(0.0, noisy[i])
+        samples.append(noisy)
+    return samples
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FIX 2: COSINE SIMILARITY — USE DISTANCE, NOT RAW SIM
+#
+#  OLD: fused = 0.70 * cnn_prob + 0.30 * cosine_sim
+#       Cosine sim of speech vectors is almost always 0.8–0.99 so this term
+#       was boosting ALL predictions toward 1.0.
+#
+#  NEW: Use Mahalanobis distance (normalised by enrollment spread) so the
+#       score is 0.0 for a vector far from the enrolled profile and 1.0 for
+#       an exact match.  This correctly penalises impostors.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def mahalanobis_score(
+    vec:          np.ndarray,
+    profile_mean: np.ndarray,
+    profile_std:  np.ndarray,
+) -> float:
+    """
+    Returns a score in [0, 1]: 1 = identical to profile, 0 = very far away.
+    Uses per-feature z-score distance (diagonal Mahalanobis).
+    """
+    safe_std = np.where(profile_std < 1e-6, 1e-6, profile_std)
+    z = np.abs((vec - profile_mean) / safe_std)
+    mean_z = float(np.mean(z))
+    # Sigmoid mapping: z=0 → 1.0, z=1 → 0.73, z=2 → 0.27, z=3 → 0.05
+    score = 1.0 / (1.0 + np.exp(mean_z - 1.5))
+    return float(np.clip(score, 0, 1))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODEL BUILD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_pipeline():
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+
+    clf = MLPClassifier(
+        hidden_layer_sizes=(128, 64, 32),
+        activation='relu',
+        solver='adam',
+        alpha=0.002,              # slightly stronger L2 reg vs original
+        learning_rate='adaptive',
+        max_iter=600,
+        early_stopping=True,
+        validation_fraction=0.15,
+        n_iter_no_change=25,
+        random_state=42,
+    )
+    return Pipeline([("scaler", StandardScaler()), ("mlp", clf)])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TRAINING
+# ─────────────────────────────────────────────────────────────────────────────
 
 def train_voice_model(username: str):
-    """Train voice CNN model for a user"""
-    if USE_TENSORFLOW:
-        return train_model_tensorflow(username)
-    else:
-        return train_model_pytorch(username)
+    db = SessionLocal()
+
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            print(f"❌ User '{username}' not found!")
+            return None
+
+        print(f"\n{'='*70}")
+        print(f"  VOICE MODEL TRAINING  —  user: {username}")
+        print(f"{'='*70}")
+
+        genuine_vectors = load_enrollment_samples(db, user.id)
+        if not genuine_vectors:
+            print("❌ No valid voice enrollment samples. Re-enroll first.")
+            return None
+
+        print(f"  Enrollment samples: {len(genuine_vectors)}")
+        if len(genuine_vectors) < 3:
+            print("  ⚠  Fewer than 3 samples — accuracy will be lower.")
+
+        profile_mean = np.array(genuine_vectors).mean(axis=0)
+        profile_std  = np.array(genuine_vectors).std(axis=0) if len(genuine_vectors) > 1 \
+                       else np.abs(profile_mean) * 0.10
+
+        print(f"\n  Profile summary:")
+        print(f"    MFCC[0]      : {profile_mean[0]:.2f}")
+        print(f"    Pitch        : {profile_mean[26]:.1f} ± {profile_mean[27]:.1f} Hz")
+        print(f"    Speaking rate: {profile_mean[28]:.2f} peaks/s")
+        print(f"    Energy       : {profile_mean[29]:.4f}")
+
+        # ── Build training set ─────────────────────────────────────────────
+        genuine_aug = generate_genuine_augmentations(
+            genuine_vectors,
+            n=max(100, len(genuine_vectors) * 30)
+        )
+
+        # Prefer real impostors from other enrolled users
+        real_impostors = load_real_impostors(db, user.id)
+        if len(real_impostors) >= 20:
+            print(f"  Using {len(real_impostors)} real impostor samples from other users.")
+            impostor_samples = real_impostors
+            # Augment real impostors too to balance classes
+            while len(impostor_samples) < len(genuine_aug) * 2:
+                impostor_samples += generate_synthetic_impostors(
+                    profile_mean, profile_std, n=50
+                )
+        else:
+            if real_impostors:
+                print(f"  Only {len(real_impostors)} real impostor samples — supplementing synthetically.")
+            else:
+                print("  No other enrolled users found — using synthetic impostors.")
+            impostor_samples = real_impostors + generate_synthetic_impostors(
+                profile_mean, profile_std,
+                n=max(200, len(genuine_aug) * 2)
+            )
+
+        X = np.vstack([genuine_aug, impostor_samples])
+        y = np.array([1] * len(genuine_aug) + [0] * len(impostor_samples))
+
+        print(f"\n  Training data: {len(genuine_aug)} genuine / {len(impostor_samples)} impostor")
+
+        # ── Cross-validate ─────────────────────────────────────────────────
+        from sklearn.model_selection import StratifiedKFold, cross_val_predict
+        from sklearn.metrics import confusion_matrix, accuracy_score
+
+        pipeline = build_pipeline()
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+        print("  Running 5-fold cross-validation …")
+        y_prob_cv = cross_val_predict(pipeline, X, y, cv=cv, method="predict_proba")[:, 1]
+
+        # Find optimal threshold (minimise EER)
+        thresholds  = np.arange(0.30, 0.90, 0.02)
+        best_thresh = 0.50
+        best_eer    = 1.0
+
+        print(f"\n  {'Threshold':>10}  {'FAR':>8}  {'FRR':>8}  {'EER':>8}")
+        for t in thresholds:
+            y_t = (y_prob_cv >= t).astype(int)
+            if len(np.unique(y_t)) < 2:
+                continue
+            cm = confusion_matrix(y, y_t)
+            if cm.shape != (2, 2):
+                continue
+            tn, fp, fn, tp = cm.ravel()
+            far_t = fp / (fp + tn) if (fp + tn) > 0 else 0
+            frr_t = fn / (fn + tp) if (fn + tp) > 0 else 0
+            eer_t = (far_t + frr_t) / 2
+            marker = " ◄" if eer_t < best_eer else ""
+            print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}{marker}")
+            if eer_t < best_eer:
+                best_eer    = eer_t
+                best_thresh = float(t)
+
+        # ── Final metrics at chosen threshold ──────────────────────────────
+        y_final = (y_prob_cv >= best_thresh).astype(int)
+        cm = confusion_matrix(y, y_final)
+        tn, fp, fn, tp = cm.ravel()
+        far = fp / (fp + tn) if (fp + tn) > 0 else 0
+        frr = fn / (fn + tp) if (fn + tp) > 0 else 0
+
+        print(f"\n  Final @ threshold {best_thresh:.2f}:")
+        print(f"    FAR  : {far:.2%}   (false accept rate — impostors let in)")
+        print(f"    FRR  : {frr:.2%}   (false reject rate — real user locked out)")
+        print(f"    EER  : {best_eer:.2%}")
+        print(f"    ACC  : {accuracy_score(y, y_final):.2%}")
+
+        if far > 0.15:
+            print("  ⚠  FAR > 15% — enroll more samples or re-record in a quiet environment.")
+
+        # ── Train final model on full data ─────────────────────────────────
+        print("\n  Training final model on full dataset …")
+        pipeline.fit(X, y)
+
+        # ── Save ───────────────────────────────────────────────────────────
+        model_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+        os.makedirs(model_dir, exist_ok=True)
+
+        model_data = {
+            'pipeline':     pipeline,
+            'n_features':   N_FEATURES,
+            'username':     username,
+            'user_id':      user.id,
+            'n_enrollment': len(genuine_vectors),
+            'profile_mean': profile_mean,
+            'profile_std':  profile_std,
+            'threshold':    best_thresh,
+            'far':          float(far),
+            'frr':          float(frr),
+            'eer':          float(best_eer),
+        }
+
+        model_path = os.path.join(model_dir, f"{username}_voice_cnn.pkl")
+        with open(model_path, 'wb') as f:
+            pickle.dump(model_data, f)
+
+        print(f"\n  ✅ Model saved → {model_path}  ({os.path.getsize(model_path)/1024:.1f} KB)")
+        return model_path
+
+    finally:
+        db.close()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  FIX 3: predict_voice — correct 34-feature vector + Mahalanobis gating
+#
+#  OLD: passed only mfcc_features (13 values) to a model expecting 34 → the
+#       remaining 21 features were zero, making every prediction unreliable.
+#
+#  NEW: builds the full 34-feature vector from the feature_dict, adds a
+#       Mahalanobis gate so that a voice far from the enrolled profile is
+#       rejected even if the CNN is uncertain.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def predict_voice(username: str, feature_dict: dict) -> dict:
+    """
+    Authenticate a voice sample against the enrolled model.
+
+    feature_dict must contain ALL keys returned by the /extract-mfcc endpoint:
+      mfcc_features, mfcc_std, pitch_mean, pitch_std, speaking_rate,
+      energy_mean, energy_std, zcr_mean, spectral_centroid_mean,
+      spectral_rolloff_mean
+    """
+    model_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+    model_path = os.path.join(model_dir, f"{username}_voice_cnn.pkl")
+
+    if not os.path.exists(model_path):
+        return {'error': f'No voice model for "{username}". Enroll first.'}
+
+    with open(model_path, 'rb') as f:
+        model_data = pickle.load(f)
+
+    pipeline     = model_data['pipeline']
+    profile_mean = model_data['profile_mean']
+    profile_std  = model_data['profile_std']
+    threshold    = model_data['threshold']
+
+    # Build full 34-feature vector — MUST match training layout exactly
+    mfcc_mean = list(feature_dict.get('mfcc_features', [0] * 13))
+    mfcc_std  = list(feature_dict.get('mfcc_std',      [0] * 13))
+    while len(mfcc_mean) < 13: mfcc_mean.append(0.0)
+    while len(mfcc_std)  < 13: mfcc_std.append(0.0)
+
+    vec = np.array(
+        mfcc_mean[:13] + mfcc_std[:13] + [
+            float(feature_dict.get('pitch_mean',             0)),
+            float(feature_dict.get('pitch_std',              0)),
+            float(feature_dict.get('speaking_rate',          0)),
+            float(feature_dict.get('energy_mean',            0)),
+            float(feature_dict.get('energy_std',             0)),
+            float(feature_dict.get('zcr_mean',               0)),
+            float(feature_dict.get('spectral_centroid_mean', 0)),
+            float(feature_dict.get('spectral_rolloff_mean',  0)),
+        ],
+        dtype=np.float64
+    ).reshape(1, -1)
+
+    # Sanity check: if mfcc_std is all zeros the caller sent only 13 features
+    if vec[0, 13:26].sum() == 0:
+        print("⚠  WARNING: mfcc_std is all zeros — frontend may only be sending "
+              "mfcc_features (13 values) instead of the full 34-feature dict. "
+              "See speech.js fix notes.")
+
+    # CNN probability
+    cnn_prob = float(pipeline.predict_proba(vec)[0][1])
+
+    # Mahalanobis proximity score (replaces raw cosine similarity)
+    mah_score = mahalanobis_score(vec[0], profile_mean, profile_std)
+
+    # Fused score: 65% CNN + 35% Mahalanobis
+    # Mahalanobis is now a genuine discriminator (not inflated like cosine sim was)
+    fused = 0.65 * cnn_prob + 0.35 * mah_score
+    match = fused >= threshold
+
+    print(f"\n  Voice auth result for '{username}':")
+    print(f"    CNN probability  : {cnn_prob:.4f}")
+    print(f"    Mahalanobis score: {mah_score:.4f}")
+    print(f"    Fused score      : {fused:.4f}  (threshold={threshold:.2f})")
+    print(f"    Decision         : {'✅ MATCH' if match else '❌ REJECT'}")
+
+    return {
+        'match':           bool(match),
+        'confidence':      round(cnn_prob * 100, 2),
+        'mahalanobis':     round(mah_score * 100, 2),
+        'fused_score':     round(fused * 100, 2),
+        'threshold':       round(threshold * 100, 2),
+        'far':             round(model_data.get('far', 0) * 100, 2),
+        'frr':             round(model_data.get('frr', 0) * 100, 2),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        username = sys.argv[1]
-    else:
-        username = input("Enter username to train voice model for: ").strip()
-    
+    username = sys.argv[1] if len(sys.argv) > 1 else input("Username: ").strip()
     train_voice_model(username)

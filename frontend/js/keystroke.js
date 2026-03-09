@@ -6,7 +6,6 @@
 //   3. Spacebar added to hand detection (thumb) for word-boundary alternation
 //   4. Shift-key lag tracking (new biometric feature)
 //   5. Inter-session normalization (speed-independent ratio features)
-//   6. Pre-auth quality filter before hitting the ML backend
 
 const KeystrokeCapture = {
     events: [],
@@ -17,7 +16,7 @@ const KeystrokeCapture = {
     backspaceCount: 0,
     shiftPressTime: null,
     shiftKeyLags: [],
-    targetPhrase: "Biometric Voice Keystroke Authentication",
+    targetPhrase: "biometric voice keystroke authentication",
 
     // ── Keyboard layout ───────────────────────────────────────────────────
     // FIX: spacebar now assigned to 'thumb' so word-boundary hand
@@ -342,29 +341,6 @@ const KeystrokeCapture = {
             shift_lag_norm:   f.shift_lag_mean / baseline,
             // rhythm_cv is already normalized (std/mean) — keep as-is
         };
-    },
-
-    // ── Pre-auth quality check ────────────────────────────────────────────
-    // Call this BEFORE sending features to the ML backend.
-    // If quality is 'low', show the user a "please retype" message instead
-    // of wasting a prediction on a bad sample — directly reduces FFR.
-    getTypingQuality(features) {
-        if (!features)
-            return { quality: 'low', reason: 'no features extracted' };
-
-        if (features.rhythm_cv > 0.8)
-            return { quality: 'low', reason: 'inconsistent rhythm — please retype' };
-
-        if (features.typing_speed_cpm < 15 || features.typing_speed_cpm > 700)
-            return { quality: 'low', reason: 'abnormal typing speed — please retype' };
-
-        if (features.backspace_ratio > 0.3)
-            return { quality: 'low', reason: 'too many corrections — please retype' };
-
-        if (features.typing_duration < 2 || features.typing_duration > 30)
-            return { quality: 'low', reason: 'unusual duration — please retype' };
-
-        return { quality: 'high', reason: 'ok' };
     },
 
     validatePhrase(inputValue) {
