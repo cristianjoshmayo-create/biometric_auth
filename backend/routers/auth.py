@@ -427,7 +427,7 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             user.is_flagged = True
             db.commit()
 
-    return {"authenticated": authenticated, "confidence": float(confidence)}
+    return {"authenticated": bool(authenticated), "confidence": float(confidence)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -511,7 +511,7 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
     log_attempt(db, user.id, "voice", confidence,
                 "granted" if authenticated else "denied")
 
-    return {"authenticated": authenticated, "confidence": float(confidence)}
+    return {"authenticated": bool(authenticated), "confidence": float(confidence)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

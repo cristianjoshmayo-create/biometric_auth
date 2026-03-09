@@ -30,6 +30,8 @@ class KeystrokeTemplate(Base):
     user_id            = Column(Integer, ForeignKey("users.id"), nullable=False)
     attempt_number     = Column(Integer, default=1)
     enrollment_session = Column(Integer, default=1)
+    sample_order       = Column(Integer, default=0)   # ← ADD THIS
+    source             = Column(String(50), default="enrollment")  # ← ADD THIS
 
     dwell_times  = Column(ARRAY(Float), nullable=False)
     flight_times = Column(ARRAY(Float), nullable=False)
