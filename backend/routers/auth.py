@@ -15,6 +15,8 @@ import subprocess    # ← ADD THIS
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion, AuthLog
 
+router = APIRouter()
+
 # ─── Configuration ────────────────────────────────────────
 MAX_SAMPLES = 50  # Rolling window size for adaptive learning
 
