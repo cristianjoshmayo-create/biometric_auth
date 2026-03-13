@@ -541,6 +541,89 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
     log_attempt(db, user.id, "voice", confidence,
                 "granted" if authenticated else "denied")
 
+    # ── Adaptive learning: save login sample and retrain periodically ─────
+    if authenticated:
+        MAX_VOICE_SAMPLES = 50
+
+        total_voice = db.query(VoiceTemplate).filter(
+            VoiceTemplate.user_id == user.id
+        ).count()
+
+        # Rolling window — delete oldest if at limit
+        if total_voice >= MAX_VOICE_SAMPLES:
+            oldest = db.query(VoiceTemplate).filter(
+                VoiceTemplate.user_id == user.id
+            ).order_by(VoiceTemplate.attempt_number.asc()).first()
+            if oldest:
+                db.delete(oldest)
+                db.flush()
+
+        # Save this login attempt as a new voice sample
+        new_voice = VoiceTemplate(
+            user_id        = user.id,
+            attempt_number = min(total_voice + 1, MAX_VOICE_SAMPLES),
+            mfcc_features  = payload.mfcc_features,
+            mfcc_std       = payload.mfcc_std,
+            pitch_mean     = payload.pitch_mean,
+            pitch_std      = payload.pitch_std,
+            speaking_rate  = payload.speaking_rate,
+            energy_mean    = payload.energy_mean,
+            energy_std     = payload.energy_std,
+            zcr_mean               = payload.zcr_mean,
+            spectral_centroid_mean = payload.spectral_centroid_mean,
+            spectral_rolloff_mean  = payload.spectral_rolloff_mean,
+        )
+        db.add(new_voice)
+        db.commit()
+
+        updated_voice_count = db.query(VoiceTemplate).filter(
+            VoiceTemplate.user_id == user.id
+        ).count()
+
+        print(f"  💾 Saved voice login sample (total: {updated_voice_count}/{MAX_VOICE_SAMPLES})")
+
+        # Adaptive retrain intervals
+        successful_voice_logins = db.query(AuthLog).filter(
+            AuthLog.user_id == user.id,
+            AuthLog.auth_method == "voice",
+            AuthLog.result == "granted"
+        ).count()
+
+        if updated_voice_count <= 10:
+            retrain_interval = 2
+        elif updated_voice_count <= 30:
+            retrain_interval = 5
+        else:
+            retrain_interval = 10
+
+        voice_milestones = [10, 20, 30, 40, 50]
+        should_retrain = (
+            successful_voice_logins % retrain_interval == 0 or
+            updated_voice_count in voice_milestones
+        )
+
+        if should_retrain:
+            retrain_reason = (
+                f"milestone ({updated_voice_count} samples)"
+                if updated_voice_count in voice_milestones
+                else f"interval ({retrain_interval} logins)"
+            )
+            print(f"  🔄 Triggering voice retrain: {retrain_reason}")
+            try:
+                script_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                    'ml', 'train_voice_cnn.py'
+                )
+                subprocess.Popen(
+                    [sys.executable, script_path, payload.username],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                )
+                print(f"  ✅ Voice retraining started in background")
+            except Exception as e:
+                print(f"  ⚠️ Voice retrain failed to start: {e}")
+
     return {"authenticated": bool(authenticated), "confidence": float(confidence)}
 
 

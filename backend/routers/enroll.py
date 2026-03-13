@@ -15,8 +15,70 @@ import bcrypt  # ← ADDED
 
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion
+import threading
+import sys
 
 router = APIRouter()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  AUTO-TRAIN HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+def _run_training(username: str):
+    """Runs in a background thread — trains keystroke model after enrollment."""
+    try:
+        # Add project root to path so ml/ is importable
+        project_root = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+        )
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+
+        from ml.train_keystroke_rf import train_random_forest
+        print(f"\n🔄 Auto-training keystroke model for '{username}' ...")
+        model_path = train_random_forest(username)
+        if model_path:
+            print(f"✅ Auto-training complete → {model_path}")
+        else:
+            print(f"⚠  Auto-training returned no model for '{username}'")
+    except Exception as e:
+        import traceback
+        print(f"❌ Auto-training failed for '{username}': {e}")
+        traceback.print_exc()
+
+
+def trigger_training(username: str):
+    """Fire-and-forget: starts training in background, API responds immediately."""
+    t = threading.Thread(target=_run_training, args=(username,), daemon=True)
+    t.start()
+
+
+def _run_voice_training(username: str):
+    """Runs in a background thread — trains voice model after enrollment."""
+    try:
+        project_root = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+        )
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+
+        from ml.train_voice_cnn import train_voice_model
+        print(f"\n🔄 Auto-training voice model for '{username}' ...")
+        model_path = train_voice_model(username)
+        if model_path:
+            print(f"✅ Voice auto-training complete → {model_path}")
+        else:
+            print(f"⚠  Voice auto-training returned no model for '{username}'")
+    except Exception as e:
+        import traceback
+        print(f"❌ Voice auto-training failed for '{username}': {e}")
+        traceback.print_exc()
+
+
+def trigger_voice_training(username: str):
+    """Fire-and-forget: starts voice training in background."""
+    t = threading.Thread(target=_run_voice_training, args=(username,), daemon=True)
+    t.start()
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SCHEMAS
@@ -242,14 +304,23 @@ def enroll_keystroke(payload: KeystrokeEnroll, db: Session = Depends(get_db)):
     db.add(template)
     db.commit()
 
-    print(f"✅ Keystroke attempt #{existing_count+1} for '{payload.username}' | "
+    attempt_num = existing_count + 1
+    print(f"✅ Keystroke attempt #{attempt_num} for '{payload.username}' | "
           f"dwell={payload.dwell_mean:.1f}ms flight={payload.flight_mean:.1f}ms "
           f"cpm={payload.typing_speed_cpm:.0f}")
 
+    # Auto-train after every sample (background thread — won't block the response)
+    training_started = False
+    if attempt_num >= 1:
+        trigger_training(payload.username)
+        training_started = True
+
     return {
-        "success":        True,
-        "message":        f"Keystroke attempt #{existing_count+1} saved",
-        "attempt_number": existing_count + 1,
+        "success":          True,
+        "message":          f"Keystroke attempt #{attempt_num} saved",
+        "attempt_number":   attempt_num,
+        "training_started": training_started,
+        "training_note":    "Model is being trained in the background." if training_started else "",
     }
 
 
@@ -291,16 +362,22 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
     db.add(template)
     db.commit()
 
-    print(f"✅ Voice attempt #{existing_count+1} for '{payload.username}' | "
+    attempt_num = existing_count + 1
+    print(f"✅ Voice attempt #{attempt_num} for '{payload.username}' | "
           f"pitch={payload.pitch_mean:.1f}Hz  energy={payload.energy_mean:.4f}  "
           f"rate={payload.speaking_rate:.2f}  "
           f"mfcc_std={'✓' if payload.mfcc_std else '✗ MISSING'}")
 
+    # Auto-train after every sample (background thread — won't block the response)
+    trigger_voice_training(payload.username)
+
     return {
         "success":           True,
-        "message":           f"Voice attempt #{existing_count+1} saved",
-        "attempt_number":    existing_count + 1,
+        "message":           f"Voice attempt #{attempt_num} saved",
+        "attempt_number":    attempt_num,
         "has_full_features": not missing_features,
+        "training_started":  True,
+        "training_note":     "Voice model is being trained in the background.",
     }
 
 

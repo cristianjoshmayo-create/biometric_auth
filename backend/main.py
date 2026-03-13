@@ -26,13 +26,13 @@ app.add_middleware(
 
 # Register routers
 app.include_router(enroll.router, prefix="/api/enroll", tags=["Enrollment"])
-app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
+app.include_router(auth.router,   prefix="/api/auth",   tags=["Authentication"])
 
 @app.get("/")
 def root():
     return {
-        "system": "Multimodal Biometric Authentication",
-        "status": "running",
+        "system":  "Multimodal Biometric Authentication",
+        "status":  "running",
         "version": "1.0.0"
     }
 

@@ -120,40 +120,48 @@
 
         <!-- Keystroke Enrollment Section -->
         <div id="keystroke-section" class="hidden">
+
+            <!-- Phrase display -->
             <div class="bg-gray-800 rounded-lg p-4 mb-4 text-center border border-gray-700">
-                <p class="text-gray-400 text-xs mb-1">TYPE THIS PHRASE:</p>
-                <p class="text-purple-400 font-mono text-base font-semibold">
+                <p class="text-gray-400 text-xs mb-2 uppercase tracking-widest">Type this phrase exactly</p>
+                <p class="text-purple-400 font-mono text-sm font-semibold leading-relaxed tracking-wide">
                     biometric voice keystroke authentication
                 </p>
             </div>
-            <div class="flex justify-center gap-2 mb-4">
-                <div id="attempt-1" class="w-3 h-3 rounded-full bg-gray-700"></div>
-                <div id="attempt-2" class="w-3 h-3 rounded-full bg-gray-700"></div>
-                <div id="attempt-3" class="w-3 h-3 rounded-full bg-gray-700"></div>
+
+            <!-- Progress bar -->
+            <div class="mb-1 flex justify-between text-xs text-gray-500">
+                <span id="attempt-label">Attempt 1 of 5</span>
+                <span id="attempt-pct">0%</span>
             </div>
-            <p id="attempt-label" class="text-center text-gray-400 text-sm mb-3">
-                Attempt 1 of 3
-            </p>
+            <div class="w-full bg-gray-700 rounded-full h-2 mb-4">
+                <div id="keystroke-progress-bar"
+                     class="bg-purple-600 h-2 rounded-full transition-all duration-500"
+                     style="width: 0%"></div>
+            </div>
+
+            <!-- Input — auto-submits on phrase completion, no button needed -->
             <input
                 id="keystroke-input"
                 type="text"
-                placeholder="Type the phrase here..."
+                placeholder="Start typing..."
                 class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
-                       mb-4 outline-none focus:ring-2 focus:ring-purple-500
+                       mb-3 outline-none focus:ring-2 focus:ring-purple-500
                        font-mono border border-gray-700"
-                autocomplete="off"
+                autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
             />
-            <p id="keystroke-status" class="text-center text-sm mb-4 text-gray-500">
-                Start typing when ready
+
+            <!-- Live feedback row -->
+            <div class="flex justify-between text-xs text-gray-500 mb-3 px-1">
+                <span id="ks-speed-display">Speed: —</span>
+                <span id="ks-consistency-display">Consistency: —</span>
+            </div>
+
+            <p id="keystroke-status" class="text-center text-sm mb-2 text-gray-400">
+                Type the phrase above at your natural pace
             </p>
-            <button
-                onclick="submitKeystroke()"
-                class="w-full bg-purple-600 hover:bg-purple-700 text-white
-                       font-semibold py-3 rounded-lg transition-colors duration-200"
-            >
-                Submit Attempt
-            </button>
         </div>
+
 
         <!-- Voice Enrollment Section -->
         <div id="voice-section" class="hidden">

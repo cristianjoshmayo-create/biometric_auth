@@ -145,6 +145,25 @@ def load_real_impostors(db, exclude_user_id: int):
     return impostors
 
 
+def load_cmu_impostors() -> list:
+    """
+    Load pre-built CMU Keystroke Dynamics Benchmark profiles (51 subjects).
+    Run:  python ml/load_cmu_impostors.py   ONCE to generate the .pkl file.
+    Returns empty list gracefully if file not found.
+    """
+    pkl_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'models', 'cmu_impostor_profiles.pkl'
+    )
+    if not os.path.exists(pkl_path):
+        print("  ⚠  CMU impostor profiles not found.")
+        print("     Run:  python ml/load_cmu_impostors.py")
+        return []
+    with open(pkl_path, 'rb') as f:
+        vecs = pickle.load(f)
+    print(f"  CMU impostor profiles loaded: {len(vecs)} subjects")
+    return vecs
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  SYNTHETIC DATA GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -270,26 +289,36 @@ def train_random_forest(username: str):
                 print(f"    {label:20s}: {profile_mean[fn.index(feat)]:.3f}")
 
         # ── Build training set ─────────────────────────────────────────────
-        n_genuine  = max(120, len(genuine_vectors) * 30)
+        # Priority: CMU (51 real humans) → enrolled users → synthetic top-up
+        n_genuine   = max(120, len(genuine_vectors) * 30)
         genuine_aug = generate_genuine_samples(genuine_vectors, n=n_genuine)
 
+        cmu_impostors  = load_cmu_impostors()
         real_impostors = load_real_impostors(db, user.id)
-        n_impostor = max(300, n_genuine * 3)
-        synthetic_impostors = generate_impostor_samples(profile_mean, profile_std, n=n_impostor)
-        all_impostors = real_impostors + synthetic_impostors
+        real_pool      = cmu_impostors + real_impostors
 
-        print(f"  Impostor pool: {len(real_impostors)} real + {len(synthetic_impostors)} synthetic = {len(all_impostors)} total")
+        # Only generate synthetic to top up to 3:1 ratio
+        n_target    = max(300, n_genuine * 3)
+        n_synthetic = max(0, n_target - len(real_pool))
+        synthetic_impostors = generate_impostor_samples(
+            profile_mean, profile_std, n=n_synthetic
+        ) if n_synthetic > 0 else []
 
-        X = np.vstack([genuine_aug, all_impostors])
-        y = np.array([1] * len(genuine_aug) + [0] * len(all_impostors))
+        all_impostors = real_pool + synthetic_impostors
 
         print(f"\n{'='*70}")
         print(f"  TRAINING DATA")
         print(f"{'='*70}")
-        print(f"  Genuine samples  : {len(genuine_aug)}")
-        print(f"  Impostor samples : {len(all_impostors)}")
-        print(f"  Feature dims     : {X.shape[1]}")
-        print(f"  Impostor ratio   : {len(all_impostors)/len(genuine_aug):.1f}:1")
+        print(f"  Genuine samples    : {len(genuine_aug)}")
+        print(f"  CMU impostors      : {len(cmu_impostors)}  (51 real humans)")
+        print(f"  Enrolled impostors : {len(real_impostors)}  (other users in DB)")
+        print(f"  Synthetic top-up   : {len(synthetic_impostors)}")
+        print(f"  Total impostors    : {len(all_impostors)}")
+        print(f"  Feature dims       : {len(FEATURE_NAMES)}")
+        print(f"  Impostor ratio     : {len(all_impostors)/len(genuine_aug):.1f}:1")
+
+        X = np.vstack([genuine_aug, all_impostors])
+        y = np.array([1] * len(genuine_aug) + [0] * len(all_impostors))
 
         # ── Pipeline ──────────────────────────────────────────────────────
         pipeline = Pipeline([
