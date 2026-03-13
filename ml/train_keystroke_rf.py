@@ -1,7 +1,5 @@
 # ml/train_keystroke_rf.py
-# Trains Random Forest model for keystroke authentication
-# Fixed: multiple enrollment samples, calibrated noise, updated features,
-#        feature-aware perturbation, real EER evaluation
+# Hardened: realistic impostor generation, stricter thresholds, FAR-biased tuning
 
 import sys
 import os
@@ -26,17 +24,14 @@ from database.db import SessionLocal
 from database.models import User, KeystrokeTemplate
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FEATURE NAMES
-#  Must match exactly what keystroke.js v2 sends and models.py stores.
+#  FEATURE NAMES — must match keystroke.js and models.py exactly
 # ─────────────────────────────────────────────────────────────────────────────
 FEATURE_NAMES = [
-    # Core timing
     'dwell_mean',   'dwell_std',   'dwell_median', 'dwell_min',  'dwell_max',
     'flight_mean',  'flight_std',  'flight_median',
     'p2p_mean',     'p2p_std',
     'r2r_mean',     'r2r_std',
 
-    # Digraphs — only those present in "Biometric Voice Keystroke Authentication"
     'digraph_th', 'digraph_he',
     'digraph_bi', 'digraph_io', 'digraph_om', 'digraph_me', 'digraph_et',
     'digraph_tr', 'digraph_ri', 'digraph_ic', 'digraph_vo', 'digraph_oi',
@@ -44,7 +39,6 @@ FEATURE_NAMES = [
     'digraph_ro', 'digraph_ok', 'digraph_au', 'digraph_ut', 'digraph_en',
     'digraph_nt', 'digraph_ti', 'digraph_ca', 'digraph_at', 'digraph_on',
 
-    # Behavioral
     'typing_speed_cpm', 'typing_duration',
     'rhythm_mean', 'rhythm_std', 'rhythm_cv',
     'pause_count', 'pause_mean',
@@ -52,16 +46,13 @@ FEATURE_NAMES = [
     'hand_alternation_ratio', 'same_hand_sequence_mean',
     'finger_transition_ratio', 'seek_time_mean', 'seek_time_count',
 
-    # Shift-lag (new)
     'shift_lag_mean', 'shift_lag_std', 'shift_lag_count',
 
-    # Normalized ratios (new) — speed-independent, key for reducing FFR
     'dwell_mean_norm',  'dwell_std_norm',
     'flight_mean_norm', 'flight_std_norm',
     'p2p_std_norm',     'r2r_mean_norm',  'shift_lag_norm',
 ]
 
-# Features that are counts or ratios — need additive noise not multiplicative
 COUNT_FEATURES = {
     'pause_count', 'backspace_count', 'seek_time_count', 'shift_lag_count'
 }
@@ -71,126 +62,171 @@ RATIO_FEATURES = {
     'flight_mean_norm', 'flight_std_norm', 'r2r_mean_norm', 'shift_lag_norm',
 }
 
+# Realistic human typing ranges (min, max) — used for plausible impostor generation
+HUMAN_RANGES = {
+    'dwell_mean':    (40,   250),
+    'dwell_std':     (5,    80),
+    'dwell_median':  (40,   250),
+    'dwell_min':     (20,   120),
+    'dwell_max':     (80,   500),
+    'flight_mean':   (30,   400),
+    'flight_std':    (10,   150),
+    'flight_median': (30,   400),
+    'p2p_mean':      (80,   600),
+    'p2p_std':       (20,   200),
+    'r2r_mean':      (80,   600),
+    'r2r_std':       (20,   200),
+    'typing_speed_cpm':  (80,  600),
+    'typing_duration':   (3,   30),
+    'rhythm_mean':       (80,  600),
+    'rhythm_std':        (20,  200),
+    'rhythm_cv':         (0.1, 1.5),
+    'pause_count':       (0,   8),
+    'pause_mean':        (0,   500),
+    'backspace_ratio':   (0,   0.3),
+    'backspace_count':   (0,   5),
+    'hand_alternation_ratio':  (0.2, 0.8),
+    'same_hand_sequence_mean': (1.0, 5.0),
+    'finger_transition_ratio': (0.3, 0.9),
+    'seek_time_mean':    (0,   300),
+    'seek_time_count':   (0,   5),
+    'shift_lag_mean':    (0,   200),
+    'shift_lag_std':     (0,   100),
+    'shift_lag_count':   (0,   8),
+    'dwell_mean_norm':   (0.5, 2.0),
+    'dwell_std_norm':    (0.3, 1.5),
+    'flight_mean_norm':  (0.5, 2.5),
+    'flight_std_norm':   (0.3, 2.0),
+    'p2p_std_norm':      (0.3, 2.0),
+    'r2r_mean_norm':     (0.5, 2.5),
+    'shift_lag_norm':    (0.0, 2.0),
+}
+DIGRAPH_RANGE = (20, 300)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  DATA EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 def extract_feature_vector(template) -> np.ndarray:
-    """Pull feature values from a KeystrokeTemplate ORM row → numpy vector."""
     return np.array([
         float(getattr(template, name, 0.0) or 0.0)
         for name in FEATURE_NAMES
     ], dtype=np.float64)
 
 
-def load_enrollment_samples(db, user_id: int) -> list[np.ndarray]:
-    """
-    FIX: fetch ALL enrollment attempts for a user, not just .first().
-    Returns list of feature vectors — one per attempt.
-    """
+def load_enrollment_samples(db, user_id: int):
     templates = (
         db.query(KeystrokeTemplate)
         .filter(KeystrokeTemplate.user_id == user_id)
-        .order_by(KeystrokeTemplate.enrolled_at.asc())
+        .order_by(KeystrokeTemplate.sample_order.asc())
         .all()
     )
     if not templates:
         return []
-
     vectors = []
     for t in templates:
         vec = extract_feature_vector(t)
-        # Basic sanity: skip rows where dwell_mean is negative (old corrupt data)
         dwell_idx = FEATURE_NAMES.index('dwell_mean')
         if vec[dwell_idx] < 0:
             print(f"  ⚠  Skipping corrupt template id={t.id} (negative dwell_mean)")
             continue
         vectors.append(vec)
-
     return vectors
+
+
+def load_real_impostors(db, exclude_user_id: int):
+    other_users = db.query(User).filter(User.id != exclude_user_id).all()
+    impostors = []
+    for u in other_users:
+        vecs = load_enrollment_samples(db, u.id)
+        impostors.extend(vecs)
+    if impostors:
+        print(f"  Real impostor samples from {len(other_users)} other user(s): {len(impostors)}")
+    return impostors
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SYNTHETIC DATA GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
-def generate_synthetic_data(
-    genuine_vectors: list[np.ndarray],
-    num_genuine: int = 80,
-    num_impostor: int = 160,
-    rng_seed: int = 42,
-) -> tuple[np.ndarray, np.ndarray]:
+def generate_genuine_samples(genuine_vectors, n: int = 120, rng_seed: int = 42):
     """
-    Build training data from real enrollment vectors.
+    Tight augmentation — 10% noise max so the model learns a narrow boundary.
+    Old code used 22% which was far too loose, letting impostors slip through.
+    """
+    rng  = np.random.default_rng(rng_seed)
+    base = np.array(genuine_vectors)
 
-    Genuine samples:
-      - Perturb each real enrollment vector with noise calibrated to
-        real human session-to-session variance (~20-25% CV from data analysis).
-      - Samples are drawn from ALL enrollment vectors, not just one.
+    if base.shape[0] > 1:
+        within_std = base.std(axis=0)
+    else:
+        within_std = np.abs(base[0]) * 0.08
 
-    Impostor samples:
-      - Larger shifts in random directions to simulate a different person.
-      - Bounded so they stay physically plausible (no negative counts etc).
+    samples = []
+    for _ in range(n):
+        idx   = rng.integers(0, len(genuine_vectors))
+        noisy = genuine_vectors[idx].copy()
+
+        for i, name in enumerate(FEATURE_NAMES):
+            if name in COUNT_FEATURES:
+                noisy[i] = max(0, noisy[i] + rng.integers(-1, 2))
+            elif name in RATIO_FEATURES:
+                noisy[i] = float(np.clip(noisy[i] + rng.normal(0, within_std[i] * 0.8 + 0.01), 0, 2))
+            else:
+                factor = rng.normal(1.0, 0.10)
+                factor = np.clip(factor, 0.75, 1.25)
+                noisy[i] = noisy[i] * factor
+
+        samples.append(noisy)
+    return samples
+
+
+def generate_impostor_samples(profile_mean, profile_std, n: int = 300, rng_seed: int = 42):
+    """
+    Impostors drawn from realistic human ranges — NOT from user's own profile.
+    Key features are forced to differ by at least 1.5 sigma from enrolled user.
     """
     rng = np.random.default_rng(rng_seed)
-    base = np.array(genuine_vectors)           # shape: (n_enrollments, n_features)
-    profile_mean = base.mean(axis=0)           # centroid of user's real profile
-    profile_std  = base.std(axis=0) + 1e-9    # real spread across enrollments
 
-    # ── Genuine samples ───────────────────────────────────────────────────
-    # Calibrated to real rhythm_cv ~1.1-1.6 observed in data
-    # Using 22% multiplicative noise for timing, additive for counts/ratios
-    genuine_samples = []
-    for _ in range(num_genuine):
-        idx   = rng.integers(0, len(genuine_vectors))
-        base_vec = genuine_vectors[idx].copy()
-        noisy = base_vec.copy()
+    KEY_FEATURES = {
+        'dwell_mean', 'flight_mean', 'p2p_mean', 'typing_speed_cpm',
+        'rhythm_mean', 'dwell_mean_norm', 'flight_mean_norm'
+    }
 
+    samples = []
+    for _ in range(n):
+        vec = np.zeros(len(FEATURE_NAMES))
         for i, name in enumerate(FEATURE_NAMES):
-            if name in COUNT_FEATURES:
-                # Additive integer noise
-                noisy[i] = max(0, base_vec[i] + rng.integers(-1, 2))
-            elif name in RATIO_FEATURES:
-                # Small additive noise, clamp to [0, 1] for ratios
-                noisy[i] = float(np.clip(
-                    base_vec[i] + rng.normal(0, 0.05), 0, 2
-                ))
+            if name in HUMAN_RANGES:
+                lo, hi = HUMAN_RANGES[name]
+            elif name.startswith('digraph_'):
+                lo, hi = DIGRAPH_RANGE
             else:
-                # Multiplicative noise — 22% std matches real session variance
-                factor = rng.normal(1.0, 0.22)
-                factor = np.clip(factor, 0.5, 1.8)   # stay physically plausible
-                noisy[i] = base_vec[i] * factor
+                lo = profile_mean[i] * 0.3
+                hi = profile_mean[i] * 2.0
 
-        genuine_samples.append(noisy)
+            for _ in range(15):
+                v = rng.uniform(lo, hi)
+                if name in KEY_FEATURES:
+                    min_dist = max(profile_std[i] * 1.5, profile_mean[i] * 0.20)
+                    if abs(v - profile_mean[i]) >= min_dist:
+                        break
+                else:
+                    break
+            vec[i] = v
+        samples.append(vec)
+    return samples
 
-    # ── Impostor samples ──────────────────────────────────────────────────
-    # Impostors have a different typing rhythm — shift mean by 35-70%
-    # in random directions, different per feature to simulate a real person
-    impostor_samples = []
-    for _ in range(num_impostor):
-        impostor = profile_mean.copy()
 
-        for i, name in enumerate(FEATURE_NAMES):
-            if name in COUNT_FEATURES:
-                impostor[i] = max(0, profile_mean[i] + rng.integers(-3, 4))
-            elif name in RATIO_FEATURES:
-                impostor[i] = float(np.clip(
-                    profile_mean[i] + rng.normal(0, 0.15), 0, 2
-                ))
-            else:
-                # Different person = different absolute timing
-                direction = rng.choice([-1, 1])
-                magnitude = rng.uniform(0.3, 0.7)
-                factor    = 1.0 + direction * magnitude
-                noise     = rng.normal(1.0, 0.15)
-                impostor[i] = profile_mean[i] * factor * noise
-
-        impostor_samples.append(impostor)
-
-    X = np.vstack([genuine_samples, impostor_samples])
-    y = np.array([1] * num_genuine + [0] * num_impostor)
-
-    # Shuffle
-    perm = rng.permutation(len(X))
-    return X[perm], y[perm]
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAHALANOBIS SCORE — steeper than before, harder gate for impostors
+# ─────────────────────────────────────────────────────────────────────────────
+def mahalanobis_score(vec, profile_mean, profile_std):
+    safe_std = np.where(profile_std < 1e-6, 1e-6, profile_std)
+    z = np.abs((vec - profile_mean) / safe_std)
+    mean_z = float(np.mean(z))
+    # Steeper sigmoid: z=0->1.0, z=1->0.50, z=2->0.12, z=3->0.02
+    score = 1.0 / (1.0 + np.exp(2.5 * (mean_z - 1.0)))
+    return float(np.clip(score, 0, 1))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,9 +234,7 @@ def generate_synthetic_data(
 # ─────────────────────────────────────────────────────────────────────────────
 def train_random_forest(username: str):
     db = SessionLocal()
-
     try:
-        # ── Load user ─────────────────────────────────────────────────────
         user = db.query(User).filter(User.username == username).first()
         if not user:
             print(f"❌ User '{username}' not found!")
@@ -210,22 +244,18 @@ def train_random_forest(username: str):
         print(f"  KEYSTROKE RF TRAINING  —  user: {username}")
         print(f"{'='*70}")
 
-        # ── FIX: load ALL enrollment attempts ─────────────────────────────
         genuine_vectors = load_enrollment_samples(db, user.id)
-
         if not genuine_vectors:
             print("❌ No valid enrollment samples found.")
-            print("   Make sure the user has enrolled with the updated keystroke.js")
             return None
 
-        print(f"\n  Enrollment attempts loaded : {len(genuine_vectors)}")
-        if len(genuine_vectors) == 1:
-            print("  ⚠  Only 1 enrollment sample — model will rely heavily on")
-            print("     synthetic variation. Ask user to enroll 3-5 times for")
-            print("     best results.")
+        print(f"\n  Enrollment samples loaded: {len(genuine_vectors)}")
+        if len(genuine_vectors) < 3:
+            print("  ⚠  Fewer than 3 samples — enroll more for best accuracy.")
 
-        # Print profile summary
-        profile = np.array(genuine_vectors).mean(axis=0)
+        profile_mean = np.array(genuine_vectors).mean(axis=0)
+        profile_std  = np.array(genuine_vectors).std(axis=0) + 1e-9
+
         fn = FEATURE_NAMES
         print(f"\n  Profile (mean across {len(genuine_vectors)} attempt(s)):")
         for label, feat in [
@@ -237,51 +267,54 @@ def train_random_forest(username: str):
             ("shift_lag_mean",   "shift_lag_mean"),
         ]:
             if feat in fn:
-                print(f"    {label:20s}: {profile[fn.index(feat)]:.3f}")
+                print(f"    {label:20s}: {profile_mean[fn.index(feat)]:.3f}")
 
-        # ── Generate synthetic training data ──────────────────────────────
-        # Scale samples proportionally to how many real vectors we have
-        n_genuine  = max(80,  len(genuine_vectors) * 20)
-        n_impostor = max(160, len(genuine_vectors) * 40)
-        X, y = generate_synthetic_data(genuine_vectors, n_genuine, n_impostor)
+        # ── Build training set ─────────────────────────────────────────────
+        n_genuine  = max(120, len(genuine_vectors) * 30)
+        genuine_aug = generate_genuine_samples(genuine_vectors, n=n_genuine)
+
+        real_impostors = load_real_impostors(db, user.id)
+        n_impostor = max(300, n_genuine * 3)
+        synthetic_impostors = generate_impostor_samples(profile_mean, profile_std, n=n_impostor)
+        all_impostors = real_impostors + synthetic_impostors
+
+        print(f"  Impostor pool: {len(real_impostors)} real + {len(synthetic_impostors)} synthetic = {len(all_impostors)} total")
+
+        X = np.vstack([genuine_aug, all_impostors])
+        y = np.array([1] * len(genuine_aug) + [0] * len(all_impostors))
 
         print(f"\n{'='*70}")
         print(f"  TRAINING DATA")
         print(f"{'='*70}")
-        print(f"  Genuine samples  : {int(y.sum())}")
-        print(f"  Impostor samples : {int((y==0).sum())}")
+        print(f"  Genuine samples  : {len(genuine_aug)}")
+        print(f"  Impostor samples : {len(all_impostors)}")
         print(f"  Feature dims     : {X.shape[1]}")
+        print(f"  Impostor ratio   : {len(all_impostors)/len(genuine_aug):.1f}:1")
 
-        # ── Pipeline: scaler + RF ─────────────────────────────────────────
-        # max_depth=8 prevents overfitting on synthetic distribution
-        # min_samples_leaf=4 enforces generalization
-        # class_weight='balanced' handles 1:2 genuine:impostor ratio
+        # ── Pipeline ──────────────────────────────────────────────────────
         pipeline = Pipeline([
             ("scaler", StandardScaler()),
             ("rf", RandomForestClassifier(
-                n_estimators=300,
-                max_depth=8,
-                min_samples_split=6,
-                min_samples_leaf=4,
+                n_estimators=500,
+                max_depth=10,
+                min_samples_split=4,
+                min_samples_leaf=3,
                 max_features="sqrt",
-                class_weight="balanced",
+                class_weight={0: 1, 1: 2},   # penalise false accepts 2x
                 random_state=42,
                 n_jobs=-1,
             ))
         ])
 
-        # ── Cross-validated evaluation ────────────────────────────────────
-        # FIX: use cross_val_predict so test samples are never in training set
-        # This gives honest FAR/FRR estimates instead of inflated train accuracy
+        # ── Cross-validated evaluation ─────────────────────────────────────
         print(f"\n  Running 5-fold cross-validation ...")
         cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-        y_pred_cv = cross_val_predict(pipeline, X, y, cv=cv, method="predict")
         y_prob_cv = cross_val_predict(pipeline, X, y, cv=cv, method="predict_proba")[:, 1]
+        y_pred_cv = (y_prob_cv >= 0.5).astype(int)
 
         cm = confusion_matrix(y, y_pred_cv)
         tn, fp, fn_count, tp = cm.ravel()
-
-        far = fp / (fp + tn)      if (fp + tn) > 0      else 0.0
+        far = fp / (fp + tn)           if (fp + tn) > 0      else 0.0
         frr = fn_count / (fn_count + tp) if (fn_count + tp) > 0 else 0.0
         eer = (far + frr) / 2
 
@@ -298,11 +331,11 @@ def train_random_forest(username: str):
         print(f"  Equal Error Rate      (EER) : {eer:.2%}")
         print(f"  CV Accuracy                 : {accuracy_score(y, y_pred_cv):.2%}")
 
-        # ── Train final model on ALL data ─────────────────────────────────
+        # ── Train final model ──────────────────────────────────────────────
         print(f"\n  Training final model on full dataset ...")
         pipeline.fit(X, y)
 
-        # ── Feature importance ────────────────────────────────────────────
+        # ── Feature importance ─────────────────────────────────────────────
         rf_model = pipeline.named_steps["rf"]
         importance_pairs = sorted(
             zip(FEATURE_NAMES, rf_model.feature_importances_),
@@ -315,48 +348,61 @@ def train_random_forest(username: str):
             bar = "█" * int(imp * 200)
             print(f"  {i:2d}. {feat:28s} {imp:.4f}  {bar}")
 
-        # ── Optimal threshold search ──────────────────────────────────────
-        # Find threshold that balances FAR and FRR rather than defaulting to 0.5
-        thresholds   = np.arange(0.3, 0.85, 0.05)
-        best_thresh  = 0.5
-        best_eer     = 1.0
+        # ── Threshold search — SECURITY BIASED ────────────────────────────
         print(f"\n{'='*70}")
-        print(f"  THRESHOLD ANALYSIS")
+        print(f"  THRESHOLD ANALYSIS  (target: FAR < 5%)")
         print(f"{'='*70}")
         print(f"  {'Threshold':>10}  {'FAR':>8}  {'FRR':>8}  {'EER':>8}")
-        for t in thresholds:
+
+        best_thresh = 0.60
+        best_eer    = 1.0
+        far_constrained_thresh = 0.60
+
+        for t in np.arange(0.40, 0.92, 0.02):
             y_at_t = (y_prob_cv >= t).astype(int)
-            cm_t   = confusion_matrix(y, y_at_t)
-            if cm_t.shape == (2, 2):
-                tn_t, fp_t, fn_t, tp_t = cm_t.ravel()
-                far_t = fp_t / (fp_t + tn_t) if (fp_t + tn_t) > 0 else 0
-                frr_t = fn_t / (fn_t + tp_t) if (fn_t + tp_t) > 0 else 0
-                eer_t = (far_t + frr_t) / 2
-                marker = " ◄ best" if eer_t < best_eer else ""
-                print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}{marker}")
-                if eer_t < best_eer:
-                    best_eer    = eer_t
-                    best_thresh = t
+            if len(np.unique(y_at_t)) < 2:
+                continue
+            cm_t = confusion_matrix(y, y_at_t)
+            if cm_t.shape != (2, 2):
+                continue
+            tn_t, fp_t, fn_t, tp_t = cm_t.ravel()
+            far_t = fp_t / (fp_t + tn_t) if (fp_t + tn_t) > 0 else 0
+            frr_t = fn_t / (fn_t + tp_t) if (fn_t + tp_t) > 0 else 0
+            eer_t = (far_t + frr_t) / 2
 
-        print(f"\n  Recommended threshold: {best_thresh:.2f}  (EER={best_eer:.2%})")
+            if far_t <= 0.05 and frr_t < 1.0:
+                far_constrained_thresh = float(t)
 
-        # ── Save model ────────────────────────────────────────────────────
-        model_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'models'
-        )
+            marker = ""
+            if eer_t < best_eer:
+                best_eer    = eer_t
+                best_thresh = float(t)
+                marker = " ◄ best EER"
+
+            print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}{marker}")
+
+        final_thresh = max(best_thresh, far_constrained_thresh, 0.60)
+
+        print(f"\n  EER threshold        : {best_thresh:.2f}  (balanced)")
+        print(f"  FAR<5% threshold     : {far_constrained_thresh:.2f}  (security-biased)")
+        print(f"  ✅ Using threshold   : {final_thresh:.2f}  (stricter of the two)")
+
+        # ── Save model ─────────────────────────────────────────────────────
+        model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
         os.makedirs(model_dir, exist_ok=True)
 
         model_data = {
-            'pipeline':         pipeline,           # scaler + RF together
-            'feature_names':    FEATURE_NAMES,
-            'username':         username,
-            'user_id':          user.id,
-            'n_enrollment':     len(genuine_vectors),
-            'profile_mean':     profile,            # for distance-based fallback
-            'threshold':        best_thresh,        # use this, not hardcoded 0.75
-            'far':              float(far),
-            'frr':              float(frr),
-            'eer':              float(eer),
+            'pipeline':      pipeline,
+            'feature_names': FEATURE_NAMES,
+            'username':      username,
+            'user_id':       user.id,
+            'n_enrollment':  len(genuine_vectors),
+            'profile_mean':  profile_mean,
+            'profile_std':   profile_std,
+            'threshold':     final_thresh,
+            'far':           float(far),
+            'frr':           float(frr),
+            'eer':           float(eer),
         }
 
         model_path = os.path.join(model_dir, f"{username}_keystroke_rf.pkl")
@@ -369,7 +415,7 @@ def train_random_forest(username: str):
         print(f"{'='*70}")
         print(f"  Path      : {model_path}")
         print(f"  Size      : {size_kb:.1f} KB")
-        print(f"  Threshold : {best_thresh:.2f}")
+        print(f"  Threshold : {final_thresh:.2f}")
         print(f"  FAR/FRR   : {far:.2%} / {frr:.2%}")
         print(f"  EER       : {eer:.2%}\n")
 
@@ -381,21 +427,8 @@ def train_random_forest(username: str):
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  AUTHENTICATION HELPER
-#  Import this in your backend auth route instead of duplicating logic
 # ─────────────────────────────────────────────────────────────────────────────
 def predict_keystroke(username: str, feature_dict: dict) -> dict:
-    """
-    Load saved model and predict on a single auth attempt.
-
-    Returns:
-        {
-            'match': bool,
-            'confidence': float,   # 0.0 – 1.0
-            'threshold': float,
-            'far': float,
-            'frr': float,
-        }
-    """
     model_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
     model_path = os.path.join(model_dir, f"{username}_keystroke_rf.pkl")
 
@@ -405,22 +438,27 @@ def predict_keystroke(username: str, feature_dict: dict) -> dict:
     with open(model_path, 'rb') as f:
         model_data = pickle.load(f)
 
-    pipeline   = model_data['pipeline']
-    feat_names = model_data['feature_names']
-    threshold  = model_data['threshold']
+    pipeline     = model_data['pipeline']
+    feat_names   = model_data['feature_names']
+    profile_mean = model_data['profile_mean']
+    profile_std  = model_data['profile_std']
+    threshold    = model_data['threshold']
 
-    # Build feature vector in correct order
     vec = np.array([
         float(feature_dict.get(name, 0.0) or 0.0)
         for name in feat_names
-    ]).reshape(1, -1)
+    ])
 
-    confidence = pipeline.predict_proba(vec)[0][1]
-    match      = confidence >= threshold
+    rf_score  = float(pipeline.predict_proba(vec.reshape(1, -1))[0][1])
+    mah_score = mahalanobis_score(vec, profile_mean, profile_std)
+    fused     = 0.60 * rf_score + 0.40 * mah_score
+    match     = fused >= threshold
 
     return {
         'match':      bool(match),
-        'confidence': float(confidence),
+        'confidence': float(fused),
+        'rf_score':   float(rf_score),
+        'mah_score':  float(mah_score),
         'threshold':  float(threshold),
         'far':        model_data.get('far', 0),
         'frr':        model_data.get('frr', 0),

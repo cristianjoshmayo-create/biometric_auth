@@ -239,35 +239,28 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             ]).reshape(1, -1)
 
             rf_score = float(pipeline.predict_proba(vec)[0][1])
-
+ 
             profile_std = model_data.get('profile_std', None)
             if profile_std is not None and len(profile_std) == len(profile_mean):
                 safe_std  = np.where(profile_std < 1e-6, 1e-6, profile_std)
                 z         = np.abs((vec[0] - profile_mean) / safe_std)
-                mah_score = float(1.0 / (1.0 + np.exp(np.mean(z) - 1.5)))
+                # OLD: mah_score = float(1.0 / (1.0 + np.exp(np.mean(z) - 1.5)))
+                # NEW: steeper sigmoid, harder gate
+                mah_score = float(1.0 / (1.0 + np.exp(2.5 * (np.mean(z) - 1.0))))
             else:
                 diff      = np.linalg.norm(vec[0] - profile_mean)
                 scale     = np.linalg.norm(profile_mean) + 1e-9
                 mah_score = float(max(0, 1 - diff / scale))
-
-            confidence = 0.65 * rf_score + 0.35 * mah_score
-
-            login_count = db.query(AuthLog).filter(
-                AuthLog.user_id == user.id,
-                AuthLog.result == "granted",
-                AuthLog.auth_method == "keystroke"
-            ).count()
-
-            if login_count < 5:
-                effective_threshold = max(threshold * 0.85, 0.30)
-                phase = "early"
-            elif login_count < 15:
-                effective_threshold = threshold
-                phase = "growth"
-            else:
-                effective_threshold = min(threshold * 1.1, 0.80)
-                phase = "mature"
-
+ 
+            # Mahalanobis weight raised from 35% to 40% — harder gate
+            confidence = 0.60 * rf_score + 0.40 * mah_score
+ 
+            # REMOVED: lenient early-phase threshold multiplier (0.85x was too loose)
+            # All phases now use the same threshold — security must not degrade
+            # just because the user is new.
+            effective_threshold = threshold
+            phase = "standard"
+ 
             authenticated = confidence >= effective_threshold
 
             print(f"  RF={rf_score:.3f}  Mah={mah_score:.3f}  "
@@ -477,6 +470,11 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
     if os.path.exists(model_path):
         print(f"[voice] Using trained .pkl model for '{payload.username}'")
         try:
+            project_root = os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '..', '..'
+            ))
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
             from ml.train_voice_cnn import predict_voice
 
             # FIX: old code passed only payload.mfcc_features (13 values).
