@@ -472,7 +472,7 @@ def predict_voice(username: str, feature_dict: dict) -> dict:
 
     # Fused score: 65% CNN + 35% Mahalanobis
     # Mahalanobis is now a genuine discriminator (not inflated like cosine sim was)
-    fused = 0.65 * cnn_prob + 0.35 * mah_score
+    fused = 0.75 * cnn_prob + 0.25 * mah_score
     match = fused >= threshold
 
     print(f"\n  Voice auth result for '{username}':")

@@ -180,10 +180,6 @@ def extract_cmu_features(rows):
             'same_hand_sequence_mean': 2.0,
             'finger_transition_ratio': 0.6,
             'seek_time_mean': 0, 'seek_time_count': 0,
-            'shift_lag_mean': dwell_mean * 0.3,  # Shift.r key is present in CMU
-            'shift_lag_std': dwell_std * 0.3,
-            'shift_lag_count': 1,
-            'shift_lag_norm': 0.3,
             # Digraphs: set to 0 — passphrase doesn't match
             **{f'digraph_{d}': 0.0 for d in [
                 'th','he','bi','io','om','me','et','tr','ri','ic',
@@ -249,4 +245,3 @@ if __name__ == "__main__":
     # Add ml/ dir to path so train_keystroke_rf imports work
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     build_and_save()
-    

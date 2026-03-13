@@ -46,20 +46,19 @@ FEATURE_NAMES = [
     'hand_alternation_ratio', 'same_hand_sequence_mean',
     'finger_transition_ratio', 'seek_time_mean', 'seek_time_count',
 
-    'shift_lag_mean', 'shift_lag_std', 'shift_lag_count',
 
     'dwell_mean_norm',  'dwell_std_norm',
     'flight_mean_norm', 'flight_std_norm',
-    'p2p_std_norm',     'r2r_mean_norm',  'shift_lag_norm',
+    'p2p_std_norm',     'r2r_mean_norm',
 ]
 
 COUNT_FEATURES = {
-    'pause_count', 'backspace_count', 'seek_time_count', 'shift_lag_count'
+    'pause_count', 'backspace_count', 'seek_time_count'
 }
 RATIO_FEATURES = {
     'backspace_ratio', 'hand_alternation_ratio', 'finger_transition_ratio',
     'rhythm_cv', 'p2p_std_norm', 'dwell_mean_norm', 'dwell_std_norm',
-    'flight_mean_norm', 'flight_std_norm', 'r2r_mean_norm', 'shift_lag_norm',
+    'flight_mean_norm', 'flight_std_norm', 'r2r_mean_norm',
 }
 
 # Realistic human typing ranges (min, max) — used for plausible impostor generation
@@ -90,16 +89,12 @@ HUMAN_RANGES = {
     'finger_transition_ratio': (0.3, 0.9),
     'seek_time_mean':    (0,   300),
     'seek_time_count':   (0,   5),
-    'shift_lag_mean':    (0,   200),
-    'shift_lag_std':     (0,   100),
-    'shift_lag_count':   (0,   8),
     'dwell_mean_norm':   (0.5, 2.0),
     'dwell_std_norm':    (0.3, 1.5),
     'flight_mean_norm':  (0.5, 2.5),
     'flight_std_norm':   (0.3, 2.0),
     'p2p_std_norm':      (0.3, 2.0),
     'r2r_mean_norm':     (0.5, 2.5),
-    'shift_lag_norm':    (0.0, 2.0),
 }
 DIGRAPH_RANGE = (20, 300)
 
@@ -108,10 +103,19 @@ DIGRAPH_RANGE = (20, 300)
 #  DATA EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 def extract_feature_vector(template) -> np.ndarray:
-    return np.array([
-        float(getattr(template, name, 0.0) or 0.0)
-        for name in FEATURE_NAMES
-    ], dtype=np.float64)
+    vals = []
+    for name in FEATURE_NAMES:
+        raw = getattr(template, name, 0.0)
+        # Guard: ARRAY columns (dwell_times, flight_times) must never appear
+        # in FEATURE_NAMES, but if they do they return a list — catch that.
+        if isinstance(raw, (list, tuple, np.ndarray)):
+            vals.append(0.0)
+        else:
+            try:
+                vals.append(float(raw or 0.0))
+            except (TypeError, ValueError):
+                vals.append(0.0)
+    return np.array(vals, dtype=np.float64)
 
 
 def load_enrollment_samples(db, user_id: int):
@@ -283,7 +287,6 @@ def train_random_forest(username: str):
             ("flight_mean (ms)", "flight_mean"),
             ("p2p_mean (ms)",    "p2p_mean"),
             ("rhythm_cv",        "rhythm_cv"),
-            ("shift_lag_mean",   "shift_lag_mean"),
         ]:
             if feat in fn:
                 print(f"    {label:20s}: {profile_mean[fn.index(feat)]:.3f}")
@@ -305,6 +308,25 @@ def train_random_forest(username: str):
         ) if n_synthetic > 0 else []
 
         all_impostors = real_pool + synthetic_impostors
+
+        # Validate all vectors are the correct length before stacking.
+        # Enrolled impostor vectors can be malformed if they were saved before
+        # a feature set change — filter them out rather than crash.
+        n_feats = len(FEATURE_NAMES)
+        def _is_valid(v):
+            try:
+                arr = np.asarray(v, dtype=np.float64)
+                return arr.ndim == 1 and arr.shape[0] == n_feats
+            except Exception:
+                return False
+
+        genuine_aug   = [v for v in genuine_aug   if _is_valid(v)]
+        all_impostors = [v for v in all_impostors  if _is_valid(v)]
+
+        bad_g = len(genuine_aug)   - len(genuine_aug)
+        bad_i = (len(real_pool) + len(synthetic_impostors)) - len(all_impostors)
+        if bad_i > 0:
+            print(f"  ⚠  Dropped {bad_i} malformed impostor vector(s) (wrong length)")
 
         print(f"\n{'='*70}")
         print(f"  TRAINING DATA")
@@ -383,9 +405,8 @@ def train_random_forest(username: str):
         print(f"{'='*70}")
         print(f"  {'Threshold':>10}  {'FAR':>8}  {'FRR':>8}  {'EER':>8}")
 
-        best_thresh = 0.60
+        best_thresh = 0.50
         best_eer    = 1.0
-        far_constrained_thresh = 0.60
 
         for t in np.arange(0.40, 0.92, 0.02):
             y_at_t = (y_prob_cv >= t).astype(int)
@@ -399,9 +420,6 @@ def train_random_forest(username: str):
             frr_t = fn_t / (fn_t + tp_t) if (fn_t + tp_t) > 0 else 0
             eer_t = (far_t + frr_t) / 2
 
-            if far_t <= 0.05 and frr_t < 1.0:
-                far_constrained_thresh = float(t)
-
             marker = ""
             if eer_t < best_eer:
                 best_eer    = eer_t
@@ -410,11 +428,12 @@ def train_random_forest(username: str):
 
             print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}{marker}")
 
-        final_thresh = max(best_thresh, far_constrained_thresh, 0.60)
+        # Use EER threshold — the academically correct operating point.
+        # Balances FAR and FRR equally; avoids locking out legitimate users.
+        final_thresh = max(best_thresh, 0.50)
 
         print(f"\n  EER threshold        : {best_thresh:.2f}  (balanced)")
-        print(f"  FAR<5% threshold     : {far_constrained_thresh:.2f}  (security-biased)")
-        print(f"  ✅ Using threshold   : {final_thresh:.2f}  (stricter of the two)")
+        print(f"  ✅ Using threshold   : {final_thresh:.2f}")
 
         # ── Save model ─────────────────────────────────────────────────────
         model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
@@ -480,7 +499,7 @@ def predict_keystroke(username: str, feature_dict: dict) -> dict:
 
     rf_score  = float(pipeline.predict_proba(vec.reshape(1, -1))[0][1])
     mah_score = mahalanobis_score(vec, profile_mean, profile_std)
-    fused     = 0.60 * rf_score + 0.40 * mah_score
+    fused     = 0.75 * rf_score + 0.25 * mah_score
     match     = fused >= threshold
 
     return {

@@ -252,8 +252,8 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                 scale     = np.linalg.norm(profile_mean) + 1e-9
                 mah_score = float(max(0, 1 - diff / scale))
  
-            # Mahalanobis weight raised from 35% to 40% — harder gate
-            confidence = 0.60 * rf_score + 0.40 * mah_score
+            # ML model carries 75% of the decision, Mahalanobis 25% sanity check
+            confidence = 0.75 * rf_score + 0.25 * mah_score
  
             # REMOVED: lenient early-phase threshold multiplier (0.85x was too loose)
             # All phases now use the same threshold — security must not degrade

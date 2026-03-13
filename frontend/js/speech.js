@@ -97,6 +97,10 @@ const SpeechCapture = {
     },
 
     startActualRecording(stream) {
+        // Guard: if already recording, don't stack a second MediaRecorder
+        // (VAD can briefly dip below threshold mid-speech and re-trigger this)
+        if (this.isRecording) return;
+
         this.audioChunks  = [];
         this.mediaRecorder = new MediaRecorder(stream);
         this.isRecording  = true;

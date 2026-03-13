@@ -168,27 +168,31 @@ function _resetKeystrokeInput() {
 
     _updateKeystrokeProgress();
 
-    // Auto-submit when phrase is completed — no button needed
+    // Colour feedback on every keystroke + auto-submit on keyup when phrase matches
+    let _submitPending = false;
     input.oninput = () => {
-        const val = input.value;
-
-        // Live character-match colour feedback
-        const target = KeystrokeCapture.targetPhrase;
-        if (val.length > 0 && !target.startsWith(val)) {
+        const trimmed = input.value.trim();
+        const target  = KeystrokeCapture.targetPhrase;
+        if (trimmed.length > 0 && !target.startsWith(trimmed)) {
             input.classList.add("border-red-500");
             input.classList.remove("border-gray-700", "border-green-500");
-        } else if (val.length === target.length && val === target) {
+        } else if (trimmed === target) {
             input.classList.add("border-green-500");
             input.classList.remove("border-gray-700", "border-red-500");
         } else {
             input.classList.remove("border-red-500", "border-green-500");
             input.classList.add("border-gray-700");
         }
-
-        // Auto-submit once the full phrase is typed correctly
-        if (val === target) {
+    };
+    input.onkeyup = () => {
+        if (_submitPending) return;
+        const trimmed = input.value.trim();
+        const target  = KeystrokeCapture.targetPhrase;
+        if (trimmed === target) {
+            _submitPending = true;
+            input.value    = target; // normalise — remove any trailing space
             input.disabled = true;
-            setTimeout(() => submitKeystroke(), 150); // tiny delay so last keyup fires
+            setTimeout(() => submitKeystroke(), 100);
         }
     };
 }
@@ -220,19 +224,17 @@ function _updateKeystrokeProgress() {
 async function submitKeystroke() {
     const input  = document.getElementById("keystroke-input");
     const status = document.getElementById("keystroke-status");
+    const btn    = document.getElementById("keystroke-submit-btn");
 
-    if (!KeystrokeCapture.validatePhrase(input.value)) {
+    // Trim before validating — prevents trailing space from blocking submission
+    if (!KeystrokeCapture.validatePhrase(input.value.trim())) {
         status.textContent = "❌ Phrase doesn't match — please type exactly as shown.";
         status.className = "text-center text-sm mb-2 text-red-400";
-        input.disabled = false;
-        input.value = "";
-        input.focus();
-        KeystrokeCapture.reset();
-        KeystrokeCapture.attach("keystroke-input");
-        input.oninput = arguments.callee; // re-attach auto-submit
         _resetKeystrokeInput();
         return;
     }
+
+    if (btn) { btn.disabled = true; btn.textContent = "⏳ Saving…"; }
 
     const features = KeystrokeCapture.extractFeatures();
     if (!features) {
@@ -285,16 +287,12 @@ async function submitKeystroke() {
             finger_transition_ratio: features.finger_transition_ratio,
             seek_time_mean:          features.seek_time_mean,
             seek_time_count:         features.seek_time_count,
-            shift_lag_mean:   features.shift_lag_mean   || 0,
-            shift_lag_std:    features.shift_lag_std    || 0,
-            shift_lag_count:  features.shift_lag_count  || 0,
             dwell_mean_norm:  features.dwell_mean_norm  || 0,
             dwell_std_norm:   features.dwell_std_norm   || 0,
             flight_mean_norm: features.flight_mean_norm || 0,
             flight_std_norm:  features.flight_std_norm  || 0,
             p2p_std_norm:     features.p2p_std_norm     || 0,
             r2r_mean_norm:    features.r2r_mean_norm    || 0,
-            shift_lag_norm:   features.shift_lag_norm   || 0,
         });
 
         if (!result.success) {
@@ -454,11 +452,20 @@ function moveToSecurityQuestion() {
 async function submitSecurityQuestion() {
     const question = document.getElementById("security-question-select").value;
     const answer   = document.getElementById("security-answer").value.trim();
+    const btn      = document.querySelector("#security-section button");
+    const status   = document.getElementById("security-status");
 
     if (!question || !answer) {
-        alert("Please select a question and provide an answer.");
+        if (status) { status.textContent = "❌ Please select a question and provide an answer."; status.className = "text-center text-sm mb-4 text-red-400"; }
+        else alert("Please select a question and provide an answer.");
         return;
     }
+
+    // Guard against double-clicks while request is in flight
+    if (btn.disabled) return;
+    btn.disabled    = true;
+    btn.textContent = "⏳ Saving…";
+    if (status) { status.textContent = "⏳ Saving your answer…"; status.className = "text-center text-sm mb-4 text-yellow-400"; }
 
     try {
         const result = await Api.enrollSecurity(currentUsername, question, answer);
@@ -467,10 +474,16 @@ async function submitSecurityQuestion() {
             document.getElementById("security-section").classList.add("hidden");
             document.getElementById("success-section").classList.remove("hidden");
         } else {
-            alert("Error saving security question: " + (result.detail || "Unknown error"));
+            if (status) { status.textContent = "❌ " + (result.detail || "Unknown error"); status.className = "text-center text-sm mb-4 text-red-400"; }
+            else alert("Error saving security question: " + (result.detail || "Unknown error"));
+            btn.disabled    = false;
+            btn.textContent = "Complete Enrollment ✅";
         }
     } catch (err) {
-        alert("Could not connect to server.");
+        if (status) { status.textContent = "❌ Could not connect to server."; status.className = "text-center text-sm mb-4 text-red-400"; }
+        else alert("Could not connect to server.");
+        btn.disabled    = false;
+        btn.textContent = "Complete Enrollment ✅";
         console.error(err);
     }
 }

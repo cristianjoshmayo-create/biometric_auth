@@ -14,8 +14,6 @@ const KeystrokeCapture = {
     endTime: null,
     textBuffer: [],
     backspaceCount: 0,
-    shiftPressTime: null,
-    shiftKeyLags: [],
     targetPhrase: "biometric voice keystroke authentication",
 
     // ── Keyboard layout ───────────────────────────────────────────────────
@@ -36,7 +34,7 @@ const KeystrokeCapture = {
     },
 
     // FIX: digraphs now extracted from the ACTUAL phrase
-    // "Biometric Voice Keystroke Authentication"
+    // "biometric voice keystroke authentication"
     // Previous list had 6/8 digraphs never appearing → always 0 → model noise
     trackedDigraphs: [
         'bi','io','om','me','et','tr','ri','ic',   // Biometric
@@ -46,16 +44,29 @@ const KeystrokeCapture = {
     ],
 
     // ── Attach to input element ───────────────────────────────────────────
+    // Uses named bound functions so old listeners are removed before new
+    // ones are added — prevents duplicate listeners stacking up across
+    // attempts, which caused mid-typing auto-submits and input wipes.
     attach(inputElementId) {
         const input = document.getElementById(inputElementId);
         if (!input) {
             console.error(`[KeystrokeCapture] Element #${inputElementId} not found`);
             return;
         }
+
+        // Remove previous listeners if they exist
+        if (this._boundKeyDown) input.removeEventListener('keydown', this._boundKeyDown);
+        if (this._boundKeyUp)   input.removeEventListener('keyup',   this._boundKeyUp);
+
         this.reset();
         this.isCapturing = true;
-        input.addEventListener('keydown', (e) => this.onKeyDown(e));
-        input.addEventListener('keyup',   (e) => this.onKeyUp(e));
+
+        // Store bound references so they can be removed next time
+        this._boundKeyDown = (e) => this.onKeyDown(e);
+        this._boundKeyUp   = (e) => this.onKeyUp(e);
+
+        input.addEventListener('keydown', this._boundKeyDown);
+        input.addEventListener('keyup',   this._boundKeyUp);
         console.log('[KeystrokeCapture] Attached to:', inputElementId);
     },
 
@@ -65,20 +76,6 @@ const KeystrokeCapture = {
         const now = performance.now();
 
         if (this.startTime === null) this.startTime = now;
-
-        // NEW: track shift press timestamp for shift-lag feature
-        if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
-            this.shiftPressTime = now;
-        }
-
-        // NEW: record lag between Shift press and the letter key
-        // Phrase has 4 capital letters → 4 shift-lag samples per attempt
-        if (e.shiftKey && e.key.length === 1 && this.shiftPressTime !== null) {
-            const lag = now - this.shiftPressTime;
-            if (lag >= 0 && lag < 500) {  // sanity: ignore accidental holds > 500ms
-                this.shiftKeyLags.push(lag);
-            }
-        }
 
         // FIX: store 'used' flag so repeated keys pair correctly in dwell calc
         this.events.push({
@@ -303,13 +300,6 @@ const KeystrokeCapture = {
             seek_time_mean:           _mean(seekTimes),
             seek_time_count:          seekTimes.length,
 
-            // NEW: shift-lag features
-            // Captures the time between pressing Shift and the letter key
-            // for each capitalized word — strong consistent biometric signal
-            shift_lag_mean:  _mean(this.shiftKeyLags),
-            shift_lag_std:   _std(this.shiftKeyLags),
-            shift_lag_count: this.shiftKeyLags.length,
-
             // Raw arrays for database storage
             dwell_times:  dwellTimes,
             flight_times: flightTimes,
@@ -338,7 +328,6 @@ const KeystrokeCapture = {
             flight_std_norm:  f.flight_std    / baseline,
             p2p_std_norm:     f.p2p_std       / baseline,
             r2r_mean_norm:    f.r2r_mean      / baseline,
-            shift_lag_norm:   f.shift_lag_mean / baseline,
             // rhythm_cv is already normalized (std/mean) — keep as-is
         };
     },
@@ -354,8 +343,6 @@ const KeystrokeCapture = {
         this.endTime        = null;
         this.textBuffer     = [];
         this.backspaceCount = 0;
-        this.shiftPressTime = null;
-        this.shiftKeyLags   = [];
     },
 };
 

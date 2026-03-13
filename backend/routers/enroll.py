@@ -309,9 +309,11 @@ def enroll_keystroke(payload: KeystrokeEnroll, db: Session = Depends(get_db)):
           f"dwell={payload.dwell_mean:.1f}ms flight={payload.flight_mean:.1f}ms "
           f"cpm={payload.typing_speed_cpm:.0f}")
 
-    # Auto-train after every sample (background thread — won't block the response)
+    # Only train after the final attempt — training mid-enrollment writes .pkl
+    # files that can trigger uvicorn --reload and wipe the user's in-progress input.
+    KEYSTROKE_TARGET = 5
     training_started = False
-    if attempt_num >= 1:
+    if attempt_num >= KEYSTROKE_TARGET:
         trigger_training(payload.username)
         training_started = True
 
@@ -320,7 +322,7 @@ def enroll_keystroke(payload: KeystrokeEnroll, db: Session = Depends(get_db)):
         "message":          f"Keystroke attempt #{attempt_num} saved",
         "attempt_number":   attempt_num,
         "training_started": training_started,
-        "training_note":    "Model is being trained in the background." if training_started else "",
+        "training_note":    "Model training started in background." if training_started else "",
     }
 
 
@@ -368,16 +370,20 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
           f"rate={payload.speaking_rate:.2f}  "
           f"mfcc_std={'✓' if payload.mfcc_std else '✗ MISSING'}")
 
-    # Auto-train after every sample (background thread — won't block the response)
-    trigger_voice_training(payload.username)
+    # Only train after the final attempt — same reason as keystroke:
+    # training writes .pkl mid-enrollment which can wipe the user's progress.
+    VOICE_TARGET = 3
+    training_started = attempt_num >= VOICE_TARGET
+    if training_started:
+        trigger_voice_training(payload.username)
 
     return {
         "success":           True,
         "message":           f"Voice attempt #{attempt_num} saved",
         "attempt_number":    attempt_num,
         "has_full_features": not missing_features,
-        "training_started":  True,
-        "training_note":     "Voice model is being trained in the background.",
+        "training_started":  training_started,
+        "training_note":     "Voice model training started in background." if training_started else "",
     }
 
 
