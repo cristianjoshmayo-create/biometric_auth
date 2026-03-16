@@ -1,11 +1,5 @@
 // frontend/js/keystroke.js
 // Keystroke Dynamics Capture — Fixed & Improved v2
-// Fixes applied:
-//   1. Repeated-key dwell bug (ordered pairing instead of code map)
-//   2. Dead digraphs replaced with digraphs from actual phrase
-//   3. Spacebar added to hand detection (thumb) for word-boundary alternation
-//   4. Shift-key lag tracking (new biometric feature)
-//   5. Inter-session normalization (speed-independent ratio features)
 
 const KeystrokeCapture = {
     events: [],
@@ -16,9 +10,6 @@ const KeystrokeCapture = {
     backspaceCount: 0,
     targetPhrase: "biometric voice keystroke authentication",
 
-    // ── Keyboard layout ───────────────────────────────────────────────────
-    // FIX: spacebar now assigned to 'thumb' so word-boundary hand
-    //      alternation is counted correctly (was silently skipped before)
     keyboardLayout: {
         left_hand:    new Set('qwertasdfgzxcvb12345'),
         right_hand:   new Set('yuiophjklnm67890'),
@@ -33,20 +24,13 @@ const KeystrokeCapture = {
         right_pinky:  new Set('p0'),
     },
 
-    // FIX: digraphs now extracted from the ACTUAL phrase
-    // "biometric voice keystroke authentication"
-    // Previous list had 6/8 digraphs never appearing → always 0 → model noise
     trackedDigraphs: [
-        'bi','io','om','me','et','tr','ri','ic',   // Biometric
-        'vo','oi','ce',                             // Voice
-        'ke','ey','ys','st','ro','ok',              // Keystroke
-        'au','ut','th','he','en','nt','ti','ca','at','on'  // Authentication
+        'bi','io','om','me','et','tr','ri','ic',
+        'vo','oi','ce',
+        'ke','ey','ys','st','ro','ok',
+        'au','ut','th','he','en','nt','ti','ca','at','on'
     ],
 
-    // ── Attach to input element ───────────────────────────────────────────
-    // Uses named bound functions so old listeners are removed before new
-    // ones are added — prevents duplicate listeners stacking up across
-    // attempts, which caused mid-typing auto-submits and input wipes.
     attach(inputElementId) {
         const input = document.getElementById(inputElementId);
         if (!input) {
@@ -54,14 +38,12 @@ const KeystrokeCapture = {
             return;
         }
 
-        // Remove previous listeners if they exist
         if (this._boundKeyDown) input.removeEventListener('keydown', this._boundKeyDown);
         if (this._boundKeyUp)   input.removeEventListener('keyup',   this._boundKeyUp);
 
         this.reset();
         this.isCapturing = true;
 
-        // Store bound references so they can be removed next time
         this._boundKeyDown = (e) => this.onKeyDown(e);
         this._boundKeyUp   = (e) => this.onKeyUp(e);
 
@@ -70,14 +52,12 @@ const KeystrokeCapture = {
         console.log('[KeystrokeCapture] Attached to:', inputElementId);
     },
 
-    // ── Event handlers ────────────────────────────────────────────────────
     onKeyDown(e) {
         if (!this.isCapturing) return;
         const now = performance.now();
 
         if (this.startTime === null) this.startTime = now;
 
-        // FIX: store 'used' flag so repeated keys pair correctly in dwell calc
         this.events.push({
             type: 'press',
             key:  e.key,
@@ -107,7 +87,6 @@ const KeystrokeCapture = {
         });
     },
 
-    // ── Hand / finger helpers ─────────────────────────────────────────────
     getHand(char) {
         if (char === ' ') return 'thumb';
         char = char.toLowerCase();
@@ -125,11 +104,6 @@ const KeystrokeCapture = {
         return null;
     },
 
-    // ── FIX: dwell pairing by chronological order, not by code map ────────
-    // Old approach: pressTimeMap[e.code] = e.time
-    //   → second 'e' in "Biometric" overwrites the first, wrong dwell for both
-    // New approach: for each press, find the earliest unused release with the
-    //   same code that comes AFTER this press timestamp
     _buildDwellPairs() {
         const pressEvents   = this.events.filter(e => e.type === 'press');
         const releaseEvents = this.events.filter(e => e.type === 'release')
@@ -146,7 +120,6 @@ const KeystrokeCapture = {
                 const release = releaseEvents[matchIdx];
                 release.used  = true;
                 const dwell   = release.time - press.time;
-                // Sanity bounds: ignore holds < 0ms or > 2s (accidental holds)
                 if (dwell >= 0 && dwell < 2000) {
                     dwellTimes.push(dwell);
                     pairedPress.push(press);
@@ -156,7 +129,35 @@ const KeystrokeCapture = {
         return { dwellTimes, pairedPress };
     },
 
-    // ── Main feature extraction ───────────────────────────────────────────
+    // Returns true if typed text is within 30% edit distance of the target phrase.
+    // Prevents grossly misspelled attempts from corrupting the model.
+    _phraseConsistencyOk(inputValue) {
+        const target = this.targetPhrase;
+        const typed  = inputValue.trim().toLowerCase();
+        if (typed.length === 0) return false;
+
+        const m = target.length, n = typed.length;
+        const dp = Array.from({ length: m + 1 }, (_, i) => [i]);
+        for (let j = 1; j <= n; j++) dp[0][j] = j;
+        for (let i = 1; i <= m; i++) {
+            for (let j = 1; j <= n; j++) {
+                dp[i][j] = target[i - 1] === typed[j - 1]
+                    ? dp[i - 1][j - 1]
+                    : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+            }
+        }
+        const dist  = dp[m][n];
+        const ratio = dist / Math.max(m, n);
+        if (ratio > 0.30) {
+            console.warn(
+                '[KeystrokeCapture] Phrase edit distance ' +
+                (ratio * 100).toFixed(1) + '% > 30% — rejecting sample'
+            );
+            return false;
+        }
+        return true;
+    },
+
     extractFeatures() {
         const pressEvents   = this.events.filter(e => e.type === 'press');
         const releaseEvents = this.events.filter(e => e.type === 'release');
@@ -166,7 +167,6 @@ const KeystrokeCapture = {
             return null;
         }
 
-        // Dwell times (fixed)
         const { dwellTimes } = this._buildDwellPairs();
 
         // Flight times: release[i] → press[i+1]
@@ -174,7 +174,6 @@ const KeystrokeCapture = {
         for (let i = 0; i < releaseEvents.length - 1; i++) {
             if (i < pressEvents.length - 1) {
                 const flight = pressEvents[i + 1].time - releaseEvents[i].time;
-                // Allow slight overlap (fast typists can press next key before releasing)
                 if (flight > -50 && flight < 2000) {
                     flightTimes.push(Math.max(0, flight));
                 }
@@ -195,7 +194,7 @@ const KeystrokeCapture = {
             if (dt >= 0 && dt < 3000) r2rTimes.push(dt);
         }
 
-        // Digraphs — only tracked pairs that exist in the actual phrase
+        // Digraphs
         const digraphMap = {};
         this.trackedDigraphs.forEach(dg => { digraphMap[dg] = []; });
         for (let i = 0; i < pressEvents.length - 1; i++) {
@@ -203,6 +202,18 @@ const KeystrokeCapture = {
             if (digraphMap[pair] !== undefined) {
                 const dt = pressEvents[i + 1].time - pressEvents[i].time;
                 if (dt >= 0 && dt < 3000) digraphMap[pair].push(dt);
+            }
+        }
+
+        // Shift-lag: time between Shift keydown and the next character keydown
+        const shiftLags = [];
+        for (let i = 0; i < pressEvents.length - 1; i++) {
+            if (pressEvents[i].key === 'Shift') {
+                const nextChar = pressEvents[i + 1];
+                if (nextChar && nextChar.key.length === 1) {
+                    const lag = nextChar.time - pressEvents[i].time;
+                    if (lag >= 0 && lag < 500) shiftLags.push(lag);
+                }
             }
         }
 
@@ -222,7 +233,7 @@ const KeystrokeCapture = {
         // Pauses > 500ms
         const pauses = p2pTimes.filter(t => t > 500);
 
-        // Hand alternation (FIX: space now counted via 'thumb')
+        // Hand alternation
         const text = this.textBuffer.join('').toLowerCase();
         let alternations = 0;
         const sameHandSeqs = [];
@@ -255,9 +266,7 @@ const KeystrokeCapture = {
         const totalKeys      = pressEvents.length;
         const backspaceRatio = totalKeys > 0 ? this.backspaceCount / totalKeys : 0;
 
-        // Build raw feature object
         const raw = {
-            // Core timing
             dwell_mean:    _mean(dwellTimes),
             dwell_std:     _std(dwellTimes),
             dwell_median:  _median(dwellTimes),
@@ -274,31 +283,30 @@ const KeystrokeCapture = {
             r2r_mean:      _mean(r2rTimes),
             r2r_std:       _std(r2rTimes),
 
-            // Digraphs (all now present in phrase — no more zero features)
             ...Object.fromEntries(
                 this.trackedDigraphs.map(dg => [
                     `digraph_${dg}`, _mean(digraphMap[dg])
                 ])
             ),
 
-            // Behavioral
-            typing_speed_cpm:         typingSpeedCpm,
-            typing_duration:          duration,
-            rhythm_mean:              rhythmMean,
-            rhythm_std:               rhythmStd,
-            rhythm_cv:                rhythmCv,
-            pause_count:              pauses.length,
-            pause_mean:               _mean(pauses),
+            typing_speed_cpm:        typingSpeedCpm,
+            typing_duration:         duration,
+            rhythm_mean:             rhythmMean,
+            rhythm_std:              rhythmStd,
+            rhythm_cv:               rhythmCv,
+            pause_count:             pauses.length,
+            pause_mean:              _mean(pauses),
+            backspace_ratio:         backspaceRatio,
+            backspace_count:         this.backspaceCount,
+            hand_alternation_ratio:  text.length > 1 ? alternations / (text.length - 1) : 0,
+            same_hand_sequence_mean: _mean(sameHandSeqs),
+            finger_transition_ratio: text.length > 1 ? fingerTransitions / (text.length - 1) : 0,
+            seek_time_mean:          _mean(seekTimes),
+            seek_time_count:         seekTimes.length,
 
-            backspace_ratio:          backspaceRatio,
-            backspace_count:          this.backspaceCount,
-            hand_alternation_ratio:   text.length > 1
-                                      ? alternations / (text.length - 1) : 0,
-            same_hand_sequence_mean:  _mean(sameHandSeqs),
-            finger_transition_ratio:  text.length > 1
-                                      ? fingerTransitions / (text.length - 1) : 0,
-            seek_time_mean:           _mean(seekTimes),
-            seek_time_count:          seekTimes.length,
+            shift_lag_mean:  _mean(shiftLags),
+            shift_lag_std:   _std(shiftLags),
+            shift_lag_count: shiftLags.length,
 
             // Raw arrays for database storage
             dwell_times:  dwellTimes,
@@ -306,16 +314,11 @@ const KeystrokeCapture = {
             typing_speed: typingSpeedCpm / 60,
         };
 
-        // Apply inter-session normalization and return
         const features = this._normalize(raw);
         console.log(`[KeystrokeCapture] Features extracted: ${Object.keys(features).length}`);
         return features;
     },
 
-    // ── Inter-session normalization ───────────────────────────────────────
-    // Raw ms values shift between sessions (fatigue, mood, device).
-    // Normalizing against p2p_mean makes features speed-independent so the
-    // model learns rhythm pattern, not absolute timing → reduces FFR.
     _normalize(f) {
         const baseline = f.p2p_mean;
         if (baseline <= 0) return f;
@@ -328,7 +331,7 @@ const KeystrokeCapture = {
             flight_std_norm:  f.flight_std    / baseline,
             p2p_std_norm:     f.p2p_std       / baseline,
             r2r_mean_norm:    f.r2r_mean      / baseline,
-            // rhythm_cv is already normalized (std/mean) — keep as-is
+            shift_lag_norm:   f.shift_lag_mean > 0 ? f.shift_lag_mean / baseline : 0,
         };
     },
 
@@ -346,7 +349,7 @@ const KeystrokeCapture = {
     },
 };
 
-// ── Math helpers (prefixed with _ to avoid global namespace conflicts) ────────
+// ── Math helpers ──────────────────────────────────────────────────────────────
 function _mean(arr) {
     if (!arr || arr.length === 0) return 0;
     return arr.reduce((a, b) => a + b, 0) / arr.length;

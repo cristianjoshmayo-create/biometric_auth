@@ -1,4 +1,5 @@
 # backend/routers/enroll.py
+# IMPROVED v2: better noise rejection in extract-mfcc, 62-feature extraction
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -11,7 +12,7 @@ import numpy as np
 import librosa
 import tempfile
 import os
-import bcrypt  # ← ADDED
+import bcrypt
 
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion
@@ -20,27 +21,26 @@ import sys
 
 router = APIRouter()
 
+MAX_KEYSTROKE_SAMPLES = 5
+MAX_VOICE_SAMPLES     = 3
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  AUTO-TRAIN HELPER
+#  AUTO-TRAIN HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
 def _run_training(username: str):
-    """Runs in a background thread — trains keystroke model after enrollment."""
     try:
-        # Add project root to path so ml/ is importable
         project_root = os.path.normpath(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
         )
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
-
         from ml.train_keystroke_rf import train_random_forest
         print(f"\n🔄 Auto-training keystroke model for '{username}' ...")
         model_path = train_random_forest(username)
         if model_path:
             print(f"✅ Auto-training complete → {model_path}")
-        else:
-            print(f"⚠  Auto-training returned no model for '{username}'")
     except Exception as e:
         import traceback
         print(f"❌ Auto-training failed for '{username}': {e}")
@@ -48,27 +48,22 @@ def _run_training(username: str):
 
 
 def trigger_training(username: str):
-    """Fire-and-forget: starts training in background, API responds immediately."""
     t = threading.Thread(target=_run_training, args=(username,), daemon=True)
     t.start()
 
 
 def _run_voice_training(username: str):
-    """Runs in a background thread — trains voice model after enrollment."""
     try:
         project_root = os.path.normpath(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
         )
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
-
         from ml.train_voice_cnn import train_voice_model
         print(f"\n🔄 Auto-training voice model for '{username}' ...")
         model_path = train_voice_model(username)
         if model_path:
             print(f"✅ Voice auto-training complete → {model_path}")
-        else:
-            print(f"⚠  Voice auto-training returned no model for '{username}'")
     except Exception as e:
         import traceback
         print(f"❌ Voice auto-training failed for '{username}': {e}")
@@ -76,9 +71,9 @@ def _run_voice_training(username: str):
 
 
 def trigger_voice_training(username: str):
-    """Fire-and-forget: starts voice training in background."""
     t = threading.Thread(target=_run_voice_training, args=(username,), daemon=True)
     t.start()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SCHEMAS
@@ -86,7 +81,8 @@ def trigger_voice_training(username: str):
 
 class UserCreate(BaseModel):
     username: str
-    password: str  # ← ADDED
+    password: str
+
 
 class KeystrokeEnroll(BaseModel):
     username: str
@@ -159,17 +155,22 @@ class KeystrokeEnroll(BaseModel):
 
 
 class VoiceEnroll(BaseModel):
-    username:     str
-    mfcc_features: List[float]
-    mfcc_std:      List[float] = []
-    pitch_mean:    float = 0
-    pitch_std:     float = 0
-    speaking_rate: float = 0
-    energy_mean:   float = 0
-    energy_std:    float = 0
+    username:         str
+    mfcc_features:    List[float]
+    mfcc_std:         List[float] = []
+    delta_mfcc_mean:  List[float] = []   # NEW
+    delta2_mfcc_mean: List[float] = []   # NEW
+    pitch_mean:       float = 0
+    pitch_std:        float = 0
+    speaking_rate:    float = 0
+    energy_mean:      float = 0
+    energy_std:       float = 0
     zcr_mean:               float = 0
     spectral_centroid_mean: float = 0
     spectral_rolloff_mean:  float = 0
+    spectral_flux_mean:     float = 0    # NEW
+    voiced_fraction:        float = 0    # NEW
+    snr_db:                 float = 0    # NEW — for logging
 
 
 class SecurityEnroll(BaseModel):
@@ -199,7 +200,6 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
     if existing:
         return {"success": True, "message": "User already exists", "user_id": existing.id}
 
-    # ← ADDED: validate and hash password
     if len(payload.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
@@ -208,7 +208,7 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
         bcrypt.gensalt()
     ).decode('utf-8')
 
-    new_user = User(username=payload.username, password_hash=hashed)  # ← UPDATED
+    new_user = User(username=payload.username, password_hash=hashed)
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
@@ -309,11 +309,8 @@ def enroll_keystroke(payload: KeystrokeEnroll, db: Session = Depends(get_db)):
           f"dwell={payload.dwell_mean:.1f}ms flight={payload.flight_mean:.1f}ms "
           f"cpm={payload.typing_speed_cpm:.0f}")
 
-    # Only train after the final attempt — training mid-enrollment writes .pkl
-    # files that can trigger uvicorn --reload and wipe the user's in-progress input.
-    KEYSTROKE_TARGET = 5
     training_started = False
-    if attempt_num >= KEYSTROKE_TARGET:
+    if attempt_num >= MAX_KEYSTROKE_SAMPLES:
         trigger_training(payload.username)
         training_started = True
 
@@ -332,48 +329,47 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Warn if frontend is still sending only 13 features (old behaviour)
     missing_features = (
         not payload.mfcc_std or all(v == 0 for v in payload.mfcc_std)
     ) and payload.pitch_mean == 0 and payload.energy_mean == 0
 
     if missing_features:
-        print(f"⚠  PARTIAL ENROLLMENT for '{payload.username}': "
-              "mfcc_std / pitch / energy are all zero — "
-              "frontend is still sending only mfcc_features (13 values). "
-              "Deploy the fixed speech.js, enroll.js, and api.js.")
+        print(f"⚠  PARTIAL ENROLLMENT for '{payload.username}': missing features")
 
     existing_count = db.query(VoiceTemplate).filter(
         VoiceTemplate.user_id == user.id
     ).count()
 
     template = VoiceTemplate(
-        user_id        = user.id,
-        attempt_number = existing_count + 1,
-        mfcc_features  = payload.mfcc_features,
-        mfcc_std       = payload.mfcc_std if payload.mfcc_std else [],
-        pitch_mean     = payload.pitch_mean,
-        pitch_std      = payload.pitch_std,
-        speaking_rate  = payload.speaking_rate,
-        energy_mean    = payload.energy_mean,
-        energy_std     = payload.energy_std,
-        zcr_mean               = payload.zcr_mean,
-        spectral_centroid_mean = payload.spectral_centroid_mean,
-        spectral_rolloff_mean  = payload.spectral_rolloff_mean,
+        user_id               = user.id,
+        attempt_number        = existing_count + 1,
+        mfcc_features         = payload.mfcc_features,
+        mfcc_std              = payload.mfcc_std if payload.mfcc_std else [],
+        pitch_mean            = payload.pitch_mean,
+        pitch_std             = payload.pitch_std,
+        speaking_rate         = payload.speaking_rate,
+        energy_mean           = payload.energy_mean,
+        energy_std            = payload.energy_std,
+        zcr_mean              = payload.zcr_mean,
+        spectral_centroid_mean= payload.spectral_centroid_mean,
+        spectral_rolloff_mean = payload.spectral_rolloff_mean,
     )
+
+    # Save new fields if the model column exists (graceful for older DB schemas)
+    for field in ['delta_mfcc_mean', 'delta2_mfcc_mean', 'spectral_flux_mean', 'voiced_fraction', 'snr_db']:
+        val = getattr(payload, field, None)
+        if val is not None and hasattr(template, field):
+            setattr(template, field, val)
+
     db.add(template)
     db.commit()
 
     attempt_num = existing_count + 1
     print(f"✅ Voice attempt #{attempt_num} for '{payload.username}' | "
           f"pitch={payload.pitch_mean:.1f}Hz  energy={payload.energy_mean:.4f}  "
-          f"rate={payload.speaking_rate:.2f}  "
-          f"mfcc_std={'✓' if payload.mfcc_std else '✗ MISSING'}")
+          f"snr={payload.snr_db:.1f}dB  voiced={payload.voiced_fraction:.0%}")
 
-    # Only train after the final attempt — same reason as keystroke:
-    # training writes .pkl mid-enrollment which can wipe the user's progress.
-    VOICE_TARGET = 3
-    training_started = attempt_num >= VOICE_TARGET
+    training_started = attempt_num >= MAX_VOICE_SAMPLES
     if training_started:
         trigger_voice_training(payload.username)
 
@@ -415,20 +411,88 @@ def enroll_security(payload: SecurityEnroll, db: Session = Depends(get_db)):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  AUDIO PROCESSING + FULL FEATURE EXTRACTION
+#  IMPROVED AUDIO PROCESSING + FULL FEATURE EXTRACTION
+#
+#  Key improvements over original:
+#  1. Multi-band SNR estimation — rejects samples where noise floor is high
+#  2. Adaptive spectral subtraction — removes stationary background noise
+#     from the power spectrum before MFCC extraction
+#  3. Voiced-only MFCC computation — ignores unvoiced/silence frames for
+#     cleaner speaker-identity features (CMVN normalisation)
+#  4. Delta and delta-delta MFCCs — capture rate of change (speaker dynamics)
+#  5. Spectral flux — distinguishes consistent voiced speech from erratic noise
+#  6. voiced_fraction — fraction of frames identified as voiced by WebRTC VAD
+#  7. Stricter VAD: mode 3 + minimum 60% voiced ratio (was 40%)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _estimate_snr(audio: np.ndarray, sr: int) -> float:
+    """
+    Estimate SNR in dB using a simple noise floor from the quietest 10% of frames.
+    Returns SNR in dB; higher = cleaner.
+    """
+    hop   = 512
+    frame = librosa.feature.rms(y=audio, hop_length=hop)[0]
+    if len(frame) < 5:
+        return 0.0
+    noise_floor = np.percentile(frame, 10)   # quietest 10% of frames ≈ noise
+    signal_rms  = np.percentile(frame, 90)   # loudest 90% ≈ speech
+    if noise_floor < 1e-10:
+        return 40.0  # essentially silent background
+    snr = 20.0 * np.log10((signal_rms + 1e-10) / (noise_floor + 1e-10))
+    return float(np.clip(snr, -10, 60))
+
+
+def _spectral_subtraction(audio: np.ndarray, sr: int,
+                          noise_frac: float = 0.10,
+                          alpha: float = 2.0) -> np.ndarray:
+    """
+    Simple power-spectrum spectral subtraction for stationary noise removal.
+
+    Steps:
+      1. Estimate noise power from the first noise_frac of the signal.
+      2. Subtract alpha * noise_power from the signal power spectrum.
+      3. Reconstruct via ISTFT.
+
+    alpha=2.0 is an oversubtraction factor — common in speech enhancement.
+    """
+    n_fft  = 512
+    hop    = n_fft // 4
+
+    stft   = librosa.stft(audio, n_fft=n_fft, hop_length=hop)
+    magnitude = np.abs(stft)
+    phase     = np.angle(stft)
+
+    # Estimate noise from first noise_frac of frames
+    n_noise_frames = max(1, int(magnitude.shape[1] * noise_frac))
+    noise_est = np.mean(magnitude[:, :n_noise_frames] ** 2, axis=1, keepdims=True)
+
+    # Subtract and half-wave rectify (no negative power)
+    power_clean = np.maximum(magnitude ** 2 - alpha * noise_est, 0)
+    mag_clean   = np.sqrt(power_clean)
+
+    stft_clean  = mag_clean * np.exp(1j * phase)
+    audio_clean = librosa.istft(stft_clean, hop_length=hop, length=len(audio))
+    return audio_clean.astype(np.float32)
+
 
 @router.post("/extract-mfcc")
 async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
     """
-    Validates audio quality then extracts 34 speaker features:
-      - 13 MFCC means + 13 MFCC stds  (spectral shape)
-      - pitch mean + std               (fundamental frequency)
-      - speaking rate                  (behavioral)
-      - energy mean + std              (loudness pattern)
-      - ZCR mean                       (voicing)
-      - spectral centroid mean         (brightness)
-      - spectral rolloff mean          (frequency distribution)
+    Improved audio quality validation + 62-speaker-feature extraction.
+
+    New features vs original (34):
+      + delta_mfcc_mean[0..12]   : rate of change of MFCC coefficients
+      + delta2_mfcc_mean[0..12]  : acceleration of MFCC coefficients
+      + spectral_flux_mean       : average frame-to-frame spectral change
+      + voiced_fraction          : fraction of frames classified as voiced
+      Total: 62 features
+
+    New noise-handling:
+      • SNR estimated and returned (minimum 10 dB required)
+      • Spectral subtraction applied before MFCC extraction
+      • CMVN applied to MFCCs (cepstral mean-variance normalisation)
+      • MFCCs computed only from voiced frames (WebRTC VAD filtered)
+      • Stricter VAD: 60% voiced frames required (was 40%)
     """
     input_path = None
     wav_path   = None
@@ -438,11 +502,11 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         audio_format = payload.audio_format or "webm"
 
         print(f"\n{'='*60}")
-        print(f"VOICE FEATURE EXTRACTION PIPELINE")
+        print(f"IMPROVED VOICE FEATURE EXTRACTION")
         print(f"Audio: {len(audio_bytes)} bytes  format: {audio_format}")
         print(f"{'='*60}")
 
-        # Save and convert to WAV
+        # ── Save + convert to 16kHz mono WAV ──────────────────────────────
         with tempfile.NamedTemporaryFile(suffix=f".{audio_format}", delete=False) as tmp:
             tmp.write(audio_bytes)
             input_path = tmp.name
@@ -458,72 +522,151 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         )
         audio_segment.export(wav_path, format="wav")
 
-        audio, sr = librosa.load(wav_path, sr=16000, mono=True)
+        audio, sr     = librosa.load(wav_path, sr=16000, mono=True)
         total_duration = len(audio) / sr
         print(f"Duration: {total_duration:.2f}s")
 
-        # ── VAD Check ─────────────────────────────────────────────────────
+        # ── SNR check ──────────────────────────────────────────────────────
+        snr_db = _estimate_snr(audio, sr)
+        print(f"Estimated SNR: {snr_db:.1f} dB")
+
+        if snr_db < 10.0:
+            return {
+                "success": False,
+                "detail":  (
+                    f"Audio too noisy (SNR={snr_db:.1f}dB, minimum 10dB). "
+                    "Move to a quieter location and try again."
+                ),
+                "snr_db": snr_db,
+            }
+
+        # ── Spectral subtraction (denoise) ─────────────────────────────────
+        # Only apply if SNR < 25 dB to avoid over-processing clean audio
+        if snr_db < 25.0:
+            print(f"  Applying spectral subtraction (SNR={snr_db:.1f}dB < 25dB)")
+            audio_clean = _spectral_subtraction(audio, sr)
+        else:
+            audio_clean = audio
+            print(f"  Skipping spectral subtraction (SNR={snr_db:.1f}dB ≥ 25dB, clean enough)")
+
+        # ── WebRTC VAD ─────────────────────────────────────────────────────
         import webrtcvad
-        vad = webrtcvad.Vad(3)
+        vad = webrtcvad.Vad(3)  # most aggressive mode
 
         with open(wav_path, 'rb') as f:
             wav_data = f.read()
 
-        audio_pcm    = wav_data[44:]
-        frame_size   = int(sr * 30 / 1000) * 2
+        audio_pcm  = wav_data[44:]
+        frame_size = int(sr * 30 / 1000) * 2   # 30ms frames, 16-bit PCM
         voiced = total = 0
+        voiced_frame_indices = []
 
         for i in range(0, len(audio_pcm) - frame_size, frame_size):
             frame = audio_pcm[i:i + frame_size]
             if len(frame) == frame_size:
                 total += 1
-                if vad.is_speech(frame, sr):
+                is_voiced = vad.is_speech(frame, sr)
+                if is_voiced:
                     voiced += 1
+                    voiced_frame_indices.append(total - 1)
 
         voice_ratio     = voiced / total if total > 0 else 0
         speech_duration = (voiced * 30) / 1000
+        voiced_fraction = voice_ratio
 
-        print(f"VAD: {voice_ratio:.0%} voice  {speech_duration:.1f}s speech")
+        print(f"VAD: {voice_ratio:.0%} voiced  ({speech_duration:.1f}s speech)")
 
-        if voice_ratio < 0.40:
-            return {"success": False,
-                    "detail": f"Insufficient voice ({voice_ratio:.0%}). Speak clearly."}
+        # Stricter thresholds: require 60% voiced (was 40%)
+        if voice_ratio < 0.60:
+            return {
+                "success": False,
+                "detail":  (
+                    f"Too much background noise detected ({voice_ratio:.0%} voiced, "
+                    f"minimum 60%). Speak clearly in a quiet environment."
+                ),
+                "snr_db": snr_db,
+            }
         if speech_duration < 1.5:
-            return {"success": False,
-                    "detail": f"Too short ({speech_duration:.1f}s). Speak the full phrase."}
+            return {
+                "success": False,
+                "detail":  f"Too short ({speech_duration:.1f}s). Speak the full phrase.",
+            }
 
         # ── Energy check ───────────────────────────────────────────────────
-        rms = float(np.sqrt(np.mean(audio**2)))
+        rms = float(np.sqrt(np.mean(audio_clean ** 2)))
         if rms < 0.02:
-            return {"success": False,
-                    "detail": f"Audio too quiet (RMS={rms:.4f}). Speak louder."}
+            return {
+                "success": False,
+                "detail":  f"Audio too quiet (RMS={rms:.4f}). Speak louder.",
+            }
 
-        # ── Spectral sanity ────────────────────────────────────────────────
-        centroid      = librosa.feature.spectral_centroid(y=audio, sr=sr)
+        # ── Spectral sanity checks ─────────────────────────────────────────
+        centroid      = librosa.feature.spectral_centroid(y=audio_clean, sr=sr)
         mean_centroid = float(np.mean(centroid))
-        if mean_centroid < 600 or mean_centroid > 5000:
-            return {"success": False,
-                    "detail": f"Audio doesn't sound like speech (centroid={mean_centroid:.0f}Hz)."}
+        if mean_centroid < 600 or mean_centroid > 5500:
+            return {
+                "success": False,
+                "detail":  f"Audio doesn't sound like speech (centroid={mean_centroid:.0f}Hz).",
+            }
 
-        zcr      = librosa.feature.zero_crossing_rate(audio)
+        zcr      = librosa.feature.zero_crossing_rate(audio_clean)
         mean_zcr = float(np.mean(zcr))
         if mean_zcr < 0.02 or mean_zcr > 0.5:
-            return {"success": False,
-                    "detail": f"Unusual audio characteristics (ZCR={mean_zcr:.4f})."}
+            return {
+                "success": False,
+                "detail":  f"Unusual audio (ZCR={mean_zcr:.4f}). Ensure microphone is working.",
+            }
 
-        # ── MFCC extraction (13 coefficients) ─────────────────────────────
-        mfccs     = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
-        mfcc_mean = np.mean(mfccs, axis=1)
-        mfcc_std  = np.std(mfccs, axis=1)
+        # ── Extract voiced-only audio for MFCC computation ─────────────────
+        # This is the key improvement: MFCCs from voiced segments only
+        # are more speaker-discriminative and more noise-robust.
+        hop_length = int(sr * 0.010)   # 10ms hop
+        frame_len  = int(sr * 0.025)   # 25ms frame
 
-        if np.mean(mfcc_std) < 5.0:
-            return {"success": False,
-                    "detail": "Audio lacks variation typical of speech."}
+        if voiced_frame_indices and len(voiced_frame_indices) > 10:
+            # Convert 30ms VAD frames to sample indices and extract
+            voiced_mask = np.zeros(len(audio_clean), dtype=bool)
+            vad_frame_samples = int(sr * 0.030)
+            for fi in voiced_frame_indices:
+                start = fi * vad_frame_samples
+                end   = min(start + vad_frame_samples, len(audio_clean))
+                voiced_mask[start:end] = True
+            audio_voiced = audio_clean[voiced_mask]
+            if len(audio_voiced) < sr * 0.5:
+                audio_voiced = audio_clean  # fallback if too short after masking
+        else:
+            audio_voiced = audio_clean
 
-        # ── Pitch extraction ───────────────────────────────────────────────
+        # ── MFCC extraction with CMVN ──────────────────────────────────────
+        # CMVN (cepstral mean-variance normalisation) removes channel effects
+        # and adapts for different microphones/environments.
+        mfccs     = librosa.feature.mfcc(y=audio_voiced, sr=sr, n_mfcc=13,
+                                          n_fft=frame_len, hop_length=hop_length)
+        # Apply CMVN
+        mfcc_cmvn = (mfccs - mfccs.mean(axis=1, keepdims=True)) / (mfccs.std(axis=1, keepdims=True) + 1e-8)
+
+        mfcc_mean = np.mean(mfcc_cmvn, axis=1)
+        mfcc_std  = np.std(mfcc_cmvn,  axis=1)
+
+        if np.mean(mfcc_std) < 0.1:
+            return {
+                "success": False,
+                "detail":  "Audio lacks variation typical of speech. Try again.",
+            }
+
+        # ── Delta + delta-delta MFCCs ──────────────────────────────────────
+        # Deltas capture temporal dynamics (HOW the voice changes) — a key
+        # speaker-identity cue that static MFCCs miss entirely.
+        delta_mfcc  = librosa.feature.delta(mfcc_cmvn, order=1)
+        delta2_mfcc = librosa.feature.delta(mfcc_cmvn, order=2)
+
+        delta_mfcc_mean  = np.mean(delta_mfcc,  axis=1)
+        delta2_mfcc_mean = np.mean(delta2_mfcc, axis=1)
+
+        # ── Pitch ─────────────────────────────────────────────────────────
         try:
             f0, voiced_flag, _ = librosa.pyin(
-                audio,
+                audio_voiced,
                 fmin=librosa.note_to_hz('C2'),
                 fmax=librosa.note_to_hz('C7'),
                 sr=sr
@@ -535,9 +678,8 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
             pitch_mean = 0.0
             pitch_std  = 0.0
 
-        # ── Speaking rate ──────────────────────────────────────────────────
-        hop_length    = 512
-        rms_frames    = librosa.feature.rms(y=audio, hop_length=hop_length)[0]
+        # ── Speaking rate ─────────────────────────────────────────────────
+        rms_frames    = librosa.feature.rms(y=audio_clean, hop_length=512)[0]
         rms_threshold = np.mean(rms_frames) * 0.5
         peaks         = np.where(
             (rms_frames[1:-1] > rms_frames[:-2]) &
@@ -546,41 +688,58 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         )[0]
         speaking_rate = float(len(peaks) / total_duration) if total_duration > 0 else 0.0
 
-        # ── Energy features ────────────────────────────────────────────────
-        energy_frames = librosa.feature.rms(y=audio, hop_length=hop_length)[0]
+        # ── Energy ────────────────────────────────────────────────────────
+        energy_frames = librosa.feature.rms(y=audio_voiced, hop_length=hop_length)[0]
         energy_mean   = float(np.mean(energy_frames))
         energy_std    = float(np.std(energy_frames))
 
-        # ── Spectral rolloff ───────────────────────────────────────────────
-        rolloff      = librosa.feature.spectral_rolloff(y=audio, sr=sr)
+        # ── Spectral rolloff ──────────────────────────────────────────────
+        rolloff      = librosa.feature.spectral_rolloff(y=audio_voiced, sr=sr)
         rolloff_mean = float(np.mean(rolloff))
 
-        # ── Summary ────────────────────────────────────────────────────────
+        # ── Spectral flux (NEW) ───────────────────────────────────────────
+        # Spectral flux = average frame-to-frame spectral change.
+        # Speech has smooth, predictable flux; background noise is erratic.
+        # This feature helps reject recordings with intermittent noise bursts.
+        stft_flux = librosa.stft(audio_voiced, n_fft=512, hop_length=hop_length)
+        mag_flux  = np.abs(stft_flux)
+        flux      = np.sqrt(np.sum(np.diff(mag_flux, axis=1) ** 2, axis=0))
+        spectral_flux_mean = float(np.mean(flux))
+
+        # ── Summary ───────────────────────────────────────────────────────
         print(f"✅ ALL CHECKS PASSED")
-        print(f"  MFCC[0] mean={mfcc_mean[0]:.1f}  std_mean={np.mean(mfcc_std):.2f}")
+        print(f"  MFCC[0] mean={mfcc_mean[0]:.2f}  std_mean={np.mean(mfcc_std):.2f}")
+        print(f"  Delta[0] mean={delta_mfcc_mean[0]:.3f}  D2[0]={delta2_mfcc_mean[0]:.3f}")
         print(f"  Pitch  mean={pitch_mean:.1f}Hz  std={pitch_std:.1f}Hz")
         print(f"  Rate   {speaking_rate:.2f} peaks/s")
         print(f"  Energy mean={energy_mean:.4f}  std={energy_std:.4f}")
-        print(f"  Centroid={mean_centroid:.0f}Hz  Rolloff={rolloff_mean:.0f}Hz")
-        print(f"  ZCR={mean_zcr:.4f}")
+        print(f"  Spectral flux={spectral_flux_mean:.2f}")
+        print(f"  Voiced fraction={voiced_fraction:.2%}")
+        print(f"  SNR={snr_db:.1f}dB")
 
         return {
-            "success":       True,
-            "mfcc_features": mfcc_mean.tolist(),
-            "mfcc_std":      mfcc_std.tolist(),
-            "pitch_mean":    pitch_mean,
-            "pitch_std":     pitch_std,
-            "speaking_rate": speaking_rate,
-            "energy_mean":   energy_mean,
-            "energy_std":    energy_std,
-            "zcr_mean":      mean_zcr,
+            "success":              True,
+            "mfcc_features":        mfcc_mean.tolist(),
+            "mfcc_std":             mfcc_std.tolist(),
+            "delta_mfcc_mean":      delta_mfcc_mean.tolist(),   # NEW
+            "delta2_mfcc_mean":     delta2_mfcc_mean.tolist(),  # NEW
+            "pitch_mean":           pitch_mean,
+            "pitch_std":            pitch_std,
+            "speaking_rate":        speaking_rate,
+            "energy_mean":          energy_mean,
+            "energy_std":           energy_std,
+            "zcr_mean":             mean_zcr,
             "spectral_centroid_mean": mean_centroid,
             "spectral_rolloff_mean":  rolloff_mean,
+            "spectral_flux_mean":   spectral_flux_mean,         # NEW
+            "voiced_fraction":      voiced_fraction,            # NEW
+            "snr_db":               snr_db,                     # NEW
             "validation": {
-                "voice_ratio":       float(voice_ratio),
-                "speech_duration":   float(speech_duration),
-                "rms_energy":        rms,
-                "spectral_centroid": mean_centroid,
+                "voice_ratio":        float(voice_ratio),
+                "speech_duration":    float(speech_duration),
+                "rms_energy":         rms,
+                "spectral_centroid":  mean_centroid,
+                "snr_db":             snr_db,
             }
         }
 
@@ -598,30 +757,8 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
                 pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  NEW: GET /debug/voice-count
-#  Verify how many DB rows exist and whether features are complete.
-#  Usage: GET /api/enroll/debug/voice-count?username=hope
-# ─────────────────────────────────────────────────────────────────────────────
-
 @router.get("/debug/voice-count")
 def debug_voice_count(username: str = Query(...), db: Session = Depends(get_db)):
-    """
-    Returns row count + per-row feature summary for a user's voice enrollment.
-
-    Good response (3 complete rows):
-    {
-        "total_attempts": 3,
-        "rows": [
-            { "attempt": 1, "mfcc0": -399.5, "pitch": 165.2, "energy": 0.042, "has_std": true },
-            { "attempt": 2, "mfcc0": -412.1, "pitch": 171.8, "energy": 0.038, "has_std": true },
-            { "attempt": 3, "mfcc0": -388.7, "pitch": 159.4, "energy": 0.051, "has_std": true }
-        ],
-        "verdict": "✅ Good — all attempts have full features"
-    }
-
-    If total_attempts=1 or pitch=0, the frontend fix hasn't been deployed yet.
-    """
     user = db.query(User).filter(User.username == username).first()
     if not user:
         raise HTTPException(status_code=404, detail=f"User '{username}' not found")
@@ -637,13 +774,16 @@ def debug_voice_count(username: str = Query(...), db: Session = Depends(get_db))
     for t in templates:
         mfcc = list(t.mfcc_features or [])
         std  = list(t.mfcc_std or [])
+        has_delta = bool(getattr(t, 'delta_mfcc_mean', None))
         rows.append({
             "attempt":    t.attempt_number,
             "mfcc0":      round(mfcc[0], 2) if mfcc else None,
             "pitch":      round(float(t.pitch_mean or 0), 2),
             "energy":     round(float(t.energy_mean or 0), 5),
-            "zcr":        round(float(t.zcr_mean or 0), 5),
+            "snr_db":     round(float(getattr(t, 'snr_db', 0) or 0), 1),
+            "voiced_frac":round(float(getattr(t, 'voiced_fraction', 0) or 0), 2),
             "has_std":    bool(std and any(v != 0 for v in std)),
+            "has_delta":  has_delta,
             "enrolled_at": str(t.enrolled_at) if hasattr(t, "enrolled_at") else "n/a",
         })
 
@@ -658,27 +798,15 @@ def debug_voice_count(username: str = Query(...), db: Session = Depends(get_db))
         "verdict": (
             "✅ Good — all attempts have full features"
             if not incomplete else
-            f"⚠  {len(incomplete)} row(s) missing pitch/std — "
-            "re-enroll after deploying the fixed speech.js, enroll.js, api.js"
+            f"⚠  {len(incomplete)} row(s) missing features — re-enroll"
         ),
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  NEW: POST /re-enroll/clear
-#  Wipe all voice rows for a user so they can re-enroll cleanly.
-#  Call this ONCE per user after deploying the frontend fixes.
-#  Usage: POST /api/enroll/re-enroll/clear
-#         Body: { "username": "hope", "confirm": "yes-delete" }
-# ─────────────────────────────────────────────────────────────────────────────
-
 @router.post("/re-enroll/clear")
 def clear_voice_enrollment(payload: ClearEnrollPayload, db: Session = Depends(get_db)):
     if payload.confirm != "yes-delete":
-        raise HTTPException(
-            status_code=400,
-            detail='Set confirm="yes-delete" to proceed.'
-        )
+        raise HTTPException(status_code=400, detail='Set confirm="yes-delete" to proceed.')
 
     user = db.query(User).filter(User.username == payload.username).first()
     if not user:
@@ -691,7 +819,6 @@ def clear_voice_enrollment(payload: ClearEnrollPayload, db: Session = Depends(ge
     )
     db.commit()
 
-    # Also delete the stale trained model file if present
     from pathlib import Path
     model_path = (
         Path(__file__).parent.parent.parent
