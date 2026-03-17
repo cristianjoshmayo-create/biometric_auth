@@ -36,12 +36,14 @@ const SpeechCapture = {
     noiseFloor:     0.0,
     noiseEstimated: false,
 
-    // ── Thresholds — calibrated for real-world laptop/phone mics ─────────
-    VOICE_THRESHOLD_BASE:  0.01,   // lowered: laptop mics output lower RMS than pro mics
-    SILENCE_DURATION:      1500,   // ms silence before auto-stop (more forgiving)
-    MIN_VOICE_DURATION:    1500,   // ms of speech required (shorter phrase ok)
-    MAX_NOISE_FLOOR:       0.20,   // raised: fans/AC/office noise is normal
-    SPEECH_BAND_MIN_RATIO: 0.08,   // lowered: compressed audio formats reduce band ratio
+    // ── Thresholds — calibrated for TRUE time-domain RMS (getFloatTimeDomainData)
+    // Float32 waveform RMS ranges: silence ~0.001–0.005, speech ~0.01–0.08
+    // These are NOT the same scale as the old byte-frequency "RMS" (which was wrong).
+    VOICE_THRESHOLD_BASE:  0.008,  // ~0.8% of full scale — typical speech floor
+    SILENCE_DURATION:      1500,   // ms silence before auto-stop
+    MIN_VOICE_DURATION:    1500,   // ms of speech required
+    MAX_NOISE_FLOOR:       0.015,  // ambient noise above this = warn user
+    SPEECH_BAND_MIN_RATIO: 0.08,   // secondary frequency-band check (unchanged)
 
     _stream: null,
 
@@ -59,11 +61,14 @@ const SpeechCapture = {
             const startTime = Date.now();
 
             const measure = () => {
-                const array = new Uint8Array(analyser.frequencyBinCount);
-                analyser.getByteFrequencyData(array);
+                // FIX: use getFloatTimeDomainData for true time-domain RMS.
+                // getByteFrequencyData returns dB-scaled frequency-domain bytes,
+                // not waveform samples — "RMS" computed from it is wrong.
+                const timeData = new Float32Array(analyser.fftSize);
+                analyser.getFloatTimeDomainData(timeData);
                 let sum = 0;
-                for (let i = 0; i < array.length; i++) sum += array[i] * array[i];
-                samples.push(Math.sqrt(sum / array.length) / 255);
+                for (let i = 0; i < timeData.length; i++) sum += timeData[i] * timeData[i];
+                samples.push(Math.sqrt(sum / timeData.length));
 
                 if (Date.now() - startTime < 150) {
                     requestAnimationFrame(measure);
@@ -154,30 +159,38 @@ const SpeechCapture = {
             this.noiseFloor     = await this._estimateNoiseFloor(stream);
             this.noiseEstimated = true;
 
-            // Dynamic threshold: 1.3× noise floor, minimum 0.01
-            // (was 1.8×, which was too aggressive — any ambient noise pushed
-            //  the threshold above what a laptop mic can produce for speech)
-            const dynamicThreshold = Math.max(this.VOICE_THRESHOLD_BASE, this.noiseFloor * 1.3);
+            // Log actual applied browser settings — constraints are requests not guarantees
+            try {
+                const track    = stream.getAudioTracks()[0];
+                const settings = track.getSettings();
+                console.log("[SpeechCapture] Actual mic settings:", settings);
+                if (settings.sampleRate && settings.sampleRate !== 16000) {
+                    console.warn(`[SpeechCapture] Browser applied sampleRate=${settings.sampleRate}, not 16000 — server will resample`);
+                }
+            } catch(e) { /* getSettings() not supported in all browsers */ }
+
+            // Dynamic threshold: 2.5× noise floor, minimum 0.008
+            // Now using TRUE RMS scale (getFloatTimeDomainData, range 0.0–1.0):
+            //   silence  ≈ 0.001–0.005
+            //   speech   ≈ 0.010–0.080
+            const dynamicThreshold = Math.max(this.VOICE_THRESHOLD_BASE, this.noiseFloor * 2.5);
             this.VOICE_THRESHOLD   = dynamicThreshold;
 
             console.log(
-                `[SpeechCapture] noiseFloor=${(this.noiseFloor*100).toFixed(1)}%  ` +
-                `voiceThreshold=${(dynamicThreshold*100).toFixed(1)}%  ` +
-                `maxAllowed=${(this.MAX_NOISE_FLOOR*100).toFixed(0)}%`
+                `[SpeechCapture] noiseFloor=${this.noiseFloor.toFixed(4)} (true RMS)  ` +
+                `voiceThreshold=${dynamicThreshold.toFixed(4)}`
             );
 
-            // Warn if room is extremely noisy — but much higher bar than before
             if (this.noiseFloor > this.MAX_NOISE_FLOOR) {
                 if (status) {
                     status.textContent =
-                        `⚠️ Very loud background noise (${(this.noiseFloor*100).toFixed(0)}%). ` +
+                        `⚠️ Background noise is high (${this.noiseFloor.toFixed(3)} RMS). ` +
                         "Try moving away from fans or speakers.";
                     status.className = "text-center text-sm mb-4 text-yellow-400";
-                    // Warn but DON'T abort — let them try anyway
                 }
             } else if (status) {
                 status.textContent =
-                    `✅ Ready (noise: ${(this.noiseFloor*100).toFixed(0)}%). ` +
+                    `✅ Ready (noise: ${this.noiseFloor.toFixed(3)} RMS). ` +
                     "Speak now — recording starts automatically…";
                 status.className = "text-center text-sm mb-4 text-green-400";
             }
@@ -200,13 +213,15 @@ const SpeechCapture = {
             const sampleRate      = this.audioContext.sampleRate;
 
             this.javascriptNode.onaudioprocess = function () {
-                const array = new Uint8Array(self.analyser.frequencyBinCount);
-                self.analyser.getByteFrequencyData(array);
-
+                // TRUE time-domain RMS from waveform samples (not frequency bins)
+                // getByteFrequencyData returns dB-scaled spectral magnitudes — wrong for RMS.
+                const timeData = new Float32Array(self.analyser.fftSize);
+                self.analyser.getFloatTimeDomainData(timeData);
                 let sum = 0;
-                for (let i = 0; i < array.length; i++) sum += array[i] * array[i];
-                const rms = Math.sqrt(sum / array.length) / 255;
+                for (let i = 0; i < timeData.length; i++) sum += timeData[i] * timeData[i];
+                const rms = Math.sqrt(sum / timeData.length);
 
+                // Speech band ratio still correctly uses frequency-domain data
                 const speechRatio = self._getSpeechBandRatio(self.analyser, sampleRate);
                 const isVoice     = rms > self.VOICE_THRESHOLD && speechRatio > self.SPEECH_BAND_MIN_RATIO;
 

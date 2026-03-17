@@ -4,6 +4,28 @@ let authUsername   = "";
 let failedAttempts = 0;
 const MAX_ATTEMPTS = 3;
 
+// ── Fusion & Decision Module (matches Figure 9) ───────────
+// Scores are stored when a modality FAILS its individual threshold.
+// If both fail, the Fusion & Decision Module combines them.
+// Only if fusion ALSO fails does the system escalate to security question.
+//
+// Weights: keystroke 0.45, voice 0.55
+// Fusion threshold: 0.50 — must collectively clear this to grant access
+//
+// Flow (Figure 9):
+//   Keystroke → high confidence? yes → GRANT
+//                               no  → Voice → high confidence? yes → GRANT
+//                                                               no  → Fusion → high confidence? yes → GRANT
+//                                                                              no  → Security Question
+
+const FUSION_WEIGHT_KS    = 0.45;
+const FUSION_WEIGHT_VOICE = 0.55;
+const FUSION_THRESHOLD    = 0.50;
+
+let _ksScore    = null;   // stored when keystroke fails individual threshold
+let _voiceScore = null;   // stored when voice fails individual threshold
+
+
 // ── Step 0: Start Login ───────────────────────────────────
 function startLogin() {
     const username = document.getElementById("username-input").value.trim();
@@ -16,14 +38,15 @@ function startLogin() {
 
     document.getElementById("username-section").classList.add("hidden");
     document.getElementById("step-indicator").classList.remove("hidden");
-    document.getElementById("password-section").classList.remove("hidden");  // ← UPDATED
+    document.getElementById("password-section").classList.remove("hidden");
     document.getElementById("attempts-indicator").classList.remove("hidden");
 
     document.getElementById("dot-password")
-        .classList.replace("bg-gray-700", "bg-purple-600");  // ← UPDATED
+        .classList.replace("bg-gray-700", "bg-purple-600");
 }
 
-// ── Step 1: Password Auth ← ADDED ────────────────────────
+
+// ── Step 1: Password Auth ─────────────────────────────────
 async function submitPasswordAuth() {
     const password = document.getElementById("password-input").value;
     const status   = document.getElementById("password-status");
@@ -60,8 +83,9 @@ async function submitPasswordAuth() {
     }
 }
 
+
 // ── Step 2: Keystroke Auth ────────────────────────────────
-function moveToKeystrokeAuth() {  // ← ADDED
+function moveToKeystrokeAuth() {
     document.getElementById("password-section").classList.add("hidden");
     document.getElementById("keystroke-section").classList.remove("hidden");
 
@@ -100,11 +124,14 @@ async function submitKeystrokeAuth() {
         const result = await Api.verifyKeystroke(authUsername, features);
 
         if (result.authenticated) {
+            // Keystroke individually passed — grant immediately (Figure 9: yes branch)
             showSuccess("Keystroke Dynamics", result.confidence);
         } else {
+            // Keystroke failed individual threshold — store score for fusion later
+            _ksScore = typeof result.confidence === "number" ? result.confidence : 0.0;
             recordFailedAttempt();
             status.textContent =
-                `❌ Keystroke failed (confidence: ${(result.confidence * 100).toFixed(1)}%)`;
+                `❌ Keystroke not matched (${(_ksScore * 100).toFixed(1)}%) — trying voice…`;
             status.className = "text-center text-sm mb-4 text-red-400";
             setTimeout(() => moveToVoiceAuth(), 1500);
         }
@@ -115,6 +142,7 @@ async function submitKeystrokeAuth() {
         status.className = "text-center text-sm mb-4 text-red-400";
     }
 }
+
 
 // ── Step 3: Voice Auth ────────────────────────────────────
 function moveToVoiceAuth() {
@@ -136,9 +164,6 @@ function startVoiceAuth() {
         return;
     }
 
-    // Use the same full VAD pipeline as enrollment — noise floor estimate,
-    // speech-band check, auto-stop on silence. The old 4-second timer bypass
-    // skipped all quality checks, causing low-quality recordings to reach the model.
     btn.disabled    = true;
     btn.textContent = "🎤 Measuring background…";
     btn.classList.replace("bg-red-600", "bg-yellow-600");
@@ -153,7 +178,6 @@ function startVoiceAuth() {
             btn.textContent = "🎤 Listening — speak the phrase…";
             btn.classList.replace("bg-yellow-600", "bg-red-600");
         } else {
-            // startRecording already set an error status; just re-enable the button
             btn.disabled    = false;
             btn.textContent = "🎤 Try Again";
             btn.classList.replace("bg-yellow-600", "bg-red-600");
@@ -172,28 +196,45 @@ async function onVoiceAuthComplete(fullFeatureDict) {
     try {
         const result = await Api.verifyVoice(authUsername, fullFeatureDict);
 
+        // Normalise voice score to 0–1
+        const voiceScore = result.fused_score != null
+            ? result.fused_score / 100.0
+            : (typeof result.confidence === "number" ? result.confidence : 0.0);
+
         if (result.authenticated) {
+            // Voice individually passed — grant immediately (Figure 9: yes branch)
             showSuccess("Speech Biometrics", result.confidence);
+
         } else {
+            // Voice failed individual threshold — store score for fusion
+            _voiceScore = voiceScore;
             recordFailedAttempt();
-            // Show fused_score (0–100 scale) if available, otherwise fall back to confidence
-            const pct = result.fused_score != null
-                ? result.fused_score.toFixed(1)
-                : (result.confidence * 100).toFixed(1);
-            status.textContent =
-                `❌ Voice not recognised (score: ${pct}%). Speak clearly and try again.`;
-            status.className = "text-center text-sm mb-4 text-red-400";
 
-            if (btn) {
-                btn.disabled    = false;
-                btn.textContent = "🎤 Try Again";
-            }
+            // ── Fusion & Decision Module (Figure 9) ───────────────
+            // Both keystroke AND voice have now failed individually.
+            // Run the Fusion & Decision Module before escalating to security question.
+            const ksScore = _ksScore !== null ? _ksScore : 0.0;
+            const fusedScore = (FUSION_WEIGHT_KS * ksScore) + (FUSION_WEIGHT_VOICE * _voiceScore);
 
-            // Only advance to security question after 2 voice failures, not 1
-            const voiceFailures = parseInt(btn?.dataset.voiceFails || "0") + 1;
-            if (btn) btn.dataset.voiceFails = voiceFailures;
-            if (voiceFailures >= 2) {
-                setTimeout(() => moveToSecurityAuth(), 1500);
+            console.log(
+                `[Fusion & Decision Module] ` +
+                `keystroke=${(ksScore * 100).toFixed(1)}%  ` +
+                `voice=${(_voiceScore * 100).toFixed(1)}%  ` +
+                `fused=${(fusedScore * 100).toFixed(1)}%  ` +
+                `threshold=${(FUSION_THRESHOLD * 100).toFixed(0)}%`
+            );
+
+            if (fusedScore >= FUSION_THRESHOLD) {
+                // Fusion passed — grant access (Figure 9: fusion yes branch)
+                showSuccess("Fusion & Decision Module", fusedScore);
+            } else {
+                // Fusion also failed — escalate to security question (Figure 9: fusion no branch)
+                const voicePct  = (_voiceScore * 100).toFixed(1);
+                const fusedPct  = (fusedScore * 100).toFixed(1);
+                status.textContent =
+                    `❌ Voice not matched (${voicePct}%) — fused score ${fusedPct}% — proceeding to security question…`;
+                status.className = "text-center text-sm mb-4 text-red-400";
+                setTimeout(() => moveToSecurityAuth(), 2000);
             }
         }
 
@@ -205,6 +246,7 @@ async function onVoiceAuthComplete(fullFeatureDict) {
     }
 }
 
+
 // ── Step 4: Security Question Auth ───────────────────────
 async function moveToSecurityAuth() {
     document.getElementById("voice-section").classList.add("hidden");
@@ -212,7 +254,7 @@ async function moveToSecurityAuth() {
 
     document.getElementById("dot-security")
         .classList.replace("bg-gray-700", "bg-purple-600");
-    document.getElementById("line-3").style.width = "100%";  // ← UPDATED
+    document.getElementById("line-3").style.width = "100%";
 
     try {
         const result = await Api.getSecurityQuestion(authUsername);
@@ -244,8 +286,24 @@ async function submitSecurityAuth() {
         const result = await Api.verifySecurityQuestion(authUsername, answer);
 
         if (result.authenticated) {
-            showSuccess("Security Question", result.confidence);
+            // Correct answer → re-authenticate from the beginning (Figure 9)
+            // The security question confirms identity but does not grant access directly.
+            // The user must pass keystroke or voice on a fresh attempt.
+            status.textContent = "✅ Correct! Please re-authenticate with your biometrics.";
+            status.className   = "text-center text-sm mb-4 text-green-400";
+            setTimeout(() => {
+                // Reset scores and failed attempts, then restart from keystroke
+                _ksScore       = null;
+                _voiceScore    = null;
+                failedAttempts = 0;
+                [1, 2, 3].forEach(i => {
+                    const dot = document.getElementById(`fail-${i}`);
+                    if (dot) dot.classList.replace("bg-red-500", "bg-gray-700");
+                });
+                moveToKeystrokeAuth();
+            }, 1500);
         } else {
+            // Wrong answer → flagged and rejected (Figure 9)
             recordFailedAttempt();
             showDenied();
         }
@@ -256,6 +314,7 @@ async function submitSecurityAuth() {
         status.className = "text-center text-sm mb-4 text-red-400";
     }
 }
+
 
 // ── Helpers ───────────────────────────────────────────────
 function recordFailedAttempt() {
@@ -280,7 +339,7 @@ function showDenied() {
 
 function hideAllSections() {
     const sections = [
-        "username-section", "password-section",   // ← UPDATED
+        "username-section", "password-section",
         "keystroke-section", "voice-section",
         "security-section", "success-section", "denied-section"
     ];
@@ -292,6 +351,8 @@ function hideAllSections() {
 function resetLogin() {
     failedAttempts = 0;
     authUsername   = "";
+    _ksScore       = null;
+    _voiceScore    = null;
     KeystrokeCapture.reset();
     SpeechCapture.reset();
     const recordBtn = document.getElementById("record-btn");
@@ -302,7 +363,7 @@ function resetLogin() {
         if (dot) dot.classList.replace("bg-red-500", "bg-gray-700");
     });
 
-    ["dot-password", "dot-keystroke",               // ← UPDATED
+    ["dot-password", "dot-keystroke",
      "dot-voice", "dot-security"].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.classList.replace("bg-purple-600", "bg-gray-700");
@@ -310,7 +371,7 @@ function resetLogin() {
 
     document.getElementById("line-1").style.width = "0%";
     document.getElementById("line-2").style.width = "0%";
-    document.getElementById("line-3").style.width = "0%";  // ← ADDED
+    document.getElementById("line-3").style.width = "0%";
 
     hideAllSections();
     document.getElementById("username-section").classList.remove("hidden");

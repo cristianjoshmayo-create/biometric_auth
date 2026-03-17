@@ -224,10 +224,20 @@ def train_voice_model(username: str):
         print("  Running 5-fold cross-validation …")
         y_prob_cv = cross_val_predict(pipeline, X, y, cv=cv, method="predict_proba")[:, 1]
 
+        # ── CRITICAL FIX: calibrate threshold on FUSED score, not raw GBM prob ──
+        # Previously best_thresh was tuned on y_prob_cv (GBM only) but at
+        # inference the decision uses 0.70*model_prob + 0.30*mah_score.
+        # Those are different distributions — the threshold was meaningless.
+        # Fix: compute the same fused score during CV and tune on that.
+        fused_cv = np.array([
+            0.70 * p + 0.30 * mahalanobis_score(X[i], profile_mean, profile_std)
+            for i, p in enumerate(y_prob_cv)
+        ])
+
         best_thresh, best_eer = 0.50, 1.0
-        print(f"\n  {'Threshold':>10}  {'FAR':>8}  {'FRR':>8}  {'EER':>8}")
+        print(f"\n  {'Threshold':>10}  {'FAR':>8}  {'FRR':>8}  {'EER':>8}  (on fused score)")
         for t in np.arange(0.30, 0.90, 0.02):
-            y_t = (y_prob_cv >= t).astype(int)
+            y_t = (fused_cv >= t).astype(int)
             if len(np.unique(y_t)) < 2: continue
             cm = confusion_matrix(y, y_t)
             if cm.shape != (2, 2): continue
@@ -246,7 +256,7 @@ def train_voice_model(username: str):
         if noise_adj > 0.01:
             print(f"\n  ⚠  Noise-adaptive: {best_thresh:.2f} → {final_thresh:.2f} (+{noise_adj:.2f})")
 
-        y_final = (y_prob_cv >= final_thresh).astype(int)
+        y_final = (fused_cv >= final_thresh).astype(int)
         cm = confusion_matrix(y, y_final)
         tn, fp, fn, tp = cm.ravel()
         far = fp / (fp + tn) if (fp + tn) > 0 else 0
