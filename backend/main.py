@@ -13,10 +13,10 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS — kept for any external tools, no longer needed for the frontend
+# CORS — restrict to localhost; change to your domain if deploying
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

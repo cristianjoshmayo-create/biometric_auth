@@ -133,31 +133,41 @@ function startVoiceAuth() {
 
     if (SpeechCapture.isRecording) {
         SpeechCapture.stopRecording();
-        btn.textContent = "🎤 Start Recording";
-        indicator.classList.add("hidden");
         return;
     }
 
-    btn.textContent = "⏹ Stop Recording";
-    btn.classList.replace("bg-red-600", "bg-red-800");
+    // Use the same full VAD pipeline as enrollment — noise floor estimate,
+    // speech-band check, auto-stop on silence. The old 4-second timer bypass
+    // skipped all quality checks, causing low-quality recordings to reach the model.
+    btn.disabled    = true;
+    btn.textContent = "🎤 Measuring background…";
+    btn.classList.replace("bg-red-600", "bg-yellow-600");
     indicator.classList.remove("hidden");
-    status.textContent = "🔴 Recording... (4 seconds)";
+    indicator.style.backgroundColor = "#f59e0b";
+    status.textContent = "🔇 Measuring background noise (stay quiet)…";
+    status.className   = "text-center text-sm mb-4 text-yellow-400";
 
-    SpeechCapture.startRecording().then(started => {
-        if (started) {
-            setTimeout(() => {
-                btn.textContent = "🎤 Start Recording";
-                btn.classList.replace("bg-red-800", "bg-red-600");
-                indicator.classList.add("hidden");
-            }, 4200);
+    SpeechCapture.reset();
+    SpeechCapture.startRecording().then(ok => {
+        if (ok) {
+            btn.textContent = "🎤 Listening — speak the phrase…";
+            btn.classList.replace("bg-yellow-600", "bg-red-600");
+        } else {
+            // startRecording already set an error status; just re-enable the button
+            btn.disabled    = false;
+            btn.textContent = "🎤 Try Again";
+            btn.classList.replace("bg-yellow-600", "bg-red-600");
+            indicator.classList.add("hidden");
         }
     });
 }
 
 async function onVoiceAuthComplete(fullFeatureDict) {
     const status = document.getElementById("voice-status");
+    const btn    = document.getElementById("record-btn");
     status.textContent = "⏳ Verifying voice pattern...";
-    status.className = "text-center text-sm mb-4 text-yellow-400";
+    status.className   = "text-center text-sm mb-4 text-yellow-400";
+    if (btn) btn.disabled = true;
 
     try {
         const result = await Api.verifyVoice(authUsername, fullFeatureDict);
@@ -166,16 +176,32 @@ async function onVoiceAuthComplete(fullFeatureDict) {
             showSuccess("Speech Biometrics", result.confidence);
         } else {
             recordFailedAttempt();
+            // Show fused_score (0–100 scale) if available, otherwise fall back to confidence
+            const pct = result.fused_score != null
+                ? result.fused_score.toFixed(1)
+                : (result.confidence * 100).toFixed(1);
             status.textContent =
-                `❌ Voice failed (confidence: ${(result.confidence * 100).toFixed(1)}%)`;
+                `❌ Voice not recognised (score: ${pct}%). Speak clearly and try again.`;
             status.className = "text-center text-sm mb-4 text-red-400";
-            setTimeout(() => moveToSecurityAuth(), 1500);
+
+            if (btn) {
+                btn.disabled    = false;
+                btn.textContent = "🎤 Try Again";
+            }
+
+            // Only advance to security question after 2 voice failures, not 1
+            const voiceFailures = parseInt(btn?.dataset.voiceFails || "0") + 1;
+            if (btn) btn.dataset.voiceFails = voiceFailures;
+            if (voiceFailures >= 2) {
+                setTimeout(() => moveToSecurityAuth(), 1500);
+            }
         }
 
     } catch (err) {
         console.error(err);
         status.textContent = "❌ Server error. Try again.";
-        status.className = "text-center text-sm mb-4 text-red-400";
+        status.className   = "text-center text-sm mb-4 text-red-400";
+        if (btn) { btn.disabled = false; btn.textContent = "🎤 Try Again"; }
     }
 }
 
@@ -268,6 +294,8 @@ function resetLogin() {
     authUsername   = "";
     KeystrokeCapture.reset();
     SpeechCapture.reset();
+    const recordBtn = document.getElementById("record-btn");
+    if (recordBtn) recordBtn.dataset.voiceFails = "0";
 
     [1, 2, 3].forEach(i => {
         const dot = document.getElementById(`fail-${i}`);

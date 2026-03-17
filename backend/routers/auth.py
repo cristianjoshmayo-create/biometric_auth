@@ -15,6 +15,7 @@ import bcrypt  # ← ADDED
 
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion, AuthLog
+from schemas import VoiceFeatures
 
 router = APIRouter()
 
@@ -100,18 +101,8 @@ class KeystrokeAuth(BaseModel):
     shift_lag_norm:   float = 0
 
 
-class VoiceAuth(BaseModel):
-    username:      str
-    mfcc_features: List[float]
-    mfcc_std:      List[float] = []
-    pitch_mean:    float = 0
-    pitch_std:     float = 0
-    speaking_rate: float = 0
-    energy_mean:   float = 0
-    energy_std:    float = 0
-    zcr_mean:               float = 0
-    spectral_centroid_mean: float = 0
-    spectral_rolloff_mean:  float = 0
+class VoiceAuth(VoiceFeatures):
+    username: str
 
 
 class SecurityAuth(BaseModel):
@@ -193,12 +184,12 @@ def verify_password(payload: PasswordAuth, db: Session = Depends(get_db)):
                 "granted" if authenticated else "denied")
 
     if not authenticated:
-        total_denials = db.query(AuthLog).filter(
+        pw_denials = db.query(AuthLog).filter(
             AuthLog.user_id == user.id,
             AuthLog.auth_method == "password",
             AuthLog.result == "denied"
         ).count()
-        if total_denials >= 5:
+        if pw_denials >= 5:
             user.is_flagged = True
             db.commit()
 
@@ -442,13 +433,14 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             except Exception as e:
                 print(f"  ⚠️ Retrain failed: {e}")
 
-    # Handle failed attempts
+    # Handle failed attempts — count keystroke method only
     if not authenticated:
-        total_denials = db.query(AuthLog).filter(
+        ks_denials = db.query(AuthLog).filter(
             AuthLog.user_id == user.id,
+            AuthLog.auth_method == "keystroke",
             AuthLog.result == "denied"
         ).count()
-        if total_denials >= 5:
+        if ks_denials >= 10:
             user.is_flagged = True
             db.commit()
 
@@ -477,12 +469,13 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
                 sys.path.insert(0, project_root)
             from ml.train_voice_cnn import predict_voice
 
-            # FIX: old code passed only payload.mfcc_features (13 values).
-            # predict_voice() needs the full 34-feature dict — the missing 21
-            # were always 0, making every voice score near-identical → accept all.
+            # FIX v3: pass ALL 62 features — delta/flux/voiced were missing,
+            # causing the 62-feature GBM model to run on a 34-feature input.
             feature_dict = {
                 "mfcc_features":          payload.mfcc_features,
                 "mfcc_std":               payload.mfcc_std,
+                "delta_mfcc_mean":        payload.delta_mfcc_mean,        # v2
+                "delta2_mfcc_mean":       payload.delta2_mfcc_mean,       # v2
                 "pitch_mean":             payload.pitch_mean,
                 "pitch_std":              payload.pitch_std,
                 "speaking_rate":          payload.speaking_rate,
@@ -491,6 +484,8 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
                 "zcr_mean":               payload.zcr_mean,
                 "spectral_centroid_mean": payload.spectral_centroid_mean,
                 "spectral_rolloff_mean":  payload.spectral_rolloff_mean,
+                "spectral_flux_mean":     payload.spectral_flux_mean,     # v2
+                "voiced_fraction":        payload.voiced_fraction,        # v2
             }
 
             result = predict_voice(payload.username, feature_dict)
@@ -541,6 +536,18 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
     log_attempt(db, user.id, "voice", confidence,
                 "granted" if authenticated else "denied")
 
+    # Handle failed voice attempts — count voice method only to avoid cross-method false lockout
+    if not authenticated:
+        voice_denials = db.query(AuthLog).filter(
+            AuthLog.user_id == user.id,
+            AuthLog.auth_method == "voice",
+            AuthLog.result == "denied"
+        ).count()
+        if voice_denials >= 10:
+            user.is_flagged = True
+            db.commit()
+            print(f"  ⚠️ User '{payload.username}' flagged after {voice_denials} voice failures")
+
     # ── Adaptive learning: save login sample and retrain periodically ─────
     if authenticated:
         MAX_VOICE_SAMPLES = 50
@@ -558,7 +565,7 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
                 db.delete(oldest)
                 db.flush()
 
-        # Save this login attempt as a new voice sample
+        # Save this login attempt as a new voice sample (with ALL v2 fields)
         new_voice = VoiceTemplate(
             user_id        = user.id,
             attempt_number = min(total_voice + 1, MAX_VOICE_SAMPLES),
@@ -572,6 +579,11 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
             zcr_mean               = payload.zcr_mean,
             spectral_centroid_mean = payload.spectral_centroid_mean,
             spectral_rolloff_mean  = payload.spectral_rolloff_mean,
+            delta_mfcc_mean        = payload.delta_mfcc_mean,    # v2
+            delta2_mfcc_mean       = payload.delta2_mfcc_mean,   # v2
+            spectral_flux_mean     = payload.spectral_flux_mean, # v2
+            voiced_fraction        = payload.voiced_fraction,    # v2
+            snr_db                 = payload.snr_db,             # v2
         )
         db.add(new_voice)
         db.commit()
@@ -614,13 +626,23 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
                     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                     'ml', 'train_voice_cnn.py'
                 )
-                subprocess.Popen(
-                    [sys.executable, script_path, payload.username],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                lock_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                    'ml', 'models', f"{payload.username}_voice_cnn.pkl.retraining"
                 )
-                print(f"  ✅ Voice retraining started in background")
+                # Skip if another retrain is already running for this user
+                if not os.path.exists(lock_path):
+                    open(lock_path, 'w').close()
+                    subprocess.Popen(
+                        [sys.executable, script_path, payload.username,
+                         f"--lock={lock_path}"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                    )
+                    print(f"  ✅ Voice retraining started in background")
+                else:
+                    print(f"  ⏭  Voice retrain skipped — already running")
             except Exception as e:
                 print(f"  ⚠️ Voice retrain failed to start: {e}")
 
@@ -662,9 +684,16 @@ def verify_security(payload: SecurityAuth, db: Session = Depends(get_db)):
                 "granted" if authenticated else "denied")
 
     if not authenticated:
-        user.is_flagged = True
-        db.commit()
-        print(f"  ⚠️ User '{payload.username}' flagged!")
+        # Require 3 failed security answers before flagging — one typo shouldn't lock an account
+        sq_denials = db.query(AuthLog).filter(
+            AuthLog.user_id == user.id,
+            AuthLog.auth_method == "security_question",
+            AuthLog.result == "denied"
+        ).count()
+        if sq_denials >= 3:
+            user.is_flagged = True
+            db.commit()
+            print(f"  ⚠️ User '{payload.username}' flagged after {sq_denials} security Q failures")
 
     return {
         "authenticated": authenticated,

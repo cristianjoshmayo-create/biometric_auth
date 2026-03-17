@@ -131,10 +131,20 @@ def generate_genuine_augmentations(genuine_vectors, n=150, rng_seed=42):
 
 
 def mahalanobis_score(vec, profile_mean, profile_std):
-    safe_std = np.where(profile_std < 1e-6, 1e-6, profile_std)
-    z = np.abs((vec - profile_mean) / safe_std)
-    mean_z = float(np.mean(z))
-    score = 1.0 / (1.0 + np.exp(2.5 * (mean_z - 1.0)))
+    """
+    Diagonal Mahalanobis distance converted to a [0,1] similarity score.
+    Uses variance (std²) as the diagonal covariance — accounts for each feature's
+    natural spread rather than treating all features equally.
+    """
+    var = profile_std ** 2
+    safe_var = np.where(var < 1e-10, 1e-10, var)
+    diff = vec - profile_mean
+    # Weighted sum of squared z-scores (diagonal Mahalanobis²)
+    d_sq = float(np.sum(diff ** 2 / safe_var))
+    # Normalise by feature count so the threshold is dimensionality-independent
+    d_sq_norm = d_sq / len(vec)
+    # Sigmoid mapping: score=1.0 when d_sq_norm=0, ~0.5 at d_sq_norm=1 (1σ avg)
+    score = 1.0 / (1.0 + np.exp(2.5 * (d_sq_norm - 1.0)))
     return float(np.clip(score, 0, 1))
 
 
@@ -259,12 +269,13 @@ def train_voice_model(username: str):
             'n_enrollment': len(genuine_vectors),
             'profile_mean': profile_mean,
             'profile_std':  profile_std,
+            'profile_var':  profile_std ** 2,   # stored for diagonal Mahalanobis
             'threshold':    final_thresh,
             'noise_level':  noise_level,
             'far':          float(far),
             'frr':          float(frr),
             'eer':          float(best_eer),
-            'model_type':   'gbm_improved_v2',
+            'model_type':   'gbm_improved_v3',
         }
         model_path = os.path.join(model_dir, f"{username}_voice_cnn.pkl")
         with open(model_path, 'wb') as f:
@@ -340,7 +351,8 @@ def predict_voice(username: str, feature_dict: dict) -> dict:
         vec = vec[:, :n]
 
     model_prob = float(pipeline.predict_proba(vec)[0][1])
-    mah_score  = mahalanobis_score(vec[0], profile_mean, profile_std)
+    profile_var = model_data.get('profile_var', profile_std ** 2)
+    mah_score  = mahalanobis_score(vec[0], profile_mean, np.sqrt(profile_var))
     fused      = 0.70 * model_prob + 0.30 * mah_score
     match      = fused >= threshold
 
@@ -360,6 +372,19 @@ def predict_voice(username: str, feature_dict: dict) -> dict:
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("username", nargs="?", default=None)
+    parser.add_argument("--lock", default=None, help="Lock file to delete on completion")
+    args = parser.parse_args()
 
-    username = sys.argv[1] if len(sys.argv) > 1 else input("Username: ").strip()
-    train_voice_model(username)
+    username = args.username or input("Username: ").strip()
+    try:
+        train_voice_model(username)
+    finally:
+        # Always clean up the lock file so the next retrain isn't blocked
+        if args.lock and os.path.exists(args.lock):
+            try:
+                os.remove(args.lock)
+            except Exception:
+                pass

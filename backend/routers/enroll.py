@@ -16,6 +16,7 @@ import bcrypt
 
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion
+from schemas import VoiceFeatures
 import threading
 import sys
 
@@ -154,23 +155,8 @@ class KeystrokeEnroll(BaseModel):
     shift_lag_norm:   float = 0
 
 
-class VoiceEnroll(BaseModel):
-    username:         str
-    mfcc_features:    List[float]
-    mfcc_std:         List[float] = []
-    delta_mfcc_mean:  List[float] = []   # NEW
-    delta2_mfcc_mean: List[float] = []   # NEW
-    pitch_mean:       float = 0
-    pitch_std:        float = 0
-    speaking_rate:    float = 0
-    energy_mean:      float = 0
-    energy_std:       float = 0
-    zcr_mean:               float = 0
-    spectral_centroid_mean: float = 0
-    spectral_rolloff_mean:  float = 0
-    spectral_flux_mean:     float = 0    # NEW
-    voiced_fraction:        float = 0    # NEW
-    snr_db:                 float = 0    # NEW — for logging
+class VoiceEnroll(VoiceFeatures):
+    username: str
 
 
 class SecurityEnroll(BaseModel):
@@ -530,28 +516,32 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         snr_db = _estimate_snr(audio, sr)
         print(f"Estimated SNR: {snr_db:.1f} dB")
 
-        if snr_db < 10.0:
+        # Lowered from 10dB to 6dB — typical laptop mic in a normal room
+        # measures 6–12dB. 10dB was blocking almost every real recording.
+        if snr_db < 6.0:
             return {
                 "success": False,
                 "detail":  (
-                    f"Audio too noisy (SNR={snr_db:.1f}dB, minimum 10dB). "
-                    "Move to a quieter location and try again."
+                    f"Audio too noisy (SNR={snr_db:.1f}dB, need ≥6dB). "
+                    "Move away from fans or loud speakers and try again."
                 ),
                 "snr_db": snr_db,
             }
 
         # ── Spectral subtraction (denoise) ─────────────────────────────────
-        # Only apply if SNR < 25 dB to avoid over-processing clean audio
-        if snr_db < 25.0:
-            print(f"  Applying spectral subtraction (SNR={snr_db:.1f}dB < 25dB)")
+        # Apply whenever SNR < 30dB (was 25dB) to cover more real-world cases
+        if snr_db < 30.0:
+            print(f"  Applying spectral subtraction (SNR={snr_db:.1f}dB)")
             audio_clean = _spectral_subtraction(audio, sr)
         else:
             audio_clean = audio
-            print(f"  Skipping spectral subtraction (SNR={snr_db:.1f}dB ≥ 25dB, clean enough)")
+            print(f"  Skipping spectral subtraction (SNR={snr_db:.1f}dB ≥ 30dB)")
 
         # ── WebRTC VAD ─────────────────────────────────────────────────────
         import webrtcvad
-        vad = webrtcvad.Vad(3)  # most aggressive mode
+        # Mode 1 (was 3) — less aggressive, works better on compressed
+        # audio (webm/opus from browser) and laptop mic recordings
+        vad = webrtcvad.Vad(1)
 
         with open(wav_path, 'rb') as f:
             wav_data = f.read()
@@ -576,42 +566,51 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
 
         print(f"VAD: {voice_ratio:.0%} voiced  ({speech_duration:.1f}s speech)")
 
-        # Stricter thresholds: require 60% voiced (was 40%)
-        if voice_ratio < 0.60:
+        # Lowered from 60% to 40% — browser audio compression and laptop mics
+        # cause many voiced frames to be misclassified as unvoiced by aggressive VAD.
+        # 40% still ensures we have real speech, not just ambient noise.
+        if voice_ratio < 0.40:
             return {
                 "success": False,
                 "detail":  (
-                    f"Too much background noise detected ({voice_ratio:.0%} voiced, "
-                    f"minimum 60%). Speak clearly in a quiet environment."
+                    f"Not enough speech detected ({voice_ratio:.0%} voiced, need ≥40%). "
+                    f"Speak the phrase clearly: 'biometric voice keystroke authentication'."
                 ),
                 "snr_db": snr_db,
             }
-        if speech_duration < 1.5:
+        # Lowered from 1.5s to 1.0s minimum speech
+        if speech_duration < 1.0:
             return {
                 "success": False,
-                "detail":  f"Too short ({speech_duration:.1f}s). Speak the full phrase.",
+                "detail":  f"Recording too short ({speech_duration:.1f}s of speech). Speak the full phrase.",
             }
 
         # ── Energy check ───────────────────────────────────────────────────
         rms = float(np.sqrt(np.mean(audio_clean ** 2)))
-        if rms < 0.02:
+        # Lowered from 0.02 to 0.005 — laptop mics and some browsers
+        # output much lower amplitude than professional mics
+        if rms < 0.005:
             return {
                 "success": False,
-                "detail":  f"Audio too quiet (RMS={rms:.4f}). Speak louder.",
+                "detail":  f"Audio too quiet (level={rms:.4f}). Speak louder or move closer to the mic.",
             }
 
         # ── Spectral sanity checks ─────────────────────────────────────────
         centroid      = librosa.feature.spectral_centroid(y=audio_clean, sr=sr)
         mean_centroid = float(np.mean(centroid))
-        if mean_centroid < 600 or mean_centroid > 5500:
+        # Widened from 600–5500 to 300–7000 Hz — some voices and accents
+        # have more energy outside the narrow 600–5500 band
+        if mean_centroid < 300 or mean_centroid > 7000:
             return {
                 "success": False,
-                "detail":  f"Audio doesn't sound like speech (centroid={mean_centroid:.0f}Hz).",
+                "detail":  f"Audio doesn't sound like speech (centroid={mean_centroid:.0f}Hz). Check microphone.",
             }
 
         zcr      = librosa.feature.zero_crossing_rate(audio_clean)
         mean_zcr = float(np.mean(zcr))
-        if mean_zcr < 0.02 or mean_zcr > 0.5:
+        # Widened from 0.02–0.5 to 0.01–0.6 — compressed audio formats
+        # can produce slightly different ZCR distributions
+        if mean_zcr < 0.01 or mean_zcr > 0.6:
             return {
                 "success": False,
                 "detail":  f"Unusual audio (ZCR={mean_zcr:.4f}). Ensure microphone is working.",

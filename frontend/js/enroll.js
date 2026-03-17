@@ -487,14 +487,3 @@ async function submitSecurityQuestion() {
         console.error(err);
     }
 }
-
-function averageArrays(arrays) {
-    if (!arrays || arrays.length === 0) return [];
-    const minLen = Math.min(...arrays.map(a => a.length));
-    const result = [];
-    for (let i = 0; i < minLen; i++) {
-        const avg = arrays.reduce((sum, arr) => sum + (arr[i] || 0), 0) / arrays.length;
-        result.push(parseFloat(avg.toFixed(3)));
-    }
-    return result;
-}
