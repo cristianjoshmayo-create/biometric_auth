@@ -130,6 +130,7 @@ function moveToVoiceAuth() {
 
 function startVoiceAuth() {
     const btn       = document.getElementById("record-btn");
+    const tryAgain  = document.getElementById("try-again-btn");
     const indicator = document.getElementById("recording-indicator");
     const status    = document.getElementById("voice-status");
 
@@ -141,6 +142,7 @@ function startVoiceAuth() {
     btn.disabled    = true;
     btn.textContent = "🎤 Measuring background…";
     btn.classList.replace("bg-red-600", "bg-yellow-600");
+    if (tryAgain) tryAgain.disabled = true;
     indicator.classList.remove("hidden");
     indicator.style.backgroundColor = "#f59e0b";
     status.textContent = "🔇 Measuring background noise (stay quiet)…";
@@ -155,9 +157,37 @@ function startVoiceAuth() {
             btn.disabled    = false;
             btn.textContent = "🎤 Try Again";
             btn.classList.replace("bg-yellow-600", "bg-red-600");
+            if (tryAgain) tryAgain.disabled = false;
             indicator.classList.add("hidden");
         }
     });
+}
+
+// Resets the voice step so the user can try a fresh recording
+function resetVoiceAuth() {
+    if (SpeechCapture.isRecording) SpeechCapture.stopRecording();
+    SpeechCapture.reset();
+
+    const btn      = document.getElementById("record-btn");
+    const tryAgain = document.getElementById("try-again-btn");
+    const indicator = document.getElementById("recording-indicator");
+    const status    = document.getElementById("voice-status");
+    const diagBar   = document.getElementById("diag-bar");
+    const diagText  = document.getElementById("diag-text");
+
+    if (btn) {
+        btn.disabled    = false;
+        btn.textContent = "🎤 Start Recording";
+        btn.classList.replace("bg-yellow-600", "bg-red-600");
+    }
+    if (tryAgain)  tryAgain.disabled = false;
+    if (indicator) indicator.classList.add("hidden");
+    if (diagBar)   { diagBar.style.width = "0%"; diagBar.style.background = "#ef4444"; }
+    if (diagText)  diagText.textContent = "";
+    if (status) {
+        status.textContent = "Click record when ready";
+        status.className   = "text-center text-sm mb-4 text-gray-500";
+    }
 }
 
 async function onVoiceAuthComplete(fullFeatureDict) {
@@ -166,6 +196,8 @@ async function onVoiceAuthComplete(fullFeatureDict) {
     status.textContent = "⏳ Verifying voice pattern...";
     status.className   = "text-center text-sm mb-4 text-yellow-400";
     if (btn) btn.disabled = true;
+    const tryAgain = document.getElementById("try-again-btn");
+    if (tryAgain) tryAgain.disabled = true;
 
     try {
         const result = await Api.verifyVoice(authUsername, fullFeatureDict);
@@ -211,6 +243,7 @@ async function onVoiceAuthComplete(fullFeatureDict) {
         status.textContent = "❌ Server error. Try again.";
         status.className   = "text-center text-sm mb-4 text-red-400";
         if (btn) { btn.disabled = false; btn.textContent = "🎤 Try Again"; }
+        if (tryAgain) tryAgain.disabled = false;
     }
 }
 

@@ -200,10 +200,16 @@ function _resetKeystrokeInput() {
         const trimmed = input.value.trim();
         const target  = KeystrokeCapture.targetPhrase;
         if (trimmed === target) {
+            // Wait for this keyup event to fully register in KeystrokeCapture
+            // before submitting — fast typists can complete the phrase mid-keystroke,
+            // cutting off the final key's release timing data.
+            // 120ms is enough for the keyup timestamp to land without feeling sluggish.
             _submitPending = true;
             input.value    = target; // normalise — remove any trailing space
-            input.disabled = true;
-            setTimeout(() => submitKeystroke(), 100);
+            setTimeout(() => {
+                input.disabled = true;
+                submitKeystroke();
+            }, 120);
         }
     };
 }
@@ -298,12 +304,19 @@ async function submitKeystroke() {
             finger_transition_ratio: features.finger_transition_ratio,
             seek_time_mean:          features.seek_time_mean,
             seek_time_count:         features.seek_time_count,
-            dwell_mean_norm:  features.dwell_mean_norm  || 0,
-            dwell_std_norm:   features.dwell_std_norm   || 0,
-            flight_mean_norm: features.flight_mean_norm || 0,
-            flight_std_norm:  features.flight_std_norm  || 0,
-            p2p_std_norm:     features.p2p_std_norm     || 0,
-            r2r_mean_norm:    features.r2r_mean_norm    || 0,
+            // FIX: shift_lag fields were missing from enrollment — the model
+            // uses shift_lag_norm but it was never stored during enrollment,
+            // so all enrolled templates had shift_lag_norm = 0.
+            shift_lag_mean:          features.shift_lag_mean  || 0,
+            shift_lag_std:           features.shift_lag_std   || 0,
+            shift_lag_count:         features.shift_lag_count || 0,
+            dwell_mean_norm:         features.dwell_mean_norm  || 0,
+            dwell_std_norm:          features.dwell_std_norm   || 0,
+            flight_mean_norm:        features.flight_mean_norm || 0,
+            flight_std_norm:         features.flight_std_norm  || 0,
+            p2p_std_norm:            features.p2p_std_norm     || 0,
+            r2r_mean_norm:           features.r2r_mean_norm    || 0,
+            shift_lag_norm:          features.shift_lag_norm   || 0,
         });
 
         if (!result.success) {
