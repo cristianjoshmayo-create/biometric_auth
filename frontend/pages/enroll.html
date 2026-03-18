@@ -15,26 +15,87 @@
         <div class="text-center mb-8">
             <div class="text-4xl mb-3">🔐</div>
             <h1 class="text-white text-2xl font-bold">Biometric Enrollment</h1>
-            <p class="text-gray-400 text-sm mt-1">Register your typing and voice patterns</p>
+            <p class="text-gray-400 text-sm mt-1">Register your account and biometric patterns</p>
         </div>
 
-        <!-- Username Input -->
+        <!-- Step Indicator (3 steps, shown after account setup) -->
+        <div id="step-indicator" class="hidden mb-6">
+            <div class="flex justify-between items-center">
+                <!-- Step 1: Keystroke -->
+                <div id="step1-dot" class="flex flex-col items-center">
+                    <div class="w-8 h-8 rounded-full bg-gray-700
+                                flex items-center justify-center text-white text-sm font-bold">
+                        1
+                    </div>
+                    <span class="text-xs text-gray-400 mt-1">Keystroke</span>
+                </div>
+                <div class="flex-1 h-1 bg-gray-700 mx-2">
+                    <div id="progress-line" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
+                </div>
+                <!-- Step 2: Voice -->
+                <div id="step2-dot" class="flex flex-col items-center">
+                    <div class="w-8 h-8 rounded-full bg-gray-700
+                                flex items-center justify-center text-white text-sm font-bold">
+                        2
+                    </div>
+                    <span class="text-xs text-gray-400 mt-1">Voice</span>
+                </div>
+                <div class="flex-1 h-1 bg-gray-700 mx-2">
+                    <div id="progress-line2" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
+                </div>
+                <!-- Step 3: Security -->
+                <div id="step3-dot" class="flex flex-col items-center">
+                    <div class="w-8 h-8 rounded-full bg-gray-700
+                                flex items-center justify-center text-white text-sm font-bold">
+                        3
+                    </div>
+                    <span class="text-xs text-gray-400 mt-1">Security</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Account Setup (username + password on one screen) -->
         <div id="username-section">
-            <label class="text-gray-300 text-sm font-medium block mb-2">Username</label>
-            <input
-                id="username-input"
-                type="text"
-                placeholder="Enter your username"
-                class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
-                       mb-4 outline-none focus:ring-2 focus:ring-purple-500
-                       border border-gray-700"
-            />
+            <div class="mb-4">
+                <label class="text-gray-300 text-sm font-medium block mb-2">Username</label>
+                <input
+                    id="username-input"
+                    type="text"
+                    placeholder="Choose a username"
+                    class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
+                           outline-none focus:ring-2 focus:ring-purple-500
+                           border border-gray-700"
+                />
+            </div>
+            <div class="mb-3">
+                <label class="text-gray-300 text-sm font-medium block mb-2">Password</label>
+                <input
+                    id="password-input"
+                    type="password"
+                    placeholder="Create a password (min 8 characters)"
+                    class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
+                           outline-none focus:ring-2 focus:ring-purple-500
+                           border border-gray-700"
+                />
+            </div>
+            <div class="mb-4">
+                <label class="text-gray-300 text-sm font-medium block mb-2">Confirm Password</label>
+                <input
+                    id="password-confirm"
+                    type="password"
+                    placeholder="Confirm your password"
+                    class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
+                           outline-none focus:ring-2 focus:ring-purple-500
+                           border border-gray-700"
+                />
+            </div>
+            <p id="password-status" class="text-center text-sm mb-4 text-gray-500"></p>
             <button
-                onclick="startEnrollment()"
+                onclick="submitPassword()"
                 class="w-full bg-purple-600 hover:bg-purple-700 text-white
                        font-semibold py-3 rounded-lg transition-colors duration-200"
             >
-                Start Enrollment
+                Create Account
             </button>
             <p class="text-center text-gray-500 text-sm mt-4">
                 Already enrolled?
@@ -42,86 +103,8 @@
             </p>
         </div>
 
-        <!-- Step Indicator -->
-        <div id="step-indicator" class="hidden mb-6">
-            <div class="flex justify-between items-center">
-                <!-- Step 1: Password -->
-                <div id="step1-dot" class="flex flex-col items-center">
-                    <div class="w-8 h-8 rounded-full bg-purple-600
-                                flex items-center justify-center text-white text-sm font-bold">
-                        1
-                    </div>
-                    <span class="text-xs text-gray-400 mt-1">Password</span>
-                </div>
-                <div class="flex-1 h-1 bg-gray-700 mx-2">
-                    <div id="progress-line" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
-                </div>
-                <!-- Step 2: Keystroke -->
-                <div id="step2-dot" class="flex flex-col items-center">
-                    <div class="w-8 h-8 rounded-full bg-gray-700
-                                flex items-center justify-center text-white text-sm font-bold">
-                        2
-                    </div>
-                    <span class="text-xs text-gray-400 mt-1">Keystroke</span>
-                </div>
-                <div class="flex-1 h-1 bg-gray-700 mx-2">
-                    <div id="progress-line2" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
-                </div>
-                <!-- Step 3: Voice -->
-                <div id="step3-dot" class="flex flex-col items-center">
-                    <div class="w-8 h-8 rounded-full bg-gray-700
-                                flex items-center justify-center text-white text-sm font-bold">
-                        3
-                    </div>
-                    <span class="text-xs text-gray-400 mt-1">Voice</span>
-                </div>
-                <div class="flex-1 h-1 bg-gray-700 mx-2">
-                    <div id="progress-line3" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
-                </div>
-                <!-- Step 4: Security -->
-                <div id="step4-dot" class="flex flex-col items-center">
-                    <div class="w-8 h-8 rounded-full bg-gray-700
-                                flex items-center justify-center text-white text-sm font-bold">
-                        4
-                    </div>
-                    <span class="text-xs text-gray-400 mt-1">Security</span>
-                </div>
-            </div>
-        </div>
-
-        <!-- Password Section -->
-        <div id="password-section" class="hidden">
-            <p class="text-gray-300 text-sm font-medium mb-3">Create a password:</p>
-            <input
-                id="password-input"
-                type="password"
-                placeholder="Enter password (min 8 characters)"
-                class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
-                       mb-3 outline-none focus:ring-2 focus:ring-purple-500
-                       border border-gray-700"
-            />
-            <input
-                id="password-confirm"
-                type="password"
-                placeholder="Confirm password"
-                class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
-                       mb-4 outline-none focus:ring-2 focus:ring-purple-500
-                       border border-gray-700"
-            />
-            <p id="password-status" class="text-center text-sm mb-4 text-gray-500"></p>
-            <button
-                onclick="submitPassword()"
-                class="w-full bg-purple-600 hover:bg-purple-700 text-white
-                       font-semibold py-3 rounded-lg transition-colors duration-200"
-            >
-                Set Password
-            </button>
-        </div>
-
-        <!-- Keystroke Enrollment Section -->
+        <!-- Step 1: Keystroke Enrollment -->
         <div id="keystroke-section" class="hidden">
-
-            <!-- Phrase display -->
             <div class="bg-gray-800 rounded-lg p-4 mb-4 text-center border border-gray-700">
                 <p class="text-gray-400 text-xs mb-2 uppercase tracking-widest">Type this phrase exactly</p>
                 <p class="text-purple-400 font-mono text-sm font-semibold leading-relaxed tracking-wide">
@@ -140,7 +123,6 @@
                      style="width: 0%"></div>
             </div>
 
-            <!-- Input — auto-submits on phrase completion, no button needed -->
             <input
                 id="keystroke-input"
                 type="text"
@@ -151,7 +133,6 @@
                 autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
             />
 
-            <!-- Live feedback row -->
             <div class="flex justify-between text-xs text-gray-500 mb-3 px-1">
                 <span id="ks-speed-display">Speed: —</span>
                 <span id="ks-consistency-display">Consistency: —</span>
@@ -160,7 +141,6 @@
             <p id="keystroke-status" class="text-center text-sm mb-2 text-gray-400">
                 Type the phrase above at your natural pace
             </p>
-            <!-- Emergency fallback only — auto-submits on keyup normally -->
             <button
                 id="keystroke-submit-btn"
                 onclick="submitKeystroke()"
@@ -171,8 +151,7 @@
             </button>
         </div>
 
-
-        <!-- Voice Enrollment Section -->
+        <!-- Step 2: Voice Enrollment -->
         <div id="voice-section" class="hidden">
             <div class="bg-gray-800 rounded-lg p-4 mb-4 text-center border border-gray-700">
                 <p class="text-gray-400 text-xs mb-1">SAY THIS PHRASE:</p>
@@ -206,7 +185,7 @@
             </button>
         </div>
 
-        <!-- Security Question Section -->
+        <!-- Step 3: Security Question -->
         <div id="security-section" class="hidden">
             <p class="text-gray-300 text-sm font-medium mb-3">
                 Set a security question as fallback authentication:
@@ -249,7 +228,7 @@
             </button>
         </div>
 
-        <!-- Success Section -->
+        <!-- Success -->
         <div id="success-section" class="hidden text-center">
             <div class="text-6xl mb-4">✅</div>
             <h2 class="text-white text-xl font-bold mb-2">Enrollment Complete!</h2>
@@ -262,6 +241,9 @@
                 Proceed to Login
             </a>
         </div>
+
+        <!-- Attempts indicator (reused for keystroke progress feedback) -->
+        <div id="attempts-indicator" class="hidden mt-4"></div>
 
     </div>
 

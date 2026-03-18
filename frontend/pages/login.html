@@ -18,74 +18,77 @@
             <p class="text-gray-400 text-sm mt-1">Verify your identity to continue</p>
         </div>
 
-        <!-- Step Indicator -->
+        <!-- Step Indicator (3 steps) -->
         <div id="step-indicator" class="hidden mb-6">
             <div class="flex justify-between items-center">
-                <!-- Step 1: Password -->
-                <div class="flex flex-col items-center">
-                    <div id="dot-password"
-                         class="w-8 h-8 rounded-full bg-gray-700 flex
-                                items-center justify-center text-white text-sm font-bold">
-                        1
-                    </div>
-                    <span class="text-xs text-gray-400 mt-1">Password</span>
-                </div>
-                <div class="flex-1 h-1 bg-gray-700 mx-2">
-                    <div id="line-1" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
-                </div>
-                <!-- Step 2: Keystroke -->
+                <!-- Step 1: Keystroke -->
                 <div class="flex flex-col items-center">
                     <div id="dot-keystroke"
                          class="w-8 h-8 rounded-full bg-gray-700 flex
                                 items-center justify-center text-white text-sm font-bold">
-                        2
+                        1
                     </div>
                     <span class="text-xs text-gray-400 mt-1">Keystroke</span>
                 </div>
                 <div class="flex-1 h-1 bg-gray-700 mx-2">
-                    <div id="line-2" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
+                    <div id="line-1" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
                 </div>
-                <!-- Step 3: Voice -->
+                <!-- Step 2: Voice -->
                 <div class="flex flex-col items-center">
                     <div id="dot-voice"
                          class="w-8 h-8 rounded-full bg-gray-700 flex
                                 items-center justify-center text-white text-sm font-bold">
-                        3
+                        2
                     </div>
                     <span class="text-xs text-gray-400 mt-1">Voice</span>
                 </div>
                 <div class="flex-1 h-1 bg-gray-700 mx-2">
-                    <div id="line-3" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
+                    <div id="line-2" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
                 </div>
-                <!-- Step 4: Security -->
+                <!-- Step 3: Security -->
                 <div class="flex flex-col items-center">
                     <div id="dot-security"
                          class="w-8 h-8 rounded-full bg-gray-700 flex
                                 items-center justify-center text-white text-sm font-bold">
-                        4
+                        3
                     </div>
                     <span class="text-xs text-gray-400 mt-1">Security</span>
                 </div>
             </div>
         </div>
 
-        <!-- Section 0: Username -->
-        <div id="username-section">
-            <label class="text-gray-300 text-sm font-medium block mb-2">Username</label>
-            <input
-                id="username-input"
-                type="text"
-                placeholder="Enter your username"
-                class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
-                       mb-4 outline-none focus:ring-2 focus:ring-purple-500
-                       border border-gray-700"
-            />
+        <!-- Section 0: Username + Password (standard login form) -->
+        <div id="login-section">
+            <div class="mb-4">
+                <label class="text-gray-300 text-sm font-medium block mb-2">Username</label>
+                <input
+                    id="username-input"
+                    type="text"
+                    placeholder="Enter your username"
+                    class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
+                           outline-none focus:ring-2 focus:ring-purple-500
+                           border border-gray-700"
+                />
+            </div>
+            <div class="mb-4">
+                <label class="text-gray-300 text-sm font-medium block mb-2">Password</label>
+                <input
+                    id="password-input"
+                    type="password"
+                    placeholder="Enter your password"
+                    class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
+                           outline-none focus:ring-2 focus:ring-purple-500
+                           border border-gray-700"
+                    onkeydown="if(event.key==='Enter') submitLogin()"
+                />
+            </div>
+            <p id="login-status" class="text-center text-sm mb-4 text-gray-500"></p>
             <button
-                onclick="startLogin()"
+                onclick="submitLogin()"
                 class="w-full bg-purple-600 hover:bg-purple-700 text-white
                        font-semibold py-3 rounded-lg transition-colors duration-200"
             >
-                Continue
+                Login
             </button>
             <p class="text-center text-gray-500 text-sm mt-4">
                 Not enrolled?
@@ -93,33 +96,11 @@
             </p>
         </div>
 
-        <!-- Section 1: Password -->
-        <div id="password-section" class="hidden">
-            <label class="text-gray-300 text-sm font-medium block mb-2">Password</label>
-            <input
-                id="password-input"
-                type="password"
-                placeholder="Enter your password"
-                class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
-                       mb-4 outline-none focus:ring-2 focus:ring-purple-500
-                       border border-gray-700"
-            />
-            <p id="password-status" class="text-center text-sm mb-4 text-gray-500"></p>
-            <button
-                onclick="submitPasswordAuth()"
-                class="w-full bg-purple-600 hover:bg-purple-700 text-white
-                       font-semibold py-3 rounded-lg transition-colors duration-200"
-            >
-                Verify Password
-            </button>
-        </div>
-
-        <!-- Section 2: Keystroke -->
+        <!-- Section 1: Keystroke -->
         <div id="keystroke-section" class="hidden">
-            <div class="bg-yellow-900 border border-yellow-600 rounded-lg
-                        p-3 mb-4 text-center">
-                <p class="text-yellow-400 text-sm">
-                    ⚠️ Password verified. Now verify your typing pattern.
+            <div class="bg-blue-900 border border-blue-600 rounded-lg p-3 mb-4 text-center">
+                <p class="text-blue-300 text-sm">
+                    ✅ Credentials verified. Now verify your typing pattern.
                 </p>
             </div>
             <div class="bg-gray-800 rounded-lg p-4 mb-4 text-center border border-gray-700">
@@ -149,10 +130,9 @@
             </button>
         </div>
 
-        <!-- Section 3: Voice -->
+        <!-- Section 2: Voice -->
         <div id="voice-section" class="hidden">
-            <div class="bg-yellow-900 border border-yellow-600 rounded-lg
-                        p-3 mb-4 text-center">
+            <div class="bg-yellow-900 border border-yellow-600 rounded-lg p-3 mb-4 text-center">
                 <p class="text-yellow-400 text-sm">
                     ⚠️ Keystroke verification failed. Please verify with voice.
                 </p>
@@ -168,6 +148,13 @@
                         mb-4 flex items-center justify-center animate-pulse">
                 <span class="text-white text-2xl">🎤</span>
             </div>
+            <!-- Live diagnostic bar -->
+            <div class="bg-gray-800 rounded-lg p-2 mb-3 border border-gray-700">
+                <div class="bg-gray-700 rounded h-2 overflow-hidden">
+                    <div id="diag-bar" class="h-2 rounded transition-all" style="width:0%;background:#ef4444"></div>
+                </div>
+                <p id="diag-text" class="text-xs text-gray-500 mt-1 text-center"></p>
+            </div>
             <p id="voice-status" class="text-center text-sm mb-4 text-gray-500">
                 Click record when ready
             </p>
@@ -181,12 +168,11 @@
             </button>
         </div>
 
-        <!-- Section 4: Security Question -->
+        <!-- Section 3: Security Question -->
         <div id="security-section" class="hidden">
-            <div class="bg-yellow-900 border border-yellow-600 rounded-lg
-                        p-3 mb-4 text-center">
+            <div class="bg-yellow-900 border border-yellow-600 rounded-lg p-3 mb-4 text-center">
                 <p class="text-yellow-400 text-sm">
-                    ⚠️ Voice verification failed. Answer your security question.
+                    ⚠️ Biometric verification failed. Answer your security question.
                 </p>
             </div>
             <p id="security-question-text" class="text-gray-300 text-sm font-medium mb-3"></p>

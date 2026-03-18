@@ -41,23 +41,27 @@ function restoreEnrollState() {
         currentKeystrokeAttempt   = s.keystrokeAttempt   || 1;
         voiceAttemptsSaved        = s.voiceAttemptsSaved  || 0;
 
-        // Hide username section, show step indicator
         document.getElementById("username-section").classList.add("hidden");
         document.getElementById("step-indicator").classList.remove("hidden");
-        document.getElementById("attempts-indicator")?.classList.remove("hidden");
 
-        // Restore step dots up to current section
-        const stepOrder = ["password", "keystroke", "voice", "security", "success"];
+        // 3-step system: keystroke=step1, voice=step2, security=step3
+        const stepOrder = ["keystroke", "voice", "security", "success"];
         const idx = stepOrder.indexOf(s.section);
-        for (let i = 0; i <= idx && i < 4; i++) {
-            const dot = document.getElementById(`step${i+1}-dot`);
-            if (dot) dot.querySelector("div").classList.replace("bg-gray-700", "bg-purple-600");
+        if (idx >= 0) {
+            document.getElementById("step1-dot").querySelector("div")
+                .classList.replace("bg-gray-700", "bg-purple-600");
         }
-        if (idx >= 1) document.getElementById("progress-line").style.width  = "100%";
-        if (idx >= 2) document.getElementById("progress-line2").style.width = "100%";
-        if (idx >= 3) document.getElementById("progress-line3").style.width = "100%";
+        if (idx >= 1) {
+            document.getElementById("step2-dot").querySelector("div")
+                .classList.replace("bg-gray-700", "bg-purple-600");
+            document.getElementById("progress-line").style.width = "100%";
+        }
+        if (idx >= 2) {
+            document.getElementById("step3-dot").querySelector("div")
+                .classList.replace("bg-gray-700", "bg-purple-600");
+            document.getElementById("progress-line2").style.width = "100%";
+        }
 
-        // Jump straight to the right section
         if (s.section === "keystroke") {
             document.getElementById("keystroke-section").classList.remove("hidden");
             _resetKeystrokeInput();
@@ -69,9 +73,6 @@ function restoreEnrollState() {
             document.getElementById("security-section").classList.remove("hidden");
         } else if (s.section === "success") {
             document.getElementById("success-section").classList.remove("hidden");
-        } else {
-            // password section — just show it
-            document.getElementById("password-section").classList.remove("hidden");
         }
 
         console.log(`[enroll] Restored state: section=${s.section} user=${s.username}`);
@@ -94,23 +95,27 @@ function startEnrollment() {
         alert("Please enter a username first.");
         return;
     }
-
     currentUsername = username;
 
     document.getElementById("username-section").classList.add("hidden");
     document.getElementById("step-indicator").classList.remove("hidden");
-    document.getElementById("password-section").classList.remove("hidden");  // ← UPDATED
 
     document.getElementById("step1-dot").querySelector("div")
         .classList.replace("bg-gray-700", "bg-purple-600");
 }
 
-// ── Step 1: Password Enrollment ← ADDED ──────────────────────────────────
+// ── Step 0: Create account (username + password on one screen) ───────────
 async function submitPassword() {
+    const username = document.getElementById("username-input").value.trim();
     const password = document.getElementById("password-input").value;
     const confirm  = document.getElementById("password-confirm").value;
     const status   = document.getElementById("password-status");
 
+    if (!username) {
+        status.textContent = "❌ Please enter a username.";
+        status.className   = "text-center text-sm mb-4 text-red-400";
+        return;
+    }
     if (password.length < 8) {
         status.textContent = "❌ Password must be at least 8 characters.";
         status.className   = "text-center text-sm mb-4 text-red-400";
@@ -122,16 +127,24 @@ async function submitPassword() {
         return;
     }
 
-    status.textContent = "⏳ Saving...";
+    status.textContent = "⏳ Creating account...";
     status.className   = "text-center text-sm mb-4 text-yellow-400";
 
     try {
-        const result = await Api.enrollUser(currentUsername, password);  // ← UPDATED
+        const result = await Api.enrollUser(username, password);
 
         if (result.success) {
+            currentUsername = username;
             currentPassword = password;
             status.textContent = "✅ Account created!";
             status.className   = "text-center text-sm mb-4 text-green-400";
+
+            // Show step indicator and go straight to keystroke enrollment
+            document.getElementById("username-section").classList.add("hidden");
+            document.getElementById("step-indicator").classList.remove("hidden");
+            document.getElementById("step1-dot").querySelector("div")
+                .classList.replace("bg-gray-700", "bg-purple-600");
+
             setTimeout(() => moveToKeystrokeEnrollment(), 800);
         } else {
             status.textContent = "❌ " + (result.detail || "Failed.");
@@ -140,18 +153,16 @@ async function submitPassword() {
     } catch (err) {
         status.textContent = "❌ Network error.";
         status.className   = "text-center text-sm mb-4 text-red-400";
-        console.error("Password enroll error:", err);
+        console.error("Account creation error:", err);
     }
 }
 
-// ── Step 2: Keystroke Enrollment ──────────────────────────────────────────
+// ── Step 1: Keystroke Enrollment ──────────────────────────────────────────
 function moveToKeystrokeEnrollment() {
-    document.getElementById("password-section").classList.add("hidden");
     document.getElementById("keystroke-section").classList.remove("hidden");
 
-    document.getElementById("step2-dot").querySelector("div")
+    document.getElementById("step1-dot").querySelector("div")
         .classList.replace("bg-gray-700", "bg-purple-600");
-    document.getElementById("progress-line").style.width = "100%";
 
     saveEnrollState("keystroke");
     _resetKeystrokeInput();
@@ -353,14 +364,14 @@ async function submitKeystroke() {
     }
 }
 
-// ── Step 3: Voice Enrollment ──────────────────────────────────────────────
+// ── Step 2: Voice Enrollment ──────────────────────────────────────────────
 function moveToVoiceEnrollment() {
     document.getElementById("keystroke-section").classList.add("hidden");
     document.getElementById("voice-section").classList.remove("hidden");
 
-    document.getElementById("step3-dot").querySelector("div")
+    document.getElementById("step2-dot").querySelector("div")
         .classList.replace("bg-gray-700", "bg-purple-600");
-    document.getElementById("progress-line2").style.width = "100%";
+    document.getElementById("progress-line").style.width = "100%";
 
     saveEnrollState("voice");
     updateVoiceAttemptUI(0);
@@ -437,14 +448,14 @@ function updateVoiceAttemptUI(count) {
     }
 }
 
-// ── Step 4: Security Question ─────────────────────────────────────────────
+// ── Step 3: Security Question ─────────────────────────────────────────────
 function moveToSecurityQuestion() {
     document.getElementById("voice-section").classList.add("hidden");
     document.getElementById("security-section").classList.remove("hidden");
 
-    document.getElementById("step4-dot").querySelector("div")
+    document.getElementById("step3-dot").querySelector("div")
         .classList.replace("bg-gray-700", "bg-purple-600");
-    document.getElementById("progress-line3").style.width = "100%";
+    document.getElementById("progress-line2").style.width = "100%";
 
     saveEnrollState("security");
 }
