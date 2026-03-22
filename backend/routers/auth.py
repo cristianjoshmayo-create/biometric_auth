@@ -509,26 +509,21 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
             authenticated = False
 
     else:
-        # No trained model — cosine similarity fallback on MFCC means only
-        print(f"[voice] No trained model for '{payload.username}', using cosine fallback")
+        # No trained model exists — this means enrollment is incomplete.
+        # The cosine similarity fallback is too loose and grants access to
+        # anyone whose MFCC means loosely resemble the enrolled sample.
+        # Correct behaviour: reject and tell the user to complete enrollment.
+        print(f"[voice] No trained model for '{payload.username}' — rejecting")
         template = db.query(VoiceTemplate).filter(
             VoiceTemplate.user_id == user.id
         ).first()
         if not template:
-            raise HTTPException(status_code=404, detail="No voice template found")
+            raise HTTPException(status_code=404, detail="No voice template found. Please enroll first.")
 
-        a = np.array(template.mfcc_features or [])
-        b = np.array(payload.mfcc_features  or [])
-        if len(a) > 0 and len(b) > 0:
-            min_len = min(len(a), len(b))
-            a, b    = a[:min_len], b[:min_len]
-            denom   = np.linalg.norm(a) * np.linalg.norm(b)
-            cos_sim = float(np.dot(a, b) / denom) if denom > 0 else 0.0
-            confidence = (cos_sim + 1) / 2
-        else:
-            confidence = 0.0
-
-        authenticated = confidence >= 0.75  # higher bar for raw cosine fallback
+        # Hard reject — enrollment not complete, no reliable model to verify against
+        confidence    = 0.0
+        authenticated = False
+        print(f"[voice] Enrollment incomplete — voice model not yet trained, access denied")
 
     print(f"[voice] user={payload.username}  "
           f"confidence={confidence:.3f}  result={'PASS' if authenticated else 'FAIL'}")

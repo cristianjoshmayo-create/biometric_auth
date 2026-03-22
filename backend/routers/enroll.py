@@ -207,6 +207,26 @@ def enroll_keystroke(payload: KeystrokeEnroll, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # ── Quality gate: reject samples with too many errors ─────────────────
+    # A high backspace ratio means the user made many mistakes while typing.
+    # These samples produce noisy, unrepresentative timing data and will
+    # hurt model accuracy. Reject them early and ask the user to retype.
+    MAX_BACKSPACE_RATIO = 0.20   # more than 20% of keystrokes were backspaces
+    MAX_BACKSPACE_COUNT = 8      # or more than 8 absolute backspaces
+    if (payload.backspace_ratio or 0) > MAX_BACKSPACE_RATIO or \
+       (payload.backspace_count or 0) > MAX_BACKSPACE_COUNT:
+        backspace_pct = int((payload.backspace_ratio or 0) * 100)
+        return {
+            "success": False,
+            "detail":  (
+                f"Too many corrections ({backspace_pct}% of keystrokes were backspaces). "
+                "Please retype the phrase carefully without fixing mistakes — "
+                "just type at your natural pace."
+            ),
+            "attempt_number": 0,
+            "training_started": False,
+        }
+
     existing_count = db.query(KeystrokeTemplate).filter(
         KeystrokeTemplate.user_id == user.id
     ).count()
@@ -528,6 +548,30 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
                 "snr_db": snr_db,
             }
 
+        # ── Music / background audio detection ────────────────────────────
+        # If there is background music playing, the recording will have high
+        # energy across all frequency bands, not just the speech band (300–3400Hz).
+        # A legitimate voice recording should have ≥35% of its energy in the
+        # speech band. Music or ambient noise spreads energy more evenly.
+        spectral_check = librosa.feature.spectral_centroid(y=audio, sr=sr)
+        mean_centroid_raw = float(np.mean(spectral_check))
+        fft_mag = np.abs(np.fft.rfft(audio))
+        freqs   = np.fft.rfftfreq(len(audio), d=1.0/sr)
+        speech_mask  = (freqs >= 300) & (freqs <= 3400)
+        speech_energy = float(np.sum(fft_mag[speech_mask] ** 2))
+        total_energy  = float(np.sum(fft_mag ** 2))
+        speech_ratio  = speech_energy / total_energy if total_energy > 0 else 0.0
+        print(f"Speech band ratio: {speech_ratio:.2f} (need ≥0.25)")
+        if speech_ratio < 0.25:
+            return {
+                "success": False,
+                "detail":  (
+                    f"Recording does not sound like speech (speech band ratio={speech_ratio:.2f}). "
+                    "Please make sure there is no background music and speak the phrase clearly."
+                ),
+                "snr_db": snr_db,
+            }
+
         # ── Spectral subtraction (denoise) ─────────────────────────────────
         # Apply whenever SNR < 30dB (was 25dB) to cover more real-world cases
         if snr_db < 30.0:
@@ -566,23 +610,41 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
 
         print(f"VAD: {voice_ratio:.0%} voiced  ({speech_duration:.1f}s speech)")
 
-        # Lowered from 60% to 40% — browser audio compression and laptop mics
-        # cause many voiced frames to be misclassified as unvoiced by aggressive VAD.
-        # 40% still ensures we have real speech, not just ambient noise.
-        if voice_ratio < 0.40:
+        # Raised from 0.40 to 0.55 — music and ambient noise at VAD mode 1
+        # can pass 40% but genuine speech consistently hits 55%+
+        if voice_ratio < 0.55:
             return {
                 "success": False,
                 "detail":  (
-                    f"Not enough speech detected ({voice_ratio:.0%} voiced, need ≥40%). "
+                    f"Not enough speech detected ({voice_ratio:.0%} voiced, need ≥55%). "
                     f"Speak the phrase clearly: 'biometric voice keystroke authentication'."
                 ),
                 "snr_db": snr_db,
             }
-        # Lowered from 1.5s to 1.0s minimum speech
         if speech_duration < 1.0:
             return {
                 "success": False,
                 "detail":  f"Recording too short ({speech_duration:.1f}s of speech). Speak the full phrase.",
+            }
+
+        # ── Spectral flatness check — rejects music and noise ─────────────
+        # Speech has a strongly peaked spectrum (low flatness).
+        # Music and broadband noise are spectrally flat (high flatness).
+        # librosa.feature.spectral_flatness returns values 0–1:
+        #   speech:  typically 0.001–0.05 (very peaked)
+        #   music:   typically 0.05–0.30  (flatter)
+        #   noise:   typically 0.20–0.80  (very flat)
+        flatness      = librosa.feature.spectral_flatness(y=audio_clean)
+        mean_flatness = float(np.mean(flatness))
+        print(f"Spectral flatness: {mean_flatness:.4f} (speech should be <0.08)")
+        if mean_flatness > 0.08:
+            return {
+                "success": False,
+                "detail":  (
+                    f"Recording does not sound like human speech (flatness={mean_flatness:.3f}). "
+                    "Please ensure no music is playing and speak the phrase directly into the microphone."
+                ),
+                "snr_db": snr_db,
             }
 
         # ── Energy check ───────────────────────────────────────────────────

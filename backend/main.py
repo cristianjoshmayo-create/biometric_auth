@@ -36,7 +36,7 @@ app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
 
 @app.get("/")
 def root():
-    return RedirectResponse(url="/static/pages/enroll.html")
+    return RedirectResponse(url="/static/pages/login.html")
 
 @app.get("/enroll")
 def go_enroll():

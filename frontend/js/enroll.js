@@ -320,8 +320,10 @@ async function submitKeystroke() {
         });
 
         if (!result.success) {
-            status.textContent = "❌ Save failed: " + (result.detail || "unknown error");
+            status.textContent = "❌ " + (result.detail || "Save failed — please try again.");
             status.className = "text-center text-sm mb-2 text-red-400";
+            // Show submit button so user knows they need to retype
+            if (btn) { btn.disabled = false; btn.textContent = "Submit Attempt"; btn.classList.remove("hidden"); }
             _resetKeystrokeInput();
             return;
         }
