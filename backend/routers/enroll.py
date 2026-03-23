@@ -13,6 +13,7 @@ import librosa
 import tempfile
 import os
 import bcrypt
+import random
 
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion
@@ -24,6 +25,85 @@ router = APIRouter()
 
 MAX_KEYSTROKE_SAMPLES = 5
 MAX_VOICE_SAMPLES     = 3
+
+# ── Passphrase word list ──────────────────────────────────────────────────────
+# 200 common English words chosen for:
+#   - clear pronunciation (good for voice biometrics)
+#   - distinct typing rhythm (good for keystroke dynamics)
+#   - no ambiguous spellings
+_WORD_LIST = [
+    "apple", "arrow", "audio", "brave", "bread", "bright", "brown", "build",
+    "cabin", "candy", "carry", "catch", "chair", "chalk", "charm", "chess",
+    "child", "china", "chord", "civil", "claim", "clamp", "clean", "clear",
+    "click", "clock", "close", "cloud", "coast", "cobra", "color", "coral",
+    "count", "cover", "craft", "crane", "cream", "creek", "crisp", "cross",
+    "crowd", "crown", "cubic", "curve", "dance", "delta", "depth", "digit",
+    "doing", "draft", "drain", "drama", "drawn", "dream", "drink", "drive",
+    "droop", "dusty", "eagle", "early", "earth", "eight", "elite", "empty",
+    "enter", "equal", "every", "exact", "extra", "fable", "faith", "false",
+    "fancy", "feast", "fence", "field", "fifth", "fifty", "fight", "final",
+    "first", "fixed", "flame", "flash", "float", "floor", "flute", "focus",
+    "forge", "forth", "found", "frame", "frank", "fresh", "front", "froze",
+    "fruit", "fully", "funny", "ghost", "giant", "given", "glass", "globe",
+    "gloss", "glove", "going", "grace", "grade", "grain", "grand", "grant",
+    "graph", "grasp", "grass", "gravel", "great", "green", "greet", "group",
+    "grove", "guard", "guess", "guide", "guild", "habit", "happy", "heart",
+    "heavy", "hinge", "honor", "horse", "hotel", "house", "human", "hurry",
+    "image", "input", "irony", "ivory", "jewel", "joker", "judge", "jumbo",
+    "kayak", "kebab", "kneel", "knife", "known", "label", "large", "laser",
+    "later", "laugh", "layer", "learn", "legal", "lemon", "level", "light",
+    "limit", "linen", "local", "lodge", "logic", "loose", "lower", "lucky",
+    "lunar", "magic", "major", "manor", "maple", "march", "match", "meant",
+    "medal", "merge", "metal", "might", "minor", "minus", "mixer", "modal",
+    "model", "money", "month", "moral", "mossy", "motif", "motor", "mount",
+    "mouse", "moved", "music", "naval", "nerve", "never", "night", "ninja",
+    "noble", "north", "noted", "novel", "nylon", "occur", "ocean", "offer",
+    "often", "olive", "onset", "opera", "orbit", "other", "outer", "owner",
+    "oxide", "ozone", "paint", "panic", "paper", "pearl", "penny", "phone",
+    "photo", "piano", "pilot", "pixel", "pizza", "place", "plain", "plane",
+    "plant", "plate", "plaza", "plumb", "point", "polar", "polka", "poppy",
+    "power", "press", "price", "prime", "print", "prism", "probe", "proof",
+    "prose", "proud", "prove", "pulse", "pupil", "queen", "quest", "queue",
+    "quiet", "quota", "quote", "radar", "radio", "ranch", "range", "rapid",
+    "reach", "realm", "rebel", "relay", "remix", "renew", "reply", "reset",
+    "right", "rigid", "risky", "river", "robot", "rocky", "rouge", "round",
+    "royal", "ruler", "rusty", "sadly", "saint", "salad", "sauce", "saved",
+    "scale", "scene", "scope", "score", "scout", "sedan", "sense", "serve",
+    "setup", "seven", "shade", "shaft", "shake", "shame", "shape", "share",
+    "sharp", "sheep", "shelf", "shell", "shift", "shine", "shirt", "shock",
+    "shore", "short", "shout", "shrug", "siren", "sixth", "sixty", "skill",
+    "slash", "sleep", "slide", "slope", "smart", "smoke", "snake", "solar",
+    "solid", "solve", "sonic", "sorry", "south", "space", "spare", "spark",
+    "speak", "speed", "spend", "spine", "split", "spoke", "spoon", "sport",
+    "spray", "squad", "stack", "stage", "stair", "stamp", "stand", "start",
+    "state", "stays", "steam", "steel", "steep", "steer", "stern", "still",
+    "stomp", "stone", "stood", "store", "storm", "story", "stout", "straw",
+    "strip", "strut", "study", "style", "sugar", "suite", "super", "swamp",
+    "sweet", "swept", "swift", "swing", "sword", "table", "taken", "taste",
+    "teach", "teeth", "tempo", "tense", "tenth", "thank", "theme", "thick",
+    "thing", "think", "third", "thorn", "three", "threw", "throw", "tiger",
+    "timed", "title", "toast", "token", "topic", "total", "touch", "tough",
+    "tower", "trace", "track", "trade", "trail", "train", "trait", "tramp",
+    "trend", "trial", "trick", "tried", "troop", "truck", "truly", "trunk",
+    "trust", "truth", "twice", "twist", "typed", "ultra", "under", "union",
+    "until", "upper", "usage", "usual", "valid", "value", "vapor", "vault",
+    "video", "viola", "viral", "virus", "visit", "vista", "vital", "vivid",
+    "vocal", "voice", "voter", "watch", "water", "weave", "wedge", "weigh",
+    "weird", "while", "white", "whole", "windy", "wired", "witch", "witch",
+    "woman", "world", "worry", "worst", "worth", "would", "woven", "yacht",
+    "young", "youth", "zebra", "zooms",
+]
+
+def _generate_phrase(db: Session) -> str:
+    """Generate a unique 4-word phrase not already used by any other user."""
+    existing_phrases = {u.phrase for u in db.query(User.phrase).all() if u.phrase}
+    for _ in range(200):  # try up to 200 times before giving up
+        words   = random.sample(_WORD_LIST, 4)
+        phrase  = " ".join(words)
+        if phrase not in existing_phrases:
+            return phrase
+    # Extremely unlikely fallback — use 5 words if 4-word space exhausted
+    return " ".join(random.sample(_WORD_LIST, 5))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,8 +160,17 @@ def trigger_voice_training(username: str):
 #  SCHEMAS
 # ─────────────────────────────────────────────────────────────────────────────
 
+import re as _re
+
+def _validate_email(email: str) -> str:
+    """Basic email format validation."""
+    email = email.strip().lower()
+    if not _re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+        raise ValueError("Invalid email address format")
+    return email
+
 class UserCreate(BaseModel):
-    username: str
+    username: str   # accepts email address — validated in endpoint
     password: str
 
 
@@ -182,9 +271,15 @@ class ClearEnrollPayload(BaseModel):
 
 @router.post("/user")
 def create_user(payload: UserCreate, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.username == payload.username).first()
+    # Validate and normalise email
+    try:
+        email = _validate_email(payload.username)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    existing = db.query(User).filter(User.username == email).first()
     if existing:
-        return {"success": True, "message": "User already exists", "user_id": existing.id}
+        return {"success": True, "message": "User already exists", "user_id": existing.id, "phrase": existing.phrase}
 
     if len(payload.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
@@ -194,11 +289,11 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
         bcrypt.gensalt()
     ).decode('utf-8')
 
-    new_user = User(username=payload.username, password_hash=hashed)
+    new_user = User(username=email, password_hash=hashed, phrase=_generate_phrase(db))
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
-    return {"success": True, "message": "User created", "user_id": new_user.id}
+    return {"success": True, "message": "User created", "user_id": new_user.id, "phrase": new_user.phrase}
 
 
 @router.post("/keystroke")
@@ -617,7 +712,7 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
                 "success": False,
                 "detail":  (
                     f"Not enough speech detected ({voice_ratio:.0%} voiced, need ≥55%). "
-                    f"Speak the phrase clearly: 'biometric voice keystroke authentication'."
+                    f"Speak your assigned phrase clearly and directly into the microphone."
                 ),
                 "snr_db": snr_db,
             }

@@ -169,6 +169,10 @@ def build_pipeline():
 
 
 def train_voice_model(username: str):
+    # ── Phase 1: Fetch all data from DB then close immediately ───────────────
+    # Supabase closes idle connections after ~60 seconds.
+    # Training takes 30–120 seconds — connection times out mid-run.
+    # Load everything into memory first, then close before training starts.
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.username == username).first()
@@ -176,125 +180,131 @@ def train_voice_model(username: str):
             print(f"❌ User '{username}' not found!")
             return None
 
-        print(f"\n{'='*70}")
-        print(f"  IMPROVED VOICE MODEL — user: {username}  ({N_FEATURES} features)")
-        print(f"{'='*70}")
-
         genuine_vectors = load_enrollment_samples(db, user.id)
         if not genuine_vectors:
             print("❌ No valid voice enrollment samples.")
             return None
 
-        print(f"  Enrollment samples: {len(genuine_vectors)}")
-        if len(genuine_vectors) < 3:
-            print("  ⚠  Fewer than 3 samples — accuracy will be lower.")
-
-        profile_mean = np.array(genuine_vectors).mean(axis=0)
-        profile_std  = (np.array(genuine_vectors).std(axis=0)
-                        if len(genuine_vectors) > 1
-                        else np.abs(profile_mean) * 0.10)
-
-        noise_level = estimate_enrollment_noise(genuine_vectors)
-        print(f"  Enrollment noise level: {noise_level:.2f} "
-              f"({'quiet' if noise_level < 0.2 else 'moderate' if noise_level < 0.4 else 'noisy'})")
-
-        n_aug = max(150, len(genuine_vectors) * 40)
-        genuine_aug = generate_genuine_augmentations(genuine_vectors, n=n_aug)
-
         real_impostors = load_real_impostors(db, user.id)
-        if len(real_impostors) >= 20:
-            print(f"  Using {len(real_impostors)} real impostor samples.")
-            impostor_samples = real_impostors
-            while len(impostor_samples) < len(genuine_aug) * 2:
-                impostor_samples += generate_synthetic_impostors(profile_mean, profile_std, n=100)
-        else:
-            impostor_samples = real_impostors + generate_synthetic_impostors(
-                profile_mean, profile_std, n=max(300, len(genuine_aug) * 2))
 
-        X = np.vstack([genuine_aug, impostor_samples])
-        y = np.array([1] * len(genuine_aug) + [0] * len(impostor_samples))
-
-        print(f"  Training data: {len(genuine_aug)} genuine / {len(impostor_samples)} impostor")
-
-        from sklearn.model_selection import StratifiedKFold, cross_val_predict
-        from sklearn.metrics import confusion_matrix, accuracy_score
-
-        pipeline = build_pipeline()
-        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-        print("  Running 5-fold cross-validation …")
-        y_prob_cv = cross_val_predict(pipeline, X, y, cv=cv, method="predict_proba")[:, 1]
-
-        # ── CRITICAL FIX: calibrate threshold on FUSED score, not raw GBM prob ──
-        # Previously best_thresh was tuned on y_prob_cv (GBM only) but at
-        # inference the decision uses 0.70*model_prob + 0.30*mah_score.
-        # Those are different distributions — the threshold was meaningless.
-        # Fix: compute the same fused score during CV and tune on that.
-        fused_cv = np.array([
-            0.70 * p + 0.30 * mahalanobis_score(X[i], profile_mean, profile_std)
-            for i, p in enumerate(y_prob_cv)
-        ])
-
-        best_thresh, best_eer = 0.50, 1.0
-        print(f"\n  {'Threshold':>10}  {'FAR':>8}  {'FRR':>8}  {'EER':>8}  (on fused score)")
-        for t in np.arange(0.30, 0.90, 0.02):
-            y_t = (fused_cv >= t).astype(int)
-            if len(np.unique(y_t)) < 2: continue
-            cm = confusion_matrix(y, y_t)
-            if cm.shape != (2, 2): continue
-            tn, fp, fn, tp = cm.ravel()
-            far_t = fp / (fp + tn) if (fp + tn) > 0 else 0
-            frr_t = fn / (fn + tp) if (fn + tp) > 0 else 0
-            eer_t = (far_t + frr_t) / 2
-            marker = " ◄" if eer_t < best_eer else ""
-            print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}{marker}")
-            if eer_t < best_eer:
-                best_eer, best_thresh = eer_t, float(t)
-
-        # Noise-adaptive threshold tightening
-        noise_adj    = noise_level * 0.08
-        final_thresh = min(best_thresh + noise_adj, 0.85)
-        if noise_adj > 0.01:
-            print(f"\n  ⚠  Noise-adaptive: {best_thresh:.2f} → {final_thresh:.2f} (+{noise_adj:.2f})")
-
-        y_final = (fused_cv >= final_thresh).astype(int)
-        cm = confusion_matrix(y, y_final)
-        tn, fp, fn, tp = cm.ravel()
-        far = fp / (fp + tn) if (fp + tn) > 0 else 0
-        frr = fn / (fn + tp) if (fn + tp) > 0 else 0
-
-        print(f"\n  Final @ {final_thresh:.2f}:  FAR={far:.2%}  FRR={frr:.2%}  "
-              f"EER={best_eer:.2%}  ACC={accuracy_score(y, y_final):.2%}")
-
-        print("\n  Training final model …")
-        pipeline.fit(X, y)
-
-        model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
-        os.makedirs(model_dir, exist_ok=True)
-
-        model_data = {
-            'pipeline':     pipeline,
-            'n_features':   N_FEATURES,
-            'username':     username,
-            'user_id':      user.id,
-            'n_enrollment': len(genuine_vectors),
-            'profile_mean': profile_mean,
-            'profile_std':  profile_std,
-            'profile_var':  profile_std ** 2,   # stored for diagonal Mahalanobis
-            'threshold':    final_thresh,
-            'noise_level':  noise_level,
-            'far':          float(far),
-            'frr':          float(frr),
-            'eer':          float(best_eer),
-            'model_type':   'gbm_improved_v3',
-        }
-        model_path = os.path.join(model_dir, f"{username}_voice_cnn.pkl")
-        with open(model_path, 'wb') as f:
-            pickle.dump(model_data, f)
-
-        print(f"\n  ✅ Model saved → {model_path}  ({os.path.getsize(model_path)/1024:.1f} KB)")
-        return model_path
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass  # already timed out — safe to ignore
+
+    # ── Phase 2: All training in memory — no DB connection needed ────────────
+    print(f"\n{'='*70}")
+    print(f"  IMPROVED VOICE MODEL — user: {username}  ({N_FEATURES} features)")
+    print(f"{'='*70}")
+
+    print(f"  Enrollment samples: {len(genuine_vectors)}")
+    if len(genuine_vectors) < 3:
+        print("  ⚠  Fewer than 3 samples — accuracy will be lower.")
+
+    profile_mean = np.array(genuine_vectors).mean(axis=0)
+    profile_std  = (np.array(genuine_vectors).std(axis=0)
+                    if len(genuine_vectors) > 1
+                    else np.abs(profile_mean) * 0.10)
+
+    noise_level = estimate_enrollment_noise(genuine_vectors)
+    print(f"  Enrollment noise level: {noise_level:.2f} "
+          f"({'quiet' if noise_level < 0.2 else 'moderate' if noise_level < 0.4 else 'noisy'})")
+
+    n_aug = max(150, len(genuine_vectors) * 40)
+    genuine_aug = generate_genuine_augmentations(genuine_vectors, n=n_aug)
+
+    if len(real_impostors) >= 20:
+        print(f"  Using {len(real_impostors)} real impostor samples.")
+        impostor_samples = real_impostors
+        while len(impostor_samples) < len(genuine_aug) * 2:
+            impostor_samples += generate_synthetic_impostors(profile_mean, profile_std, n=100)
+    else:
+        impostor_samples = real_impostors + generate_synthetic_impostors(
+            profile_mean, profile_std, n=max(300, len(genuine_aug) * 2))
+
+    X = np.vstack([genuine_aug, impostor_samples])
+    y = np.array([1] * len(genuine_aug) + [0] * len(impostor_samples))
+
+    print(f"  Training data: {len(genuine_aug)} genuine / {len(impostor_samples)} impostor")
+
+    from sklearn.model_selection import StratifiedKFold, cross_val_predict
+    from sklearn.metrics import confusion_matrix, accuracy_score
+
+    pipeline = build_pipeline()
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    print("  Running 5-fold cross-validation …")
+    y_prob_cv = cross_val_predict(pipeline, X, y, cv=cv, method="predict_proba")[:, 1]
+
+    # ── CRITICAL FIX: calibrate threshold on FUSED score, not raw GBM prob ──
+    # Previously best_thresh was tuned on y_prob_cv (GBM only) but at
+    # inference the decision uses 0.70*model_prob + 0.30*mah_score.
+    # Those are different distributions — the threshold was meaningless.
+    # Fix: compute the same fused score during CV and tune on that.
+    fused_cv = np.array([
+        0.70 * p + 0.30 * mahalanobis_score(X[i], profile_mean, profile_std)
+        for i, p in enumerate(y_prob_cv)
+    ])
+
+    best_thresh, best_eer = 0.50, 1.0
+    print(f"\n  {'Threshold':>10}  {'FAR':>8}  {'FRR':>8}  {'EER':>8}  (on fused score)")
+    for t in np.arange(0.30, 0.90, 0.02):
+        y_t = (fused_cv >= t).astype(int)
+        if len(np.unique(y_t)) < 2: continue
+        cm = confusion_matrix(y, y_t)
+        if cm.shape != (2, 2): continue
+        tn, fp, fn, tp = cm.ravel()
+        far_t = fp / (fp + tn) if (fp + tn) > 0 else 0
+        frr_t = fn / (fn + tp) if (fn + tp) > 0 else 0
+        eer_t = (far_t + frr_t) / 2
+        marker = " ◄" if eer_t < best_eer else ""
+        print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}{marker}")
+        if eer_t < best_eer:
+            best_eer, best_thresh = eer_t, float(t)
+
+    # Noise-adaptive threshold tightening
+    noise_adj    = noise_level * 0.08
+    final_thresh = min(best_thresh + noise_adj, 0.85)
+    if noise_adj > 0.01:
+        print(f"\n  ⚠  Noise-adaptive: {best_thresh:.2f} → {final_thresh:.2f} (+{noise_adj:.2f})")
+
+    y_final = (fused_cv >= final_thresh).astype(int)
+    cm = confusion_matrix(y, y_final)
+    tn, fp, fn, tp = cm.ravel()
+    far = fp / (fp + tn) if (fp + tn) > 0 else 0
+    frr = fn / (fn + tp) if (fn + tp) > 0 else 0
+
+    print(f"\n  Final @ {final_thresh:.2f}:  FAR={far:.2%}  FRR={frr:.2%}  "
+          f"EER={best_eer:.2%}  ACC={accuracy_score(y, y_final):.2%}")
+
+    print("\n  Training final model …")
+    pipeline.fit(X, y)
+
+    model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+    os.makedirs(model_dir, exist_ok=True)
+
+    model_data = {
+        'pipeline':     pipeline,
+        'n_features':   N_FEATURES,
+        'username':     username,
+        'user_id':      user.id,
+        'n_enrollment': len(genuine_vectors),
+        'profile_mean': profile_mean,
+        'profile_std':  profile_std,
+        'profile_var':  profile_std ** 2,   # stored for diagonal Mahalanobis
+        'threshold':    final_thresh,
+        'noise_level':  noise_level,
+        'far':          float(far),
+        'frr':          float(frr),
+        'eer':          float(best_eer),
+        'model_type':   'gbm_improved_v3',
+    }
+    model_path = os.path.join(model_dir, f"{username}_voice_cnn.pkl")
+    with open(model_path, 'wb') as f:
+        pickle.dump(model_data, f)
+
+    print(f"\n  ✅ Model saved → {model_path}  ({os.path.getsize(model_path)/1024:.1f} KB)")
+    return model_path
 
 
 def predict_voice(username: str, feature_dict: dict) -> dict:

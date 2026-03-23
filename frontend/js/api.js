@@ -99,6 +99,11 @@ const Api = {
         return res.json();
     },
 
+    async getPhrase(email) {
+        const res = await fetch(`${API_BASE}/auth/phrase/${encodeURIComponent(email)}`);
+        return res.json();
+    },
+
     async getSecurityQuestion(username) {
         const res = await fetch(`${API_BASE}/auth/security-question/${username}`);
         return res.json();

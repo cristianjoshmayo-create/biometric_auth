@@ -164,7 +164,9 @@ def log_attempt(db, user_id, method, confidence, result):
 
 @router.post("/password")
 def verify_password(payload: PasswordAuth, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == payload.username).first()
+    # Normalise email — lowercase so login works regardless of capitalisation
+    email = payload.username.strip().lower()
+    user = db.query(User).filter(User.username == email).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     if user.is_flagged:
@@ -177,7 +179,7 @@ def verify_password(payload: PasswordAuth, db: Session = Depends(get_db)):
         user.password_hash.encode('utf-8')
     )
 
-    print(f"[password] '{payload.username}' → {'PASS' if authenticated else 'FAIL'}")
+    print(f"[password] '{email}' → {'PASS' if authenticated else 'FAIL'}")
 
     log_attempt(db, user.id, "password",
                 1.0 if authenticated else 0.0,
@@ -647,6 +649,18 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
 # ─────────────────────────────────────────────────────────────────────────────
 #  SECURITY QUESTION AUTH
 # ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/phrase/{email}")
+def get_phrase(email: str, db: Session = Depends(get_db)):
+    """Return the unique passphrase assigned to this user.
+    Called by login page so it can display the correct phrase to type/speak."""
+    normalised = email.strip().lower()
+    user = db.query(User).filter(User.username == normalised).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not user.phrase:
+        raise HTTPException(status_code=404, detail="No phrase assigned to this user")
+    return {"phrase": user.phrase}
 
 @router.get("/security-question/{username}")
 def get_security_question(username: str, db: Session = Depends(get_db)):

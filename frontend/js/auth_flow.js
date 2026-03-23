@@ -16,14 +16,14 @@ let _ksScore    = null;
 let _voiceScore = null;
 
 
-// ── Step 0: Login (username + password on one screen) ────
+// ── Step 0: Login (email + password on one screen) ───────────────────────
 async function submitLogin() {
-    const username = document.getElementById("username-input").value.trim();
+    const rawEmail = document.getElementById("username-input").value.trim();
     const password = document.getElementById("password-input").value;
     const status   = document.getElementById("login-status");
 
-    if (!username) {
-        status.textContent = "Please enter your username.";
+    if (!rawEmail) {
+        status.textContent = "Please enter your email address.";
         status.className   = "text-center text-sm mb-4 text-red-400";
         return;
     }
@@ -33,20 +33,37 @@ async function submitLogin() {
         return;
     }
 
+    const email = rawEmail.toLowerCase();
+
     status.textContent = "⏳ Verifying credentials...";
     status.className   = "text-center text-sm mb-4 text-yellow-400";
 
     try {
-        const result = await Api.verifyPassword(username, password);
+        const result = await Api.verifyPassword(email, password);
 
         if (result.authenticated) {
-            authUsername = username;
+            authUsername = email;
             status.textContent = "✅ Credentials verified!";
             status.className   = "text-center text-sm mb-4 text-green-400";
+
+            // Fetch the user's unique phrase before moving to keystroke step
+            try {
+                const phraseResult = await Api.getPhrase(email);
+                const phrase = phraseResult.phrase || "";
+                if (phrase) {
+                    KeystrokeCapture.setPhrase(phrase);
+                    document.querySelectorAll(".phrase-display").forEach(el => {
+                        el.textContent = phrase;
+                    });
+                }
+            } catch (e) {
+                console.warn("Could not fetch phrase:", e);
+            }
+
             setTimeout(() => moveToKeystrokeAuth(), 800);
         } else {
             recordFailedAttempt();
-            status.textContent = "❌ Incorrect username or password.";
+            status.textContent = "❌ Incorrect email or password.";
             status.className   = "text-center text-sm mb-4 text-red-400";
         }
     } catch (err) {
@@ -59,7 +76,9 @@ async function submitLogin() {
 
 // ── Step 1: Keystroke Auth ────────────────────────────────
 function moveToKeystrokeAuth() {
-    document.getElementById("login-section").classList.add("hidden");
+    // Hide all sections cleanly before showing keystroke
+    // This prevents security section bleeding into keystroke during re-auth
+    hideAllSections();
     document.getElementById("step-indicator").classList.remove("hidden");
     document.getElementById("keystroke-section").classList.remove("hidden");
     document.getElementById("attempts-indicator").classList.remove("hidden");
@@ -67,6 +86,11 @@ function moveToKeystrokeAuth() {
     document.getElementById("dot-keystroke")
         .classList.replace("bg-gray-700", "bg-purple-600");
 
+    // Clear any leftover text from previous attempt
+    const input = document.getElementById("keystroke-input");
+    if (input) input.value = "";
+
+    KeystrokeCapture.reset();
     KeystrokeCapture.attach("keystroke-input");
     document.getElementById("keystroke-status").textContent = "Start typing when ready";
 }
@@ -120,8 +144,10 @@ async function submitKeystrokeAuth() {
 
 // ── Step 2: Voice Auth ────────────────────────────────────
 function moveToVoiceAuth() {
-    document.getElementById("keystroke-section").classList.add("hidden");
+    hideAllSections();
+    document.getElementById("step-indicator").classList.remove("hidden");
     document.getElementById("voice-section").classList.remove("hidden");
+    document.getElementById("attempts-indicator").classList.remove("hidden");
 
     document.getElementById("dot-voice")
         .classList.replace("bg-gray-700", "bg-purple-600");
@@ -234,7 +260,7 @@ async function onVoiceAuthComplete(fullFeatureDict) {
                     `❌ Voice not matched (${(voiceScore * 100).toFixed(1)}%) — ` +
                     `fused: ${(fusedScore * 100).toFixed(1)}% — proceeding to security question…`;
                 status.className = "text-center text-sm mb-4 text-red-400";
-                setTimeout(() => moveToSecurityAuth(), 2000);
+                setTimeout(() => moveToSecurityAuth(), 800);
             }
         }
 
@@ -250,7 +276,12 @@ async function onVoiceAuthComplete(fullFeatureDict) {
 
 // ── Step 3: Security Question ─────────────────────────────
 async function moveToSecurityAuth() {
-    document.getElementById("voice-section").classList.add("hidden");
+    // Stop any active voice recording before transitioning
+    if (SpeechCapture.isRecording) SpeechCapture.stopRecording();
+    SpeechCapture.reset();
+
+    // Hide ALL sections cleanly — prevents voice UI bleeding into security section
+    hideAllSections();
     document.getElementById("security-section").classList.remove("hidden");
 
     document.getElementById("dot-security")
@@ -369,4 +400,8 @@ function resetLogin() {
     document.getElementById("username-input").value = "";
     document.getElementById("password-input").value = "";
     document.getElementById("login-status").textContent = "";
+    document.querySelectorAll(".phrase-display").forEach(el => {
+        el.textContent = "Loading your phrase…";
+    });
+    KeystrokeCapture.setPhrase("");
 }

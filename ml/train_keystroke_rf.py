@@ -336,6 +336,12 @@ def build_pipeline(n_enrollment: int) -> Pipeline:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train_random_forest(username: str):
+    # ── Phase 1: Fetch all data from DB then close immediately ───────────────
+    # Supabase closes idle connections after ~60 seconds.
+    # Training (cross-validation) takes 30–120 seconds.
+    # If the DB stays open during training it will time out and crash on close.
+    # Solution: load everything into memory first, close the connection,
+    # then do all computation with no DB connection open.
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.username == username).first()
@@ -343,189 +349,195 @@ def train_random_forest(username: str):
             print(f"❌ User '{username}' not found!")
             return None
 
-        print(f"\n{'='*70}")
-        print(f"  KEYSTROKE RF TRAINING v3  —  user: {username}")
-        print(f"{'='*70}")
-
         genuine_vectors = load_enrollment_samples(db, user.id)
         if not genuine_vectors:
             print("❌ No valid enrollment samples found.")
             return None
 
-        n_genuine_real = len(genuine_vectors)
-        print(f"\n  Enrollment samples loaded: {n_genuine_real}")
-
-        profile_mean = np.array(genuine_vectors).mean(axis=0)
-        profile_std  = np.array(genuine_vectors).std(axis=0) + 1e-9
-        profile_var  = profile_std ** 2
-
-        key_idxs = [FEATURE_NAMES.index(f) for f in
-                    ['dwell_mean', 'flight_mean', 'p2p_mean', 'typing_speed_cpm']
-                    if f in FEATURE_NAMES]
-        consistency_cv = np.mean(
-            profile_std[key_idxs] / (np.abs(profile_mean[key_idxs]) + 1e-9)
-        )
-        print(f"  Enrollment consistency CV: {consistency_cv:.3f} "
-              f"({'consistent' if consistency_cv < 0.15 else 'variable'})")
-
-        fn = FEATURE_NAMES
-        print(f"\n  Profile (mean across {n_genuine_real} attempt(s)):")
-        for label, feat in [
-            ("typing_speed_cpm", "typing_speed_cpm"),
-            ("dwell_mean (ms)",  "dwell_mean"),
-            ("flight_mean (ms)", "flight_mean"),
-            ("p2p_mean (ms)",    "p2p_mean"),
-            ("rhythm_cv",        "rhythm_cv"),
-            ("shift_lag_norm",   "shift_lag_norm"),
-        ]:
-            if feat in fn:
-                print(f"    {label:20s}: {profile_mean[fn.index(feat)]:.3f}")
-
-        # Scale augmentation count to enrollment size — more samples means
-        # we need fewer augmentations to build a reliable distribution
-        n_aug     = max(600, n_genuine_real * 120)
-        n_imp_syn = max(1200, n_aug * 2)
-
-        genuine_aug = generate_genuine_samples(genuine_vectors, n=n_aug)
-
+        # Load impostor data while DB is still open
         cmu_impostors  = load_cmu_impostors()
         real_impostors = load_real_impostors(db, user.id)
-        real_pool      = cmu_impostors + real_impostors
-
-        n_synthetic     = max(0, n_imp_syn - len(real_pool))
-        syn_impostors   = generate_impostor_samples(
-            profile_mean, profile_std, n=n_synthetic
-        ) if n_synthetic > 0 else []
-        all_impostors   = real_pool + syn_impostors
-
-        n_feats = len(FEATURE_NAMES)
-        def _is_valid(v):
-            try:
-                arr = np.asarray(v, dtype=np.float64)
-                return arr.ndim == 1 and arr.shape[0] == n_feats
-            except Exception:
-                return False
-
-        genuine_aug   = [v for v in genuine_aug   if _is_valid(v)]
-        all_impostors = [v for v in all_impostors  if _is_valid(v)]
-
-        print(f"\n{'='*70}")
-        print(f"  TRAINING DATA")
-        print(f"{'='*70}")
-        print(f"  Genuine (real)     : {n_genuine_real}")
-        print(f"  Genuine (augmented): {len(genuine_aug)}")
-        print(f"  CMU impostors      : {len(cmu_impostors)}  (51 real humans)")
-        print(f"  Enrolled impostors : {len(real_impostors)}  (other users in DB)")
-        print(f"  Synthetic impostors: {len(syn_impostors)}")
-        print(f"  Total impostors    : {len(all_impostors)}")
-        print(f"  Feature dims       : {len(FEATURE_NAMES)}")
-        print(f"  Impostor ratio     : {len(all_impostors)/max(len(genuine_aug),1):.1f}:1")
-
-        X = np.vstack([genuine_aug, all_impostors])
-        y = np.array([1] * len(genuine_aug) + [0] * len(all_impostors))
-
-        pipeline = build_pipeline(n_genuine_real)
-
-        print(f"\n  Running 5-fold cross-validation ...")
-        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-        y_prob_cv = cross_val_predict(pipeline, X, y, cv=cv, method="predict_proba")[:, 1]
-
-        print(f"\n{'='*70}")
-        print(f"  THRESHOLD SEARCH")
-        print(f"{'='*70}")
-        print(f"  {'Threshold':>10}  {'FAR':>8}  {'FRR':>8}  {'EER':>8}")
-
-        best_thresh = 0.50
-        best_eer    = 1.0
-
-        for t in np.arange(0.35, 0.92, 0.02):
-            y_at_t = (y_prob_cv >= t).astype(int)
-            if len(np.unique(y_at_t)) < 2:
-                continue
-            cm_t = confusion_matrix(y, y_at_t)
-            if cm_t.shape != (2, 2):
-                continue
-            tn_t, fp_t, fn_t, tp_t = cm_t.ravel()
-            far_t = fp_t / (fp_t + tn_t) if (fp_t + tn_t) > 0 else 0
-            frr_t = fn_t / (fn_t + tp_t) if (fn_t + tp_t) > 0 else 0
-            eer_t = (far_t + frr_t) / 2
-
-            marker = ""
-            if eer_t < best_eer:
-                best_eer    = eer_t
-                best_thresh = float(t)
-                marker      = " ◄ best EER"
-            print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}{marker}")
-
-        # Floor threshold at 0.45 — never go lower regardless of EER optimum
-        final_thresh = max(best_thresh, 0.45)
-
-        # For highly variable typers, lower slightly to reduce false rejects
-        if consistency_cv > 0.25:
-            final_thresh = max(final_thresh - 0.04, 0.42)
-            print(f"\n  ⚠  High variability (CV={consistency_cv:.2f}) → "
-                  f"threshold adjusted to {final_thresh:.2f}")
-
-        # Report final metrics at chosen threshold
-        y_final = (y_prob_cv >= final_thresh).astype(int)
-        cm_f    = confusion_matrix(y, y_final)
-        tn_f, fp_f, fn_f, tp_f = cm_f.ravel()
-        far_f = fp_f / (fp_f + tn_f) if (fp_f + tn_f) > 0 else 0
-        frr_f = fn_f / (fn_f + tp_f) if (fn_f + tp_f) > 0 else 0
-
-        print(f"\n  Final @ {final_thresh:.2f}:  "
-              f"FAR={far_f:.2%}  FRR={frr_f:.2%}  "
-              f"EER={best_eer:.2%}  "
-              f"ACC={accuracy_score(y, y_final):.2%}")
-
-        print(f"\n  Training final model on full dataset ...")
-        pipeline.fit(X, y)
-
-        # Feature importance (works for both RF and GBM)
-        try:
-            clf_step = pipeline.named_steps["clf"]
-            importances = clf_step.feature_importances_
-            pairs = sorted(zip(FEATURE_NAMES, importances), key=lambda x: x[1], reverse=True)
-            print(f"\n  TOP 10 MOST IMPORTANT FEATURES")
-            for i, (feat, imp) in enumerate(pairs[:10], 1):
-                bar = "█" * int(imp * 200)
-                print(f"  {i:2d}. {feat:28s} {imp:.4f}  {bar}")
-        except Exception:
-            pass
-
-        model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
-        os.makedirs(model_dir, exist_ok=True)
-
-        model_data = {
-            'pipeline':       pipeline,
-            'feature_names':  FEATURE_NAMES,
-            'username':       username,
-            'user_id':        user.id,
-            'n_enrollment':   n_genuine_real,
-            'profile_mean':   profile_mean,
-            'profile_std':    profile_std,
-            'profile_var':    profile_var,
-            'threshold':      final_thresh,
-            'consistency_cv': float(consistency_cv),
-            'far':            float(far_f),
-            'frr':            float(frr_f),
-            'eer':            float(best_eer),
-        }
-
-        model_path = os.path.join(model_dir, f"{username}_keystroke_rf.pkl")
-        with open(model_path, 'wb') as f:
-            pickle.dump(model_data, f)
-
-        size_kb = os.path.getsize(model_path) / 1024
-        print(f"\n{'='*70}")
-        print(f"  ✅ MODEL SAVED:  {model_path}  ({size_kb:.1f} KB)")
-        print(f"  Threshold: {final_thresh:.2f}   "
-              f"FAR: {far_f:.2%}   FRR: {frr_f:.2%}   EER: {best_eer:.2%}\n")
-
-        return model_path
+        user_id        = user.id
 
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass  # already timed out — safe to ignore
+
+    # ── Phase 2: All training in memory — no DB connection needed ────────────
+    print(f"\n{'='*70}")
+    print(f"  KEYSTROKE RF TRAINING v3  —  user: {username}")
+    print(f"{'='*70}")
+
+    n_genuine_real = len(genuine_vectors)
+    print(f"\n  Enrollment samples loaded: {n_genuine_real}")
+
+    profile_mean = np.array(genuine_vectors).mean(axis=0)
+    profile_std  = np.array(genuine_vectors).std(axis=0) + 1e-9
+    profile_var  = profile_std ** 2
+
+    key_idxs = [FEATURE_NAMES.index(f) for f in
+                ['dwell_mean', 'flight_mean', 'p2p_mean', 'typing_speed_cpm']
+                if f in FEATURE_NAMES]
+    consistency_cv = np.mean(
+        profile_std[key_idxs] / (np.abs(profile_mean[key_idxs]) + 1e-9)
+    )
+    print(f"  Enrollment consistency CV: {consistency_cv:.3f} "
+          f"({'consistent' if consistency_cv < 0.15 else 'variable'})")
+
+    fn = FEATURE_NAMES
+    print(f"\n  Profile (mean across {n_genuine_real} attempt(s)):")
+    for label, feat in [
+        ("typing_speed_cpm", "typing_speed_cpm"),
+        ("dwell_mean (ms)",  "dwell_mean"),
+        ("flight_mean (ms)", "flight_mean"),
+        ("p2p_mean (ms)",    "p2p_mean"),
+        ("rhythm_cv",        "rhythm_cv"),
+        ("shift_lag_norm",   "shift_lag_norm"),
+    ]:
+        if feat in fn:
+            print(f"    {label:20s}: {profile_mean[fn.index(feat)]:.3f}")
+
+    # Scale augmentation count to enrollment size
+    n_aug     = max(600, n_genuine_real * 120)
+    n_imp_syn = max(1200, n_aug * 2)
+
+    genuine_aug = generate_genuine_samples(genuine_vectors, n=n_aug)
+
+    real_pool     = cmu_impostors + real_impostors
+
+    n_synthetic     = max(0, n_imp_syn - len(real_pool))
+    syn_impostors   = generate_impostor_samples(
+        profile_mean, profile_std, n=n_synthetic
+    ) if n_synthetic > 0 else []
+    all_impostors   = real_pool + syn_impostors
+
+    n_feats = len(FEATURE_NAMES)
+    def _is_valid(v):
+        try:
+            arr = np.asarray(v, dtype=np.float64)
+            return arr.ndim == 1 and arr.shape[0] == n_feats
+        except Exception:
+            return False
+
+    genuine_aug   = [v for v in genuine_aug   if _is_valid(v)]
+    all_impostors = [v for v in all_impostors  if _is_valid(v)]
+
+    print(f"\n{'='*70}")
+    print(f"  TRAINING DATA")
+    print(f"{'='*70}")
+    print(f"  Genuine (real)     : {n_genuine_real}")
+    print(f"  Genuine (augmented): {len(genuine_aug)}")
+    print(f"  CMU impostors      : {len(cmu_impostors)}  (51 real humans)")
+    print(f"  Enrolled impostors : {len(real_impostors)}  (other users in DB)")
+    print(f"  Synthetic impostors: {len(syn_impostors)}")
+    print(f"  Total impostors    : {len(all_impostors)}")
+    print(f"  Feature dims       : {len(FEATURE_NAMES)}")
+    print(f"  Impostor ratio     : {len(all_impostors)/max(len(genuine_aug),1):.1f}:1")
+
+    X = np.vstack([genuine_aug, all_impostors])
+    y = np.array([1] * len(genuine_aug) + [0] * len(all_impostors))
+
+    pipeline = build_pipeline(n_genuine_real)
+
+    print(f"\n  Running 5-fold cross-validation ...")
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    y_prob_cv = cross_val_predict(pipeline, X, y, cv=cv, method="predict_proba")[:, 1]
+
+    print(f"\n{'='*70}")
+    print(f"  THRESHOLD SEARCH")
+    print(f"{'='*70}")
+    print(f"  {'Threshold':>10}  {'FAR':>8}  {'FRR':>8}  {'EER':>8}")
+
+    best_thresh = 0.50
+    best_eer    = 1.0
+
+    for t in np.arange(0.35, 0.92, 0.02):
+        y_at_t = (y_prob_cv >= t).astype(int)
+        if len(np.unique(y_at_t)) < 2:
+            continue
+        cm_t = confusion_matrix(y, y_at_t)
+        if cm_t.shape != (2, 2):
+            continue
+        tn_t, fp_t, fn_t, tp_t = cm_t.ravel()
+        far_t = fp_t / (fp_t + tn_t) if (fp_t + tn_t) > 0 else 0
+        frr_t = fn_t / (fn_t + tp_t) if (fn_t + tp_t) > 0 else 0
+        eer_t = (far_t + frr_t) / 2
+
+        marker = ""
+        if eer_t < best_eer:
+            best_eer    = eer_t
+            best_thresh = float(t)
+            marker      = " ◄ best EER"
+        print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}{marker}")
+
+    # Floor threshold at 0.45 — never go lower regardless of EER optimum
+    final_thresh = max(best_thresh, 0.45)
+
+    # For highly variable typers, lower slightly to reduce false rejects
+    if consistency_cv > 0.25:
+        final_thresh = max(final_thresh - 0.04, 0.42)
+        print(f"\n  ⚠  High variability (CV={consistency_cv:.2f}) → "
+              f"threshold adjusted to {final_thresh:.2f}")
+
+    # Report final metrics at chosen threshold
+    y_final = (y_prob_cv >= final_thresh).astype(int)
+    cm_f    = confusion_matrix(y, y_final)
+    tn_f, fp_f, fn_f, tp_f = cm_f.ravel()
+    far_f = fp_f / (fp_f + tn_f) if (fp_f + tn_f) > 0 else 0
+    frr_f = fn_f / (fn_f + tp_f) if (fn_f + tp_f) > 0 else 0
+
+    print(f"\n  Final @ {final_thresh:.2f}:  "
+          f"FAR={far_f:.2%}  FRR={frr_f:.2%}  "
+          f"EER={best_eer:.2%}  "
+          f"ACC={accuracy_score(y, y_final):.2%}")
+
+    print(f"\n  Training final model on full dataset ...")
+    pipeline.fit(X, y)
+
+    # Feature importance (works for both RF and GBM)
+    try:
+        clf_step = pipeline.named_steps["clf"]
+        importances = clf_step.feature_importances_
+        pairs = sorted(zip(FEATURE_NAMES, importances), key=lambda x: x[1], reverse=True)
+        print(f"\n  TOP 10 MOST IMPORTANT FEATURES")
+        for i, (feat, imp) in enumerate(pairs[:10], 1):
+            bar = "█" * int(imp * 200)
+            print(f"  {i:2d}. {feat:28s} {imp:.4f}  {bar}")
+    except Exception:
+        pass
+
+    model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+    os.makedirs(model_dir, exist_ok=True)
+
+    model_data = {
+        'pipeline':       pipeline,
+        'feature_names':  FEATURE_NAMES,
+        'username':       username,
+        'user_id':        user.id,
+        'n_enrollment':   n_genuine_real,
+        'profile_mean':   profile_mean,
+        'profile_std':    profile_std,
+        'profile_var':    profile_var,
+        'threshold':      final_thresh,
+        'consistency_cv': float(consistency_cv),
+        'far':            float(far_f),
+        'frr':            float(frr_f),
+        'eer':            float(best_eer),
+    }
+
+    model_path = os.path.join(model_dir, f"{username}_keystroke_rf.pkl")
+    with open(model_path, 'wb') as f:
+        pickle.dump(model_data, f)
+
+    size_kb = os.path.getsize(model_path) / 1024
+    print(f"\n{'='*70}")
+    print(f"  ✅ MODEL SAVED:  {model_path}  ({size_kb:.1f} KB)")
+    print(f"  Threshold: {final_thresh:.2f}   "
+          f"FAR: {far_f:.2%}   FRR: {frr_f:.2%}   EER: {best_eer:.2%}\n")
+
+    return model_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -584,4 +596,4 @@ if __name__ == "__main__":
         username = sys.argv[1]
     else:
         username = input("Enter username to train: ").strip()
-    train_random_forest(username)
+    train_random_forest(username)   

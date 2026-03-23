@@ -8,7 +8,7 @@ const KeystrokeCapture = {
     endTime: null,
     textBuffer: [],
     backspaceCount: 0,
-    targetPhrase: "biometric voice keystroke authentication",
+    targetPhrase: "",   // set dynamically per user — call KeystrokeCapture.setPhrase(phrase)
 
     keyboardLayout: {
         left_hand:    new Set('qwertasdfgzxcvb12345'),
@@ -337,6 +337,10 @@ const KeystrokeCapture = {
 
     validatePhrase(inputValue) {
         return inputValue.trim() === this.targetPhrase;
+    },
+
+    setPhrase(phrase) {
+        this.targetPhrase = phrase.trim();
     },
 
     reset() {

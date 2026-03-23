@@ -13,8 +13,9 @@ class User(Base):
     __tablename__ = "users"
 
     id            = Column(Integer, primary_key=True, index=True)
-    username      = Column(String(100), unique=True, nullable=False)
-    password_hash = Column(String(255), nullable=True)  # ← ADD THIS
+    username      = Column(String(255), unique=True, nullable=False)  # stores email address
+    password_hash = Column(String(255), nullable=True)
+    phrase        = Column(String(255), nullable=True)  # unique 4-word passphrase per user
     is_flagged    = Column(Boolean, default=False)
     created_at    = Column(DateTime, default=func.now())
 

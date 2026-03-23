@@ -2,6 +2,7 @@
 
 let currentUsername = "";
 let currentPassword = "";
+let currentPhrase   = "";   // unique 4-word phrase assigned by server at enrollment
 
 let currentKeystrokeAttempt = 1;
 const KEYSTROKE_TARGET = 5;
@@ -21,6 +22,7 @@ function saveEnrollState(section) {
     sessionStorage.setItem(ENROLL_STATE_KEY, JSON.stringify({
         section,
         username:               currentUsername,
+        phrase:                 currentPhrase,
         keystrokeAttempt:       currentKeystrokeAttempt,
         voiceAttemptsSaved:     voiceAttemptsSaved,
     }));
@@ -38,8 +40,17 @@ function restoreEnrollState() {
         if (!s.username) return false;
 
         currentUsername           = s.username;
+        currentPhrase             = s.phrase || "";
         currentKeystrokeAttempt   = s.keystrokeAttempt   || 1;
         voiceAttemptsSaved        = s.voiceAttemptsSaved  || 0;
+
+        // Restore phrase in UI and KeystrokeCapture
+        if (currentPhrase) {
+            KeystrokeCapture.setPhrase(currentPhrase);
+            document.querySelectorAll(".phrase-display").forEach(el => {
+                el.textContent = currentPhrase;
+            });
+        }
 
         document.getElementById("username-section").classList.add("hidden");
         document.getElementById("step-indicator").classList.remove("hidden");
@@ -106,16 +117,25 @@ function startEnrollment() {
 
 // ── Step 0: Create account (username + password on one screen) ───────────
 async function submitPassword() {
-    const username = document.getElementById("username-input").value.trim();
-    const password = document.getElementById("password-input").value;
-    const confirm  = document.getElementById("password-confirm").value;
-    const status   = document.getElementById("password-status");
+    const rawEmail  = document.getElementById("username-input").value.trim();
+    const password  = document.getElementById("password-input").value;
+    const confirm   = document.getElementById("password-confirm").value;
+    const status    = document.getElementById("password-status");
 
-    if (!username) {
-        status.textContent = "❌ Please enter a username.";
+    // Validate email format
+    if (!rawEmail) {
+        status.textContent = "❌ Please enter your email address.";
         status.className   = "text-center text-sm mb-4 text-red-400";
         return;
     }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(rawEmail)) {
+        status.textContent = "❌ Please enter a valid email address (e.g. you@example.com).";
+        status.className   = "text-center text-sm mb-4 text-red-400";
+        return;
+    }
+    const email = rawEmail.toLowerCase();
+
     if (password.length < 8) {
         status.textContent = "❌ Password must be at least 8 characters.";
         status.className   = "text-center text-sm mb-4 text-red-400";
@@ -131,11 +151,21 @@ async function submitPassword() {
     status.className   = "text-center text-sm mb-4 text-yellow-400";
 
     try {
-        const result = await Api.enrollUser(username, password);
+        const result = await Api.enrollUser(email, password);
 
         if (result.success) {
-            currentUsername = username;
+            currentUsername = email;
             currentPassword = password;
+            currentPhrase   = result.phrase || "biometric voice keystroke authentication";
+
+            // Set the phrase in KeystrokeCapture so it validates against this user's phrase
+            KeystrokeCapture.setPhrase(currentPhrase);
+
+            // Update all phrase display elements in enrollment
+            document.querySelectorAll(".phrase-display").forEach(el => {
+                el.textContent = currentPhrase;
+            });
+
             status.textContent = "✅ Account created!";
             status.className   = "text-center text-sm mb-4 text-green-400";
 
