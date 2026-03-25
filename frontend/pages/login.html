@@ -148,12 +148,24 @@
                         mb-4 flex items-center justify-center animate-pulse">
                 <span class="text-white text-2xl">🎤</span>
             </div>
-            <!-- Live diagnostic bar -->
-            <div class="bg-gray-800 rounded-lg p-2 mb-3 border border-gray-700">
-                <div class="bg-gray-700 rounded h-2 overflow-hidden">
-                    <div id="diag-bar" class="h-2 rounded transition-all" style="width:0%;background:#ef4444"></div>
+            <!-- Live audio level meter -->
+            <div class="mb-3 px-1">
+                <div class="flex justify-between text-xs text-gray-500 mb-1">
+                    <span>🔇 Quiet</span>
+                    <span id="diag-text" class="text-gray-400 text-center text-xs"></span>
+                    <span>🔊 Loud</span>
                 </div>
-                <p id="diag-text" class="text-xs text-gray-500 mt-1 text-center"></p>
+                <div id="voice-level-bar"
+                     class="w-full h-3 bg-gray-700 rounded-full overflow-hidden">
+                    <div id="voice-level-fill"
+                         class="h-full bg-gray-500 transition-all duration-75"
+                         style="width:0%"></div>
+                </div>
+                <div class="flex justify-between text-xs text-gray-600 mt-1 px-1">
+                    <span>too quiet</span>
+                    <span class="text-green-600">✓ good range</span>
+                    <span>clipping</span>
+                </div>
             </div>
             <p id="voice-status" class="text-center text-sm mb-4 text-gray-500">
                 Click record when ready

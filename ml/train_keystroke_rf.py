@@ -193,6 +193,25 @@ def load_cmu_impostors() -> list:
     with open(pkl_path, 'rb') as f:
         vecs = pickle.load(f)
     print(f"  CMU impostor profiles loaded: {len(vecs)} subjects")
+
+    # Validate that CMU vectors match current FEATURE_NAMES length.
+    # If the pkl was built with an older FEATURE_NAMES (e.g. 59 features before
+    # shift_lag_norm was added), the vectors will have the wrong length and will
+    # produce incorrectly-stripped arrays downstream.
+    expected_len = len(FEATURE_NAMES)
+    valid_vecs = [v for v in vecs if hasattr(v, '__len__') and len(v) == expected_len]
+    if len(valid_vecs) != len(vecs):
+        stale = len(vecs) - len(valid_vecs)
+        print(
+            f"  ⚠  {stale} CMU vectors have wrong length "
+            f"(expected {expected_len}) — pkl is stale. "
+            f"Re-run: python ml/load_cmu_impostors.py"
+        )
+        if not valid_vecs:
+            print("  ⚠  All CMU vectors are stale — continuing without CMU impostors.")
+            return []
+        vecs = valid_vecs
+
     return vecs
 
 
@@ -217,6 +236,19 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42, 
     base = np.array(genuine_vectors)
     if feat_names is None:
         feat_names = FEATURE_NAMES
+
+    # Guard: feat_names must match the actual vector length.
+    # If they differ (e.g. vectors were already stripped but feat_names still
+    # refers to the full FEATURE_NAMES list), infer feat_names from the vector
+    # length to prevent "index N out of bounds for axis 0 with size N" crashes.
+    vec_len = base.shape[1] if base.ndim == 2 else len(base[0])
+    if len(feat_names) != vec_len:
+        raise ValueError(
+            f"generate_genuine_samples: feat_names has {len(feat_names)} entries "
+            f"but genuine vectors have {vec_len} features. "
+            f"Pass feat_names=active_feat_names (the post-stripping name list) "
+            f"when calling with stripped vectors."
+        )
 
     if base.shape[0] > 1:
         within_std = base.std(axis=0)
@@ -269,6 +301,14 @@ def generate_impostor_samples(profile_mean, profile_std, n: int = 1200, rng_seed
     rng = np.random.default_rng(rng_seed)
     if feat_names is None:
         feat_names = FEATURE_NAMES
+
+    # Guard: profile_mean/std must match feat_names length.
+    if len(profile_mean) != len(feat_names):
+        raise ValueError(
+            f"generate_impostor_samples: profile_mean has {len(profile_mean)} entries "
+            f"but feat_names has {len(feat_names)}. "
+            f"Pass feat_names=active_feat_names when calling with stripped profiles."
+        )
 
     KEY_FEATURES = {
         'dwell_mean', 'flight_mean', 'p2p_mean', 'typing_speed_cpm',

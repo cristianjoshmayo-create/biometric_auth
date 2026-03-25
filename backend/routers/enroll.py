@@ -424,7 +424,6 @@ def enroll_keystroke(payload: KeystrokeEnroll, db: Session = Depends(get_db)):
     }
 
 
-@router.post("/voice")
 def _mfcc_cosine_similarity(a: list, b: list) -> float:
     """Cosine similarity between two MFCC mean vectors."""
     va = np.array(a[:13], dtype=np.float64)
@@ -459,6 +458,7 @@ def _check_voice_consistency(existing_templates, new_mfcc: list) -> tuple:
     return True, min_sim, "ok"
 
 
+@router.post("/voice")
 def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == payload.username).first()
     if not user:
