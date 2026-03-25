@@ -705,13 +705,14 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
 
         print(f"VAD: {voice_ratio:.0%} voiced  ({speech_duration:.1f}s speech)")
 
-        # Raised from 0.40 to 0.55 — music and ambient noise at VAD mode 1
-        # can pass 40% but genuine speech consistently hits 55%+
-        if voice_ratio < 0.55:
+        # 45% threshold — balances music rejection vs legitimate speech acceptance.
+        # Browser WebM/Opus compression and laptop mics cause some voiced frames
+        # to be misclassified as unvoiced. Real speech hits 45–80%, music rarely does.
+        if voice_ratio < 0.45:
             return {
                 "success": False,
                 "detail":  (
-                    f"Not enough speech detected ({voice_ratio:.0%} voiced, need ≥55%). "
+                    f"Not enough speech detected ({voice_ratio:.0%} voiced, need ≥45%). "
                     f"Speak your assigned phrase clearly and directly into the microphone."
                 ),
                 "snr_db": snr_db,

@@ -43,7 +43,7 @@ const SpeechCapture = {
     SILENCE_DURATION:      1500,   // ms silence before auto-stop
     MIN_VOICE_DURATION:    1500,   // ms of speech required
     MAX_NOISE_FLOOR:       0.015,  // ambient noise above this = warn user
-    SPEECH_BAND_MIN_RATIO: 0.35,   // 35% of energy must be in 300-3400Hz speech band
+    SPEECH_BAND_MIN_RATIO: 0.20,   // 20% — blocks silence/noise, allows real speech from all mic types
                                    // Music spreads energy broadly — typically 10–20%
                                    // Real speech concentrates energy — typically 40–70%
 

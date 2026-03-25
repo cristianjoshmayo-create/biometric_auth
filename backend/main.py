@@ -33,45 +33,38 @@ frontend_dir = os.path.normpath(
 )
 
 # ── Dynamic API_BASE injection ────────────────────────────────────────────────
-# When accessed via ngrok, the browser sends requests to http://127.0.0.1:8000
-# which is your local machine — not accessible to remote users.
-# This middleware rewrites api.js on the fly so API_BASE always points to
-# whatever host the user is actually accessing (ngrok URL or localhost).
-@app.middleware("http")
-async def inject_api_base(request: Request, call_next):
-    response = await call_next(request)
+# Serves api.js with API_BASE rewritten to match the actual host (ngrok or localhost).
+# Must be a route, not a middleware — middleware fires after StaticFiles already
+# streams the file, making the response body inaccessible for rewriting.
+@app.get("/static/js/api.js")
+async def serve_api_js(request: Request):
+    # Determine the actual host from request headers
+    forwarded_host  = request.headers.get("x-forwarded-host")
+    forwarded_proto = request.headers.get("x-forwarded-proto", "https")
+    host            = request.headers.get("host", "127.0.0.1:8000")
 
-    # Only rewrite api.js
-    if request.url.path == "/static/js/api.js":
-        # Determine the actual host the request came from
-        forwarded_host = request.headers.get("x-forwarded-host")
-        forwarded_proto = request.headers.get("x-forwarded-proto", "https")
-        host = request.headers.get("host", "127.0.0.1:8000")
+    if forwarded_host:
+        api_base = f"{forwarded_proto}://{forwarded_host}/api"
+    else:
+        proto    = "https" if request.url.scheme == "https" else "http"
+        api_base = f"{proto}://{host}/api"
 
-        if forwarded_host:
-            api_base = f"{forwarded_proto}://{forwarded_host}/api"
-        else:
-            proto = "https" if request.url.scheme == "https" else "http"
-            api_base = f"{proto}://{host}/api"
+    api_js_path = os.path.join(frontend_dir, "js", "api.js")
+    with open(api_js_path, "r", encoding="utf-8") as f:
+        content = f.read()
 
-        # Read the original file and replace the API_BASE line
-        api_js_path = os.path.join(frontend_dir, "js", "api.js")
-        with open(api_js_path, "r", encoding="utf-8") as f:
-            content = f.read()
+    content = re.sub(
+        r'const API_BASE\s*=\s*["\'].*?["\'];',
+        f'const API_BASE = "{api_base}";',
+        content
+    )
 
-        content = re.sub(
-            r'const API_BASE\s*=\s*["\'].*?["\'];',
-            f'const API_BASE = "{api_base}";',
-            content
-        )
-
-        return HTMLResponse(
-            content=content,
-            media_type="application/javascript",
-            status_code=200,
-        )
-
-    return response
+    return HTMLResponse(
+        content=content,
+        media_type="application/javascript",
+        status_code=200,
+        headers={"Cache-Control": "no-store"},  # prevent browser caching old API_BASE
+    )
 
 app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
 

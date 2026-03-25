@@ -331,6 +331,12 @@ def build_pipeline(n_enrollment: int) -> Pipeline:
     return Pipeline([("scaler", StandardScaler()), ("clf", clf)])
 
 
+def _safe_filename(username: str) -> str:
+    """Sanitize email address for use as a filename.
+    user@gmail.com → user_at_gmail_com (safe on all OS)"""
+    return username.replace("@", "_at_").replace(".", "_").replace(" ", "_")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  TRAINING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -527,7 +533,7 @@ def train_random_forest(username: str):
         'eer':            float(best_eer),
     }
 
-    model_path = os.path.join(model_dir, f"{username}_keystroke_rf.pkl")
+    model_path = os.path.join(model_dir, f"{_safe_filename(username)}_keystroke_rf.pkl")
     with open(model_path, 'wb') as f:
         pickle.dump(model_data, f)
 
@@ -546,7 +552,7 @@ def train_random_forest(username: str):
 
 def predict_keystroke(username: str, feature_dict: dict) -> dict:
     model_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
-    model_path = os.path.join(model_dir, f"{username}_keystroke_rf.pkl")
+    model_path = os.path.join(model_dir, f"{_safe_filename(username)}_keystroke_rf.pkl")
 
     if not os.path.exists(model_path):
         return {'error': f'No model found for {username}. Please enroll first.'}
@@ -596,4 +602,4 @@ if __name__ == "__main__":
         username = sys.argv[1]
     else:
         username = input("Enter username to train: ").strip()
-    train_random_forest(username)   
+    train_random_forest(username)

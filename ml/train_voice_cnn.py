@@ -168,6 +168,12 @@ def build_pipeline():
     return Pipeline([("scaler", StandardScaler()), ("gbm", clf)])
 
 
+def _safe_filename(username: str) -> str:
+    """Sanitize email address for use as a filename.
+    user@gmail.com → user_at_gmail_com (safe on all OS)"""
+    return username.replace("@", "_at_").replace(".", "_").replace(" ", "_")
+
+
 def train_voice_model(username: str):
     # ── Phase 1: Fetch all data from DB then close immediately ───────────────
     # Supabase closes idle connections after ~60 seconds.
@@ -262,9 +268,11 @@ def train_voice_model(username: str):
         if eer_t < best_eer:
             best_eer, best_thresh = eer_t, float(t)
 
-    # Noise-adaptive threshold tightening
-    noise_adj    = noise_level * 0.08
-    final_thresh = min(best_thresh + noise_adj, 0.85)
+    # Noise-adaptive threshold tightening — cap at 0.72 to prevent
+    # over-rejection of legitimate users in typical laptop mic environments.
+    # Above 0.72, the FRR becomes unacceptably high for 3-sample enrollment.
+    noise_adj    = noise_level * 0.06
+    final_thresh = min(best_thresh + noise_adj, 0.72)
     if noise_adj > 0.01:
         print(f"\n  ⚠  Noise-adaptive: {best_thresh:.2f} → {final_thresh:.2f} (+{noise_adj:.2f})")
 
@@ -299,7 +307,7 @@ def train_voice_model(username: str):
         'eer':          float(best_eer),
         'model_type':   'gbm_improved_v3',
     }
-    model_path = os.path.join(model_dir, f"{username}_voice_cnn.pkl")
+    model_path = os.path.join(model_dir, f"{_safe_filename(username)}_voice_cnn.pkl")
     with open(model_path, 'wb') as f:
         pickle.dump(model_data, f)
 
@@ -309,7 +317,7 @@ def train_voice_model(username: str):
 
 def predict_voice(username: str, feature_dict: dict) -> dict:
     model_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
-    model_path = os.path.join(model_dir, f"{username}_voice_cnn.pkl")
+    model_path = os.path.join(model_dir, f"{_safe_filename(username)}_voice_cnn.pkl")
 
     if not os.path.exists(model_path):
         return {'error': f'No voice model for "{username}". Enroll first.'}

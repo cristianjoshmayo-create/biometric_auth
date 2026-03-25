@@ -21,6 +21,10 @@ router = APIRouter()
 
 MAX_SAMPLES = 50
 
+def _safe_filename(username: str) -> str:
+    """Sanitize email for use as filename. user@gmail.com → user_at_gmail_com"""
+    return username.replace("@", "_at_").replace(".", "_").replace(" ", "_")
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  SCHEMAS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,7 +217,7 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
     if user.is_flagged:
         raise HTTPException(status_code=403, detail="Account flagged")
 
-    model_path = os.path.join(_model_dir(), f"{payload.username}_keystroke_rf.pkl")
+    model_path = os.path.join(_model_dir(), f"{_safe_filename(payload.username)}_keystroke_rf.pkl")
 
     if os.path.exists(model_path):
         print(f"[keystroke] Using RF model for '{payload.username}'")
@@ -459,7 +463,7 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    model_path = os.path.join(_model_dir(), f"{payload.username}_voice_cnn.pkl")
+    model_path = os.path.join(_model_dir(), f"{_safe_filename(payload.username)}_voice_cnn.pkl")
 
     if os.path.exists(model_path):
         print(f"[voice] Using trained .pkl model for '{payload.username}'")
@@ -625,7 +629,7 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
                 )
                 lock_path = os.path.join(
                     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                    'ml', 'models', f"{payload.username}_voice_cnn.pkl.retraining"
+                    'ml', 'models', f"{_safe_filename(payload.username)}_voice_cnn.pkl.retraining"
                 )
                 # Skip if another retrain is already running for this user
                 if not os.path.exists(lock_path):
