@@ -312,6 +312,7 @@ const KeystrokeCapture = {
             extra_digraphs: Object.fromEntries(
                 this.trackedDigraphs.map(dg => [dg, _mean(digraphMap[dg])])
             ),
+            dwell_times:  dwellTimes,
             flight_times: flightTimes,
             typing_speed: typingSpeedCpm / 60,
         };

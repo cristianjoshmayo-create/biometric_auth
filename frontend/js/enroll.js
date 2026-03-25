@@ -347,6 +347,7 @@ async function submitKeystroke() {
             p2p_std_norm:            features.p2p_std_norm     || 0,
             r2r_mean_norm:           features.r2r_mean_norm    || 0,
             shift_lag_norm:          features.shift_lag_norm   || 0,
+            extra_digraphs:          features.extra_digraphs   || {},
         });
 
         if (!result.success) {

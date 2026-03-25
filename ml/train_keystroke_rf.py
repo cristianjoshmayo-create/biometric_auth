@@ -183,15 +183,28 @@ def load_enrollment_samples(db, user_id: int, extra_keys: list = None):
 
 
 def load_real_impostors(db, exclude_user_id: int, n_genuine: int = 99):
-    if n_genuine < 8:
-        print(f"  Skipping real enrolled impostors (n_genuine={n_genuine} < 8) — using CMU + synthetic only")
+    # Threshold lowered from 8 → 3.  The old guard of 8 meant real enrolled
+    # impostors were NEVER used (MAX_KEYSTROKE_SAMPLES = 5, so n_genuine is
+    # always 5 at training time).  3 is a safe minimum — enough genuine
+    # samples to define a meaningful user profile before mixing in real humans.
+    if n_genuine < 3:
+        print(f"  Skipping real enrolled impostors (n_genuine={n_genuine} < 3) — using CMU + synthetic only")
         return []
     other_users = db.query(User).filter(User.id != exclude_user_id).all()
     impostors   = []
     for u in other_users:
-        impostors.extend(load_enrollment_samples(db, u.id))
+        # Load WITHOUT extra_keys — vectors stay at FEATURE_NAMES length.
+        # _strip_inactive() in train_random_forest() pads the user-specific
+        # extra_pairs columns with zeros, which is correct: the impostor never
+        # typed the genuine user's phrase so those bigram timings are unknown.
+        samples = load_enrollment_samples(db, u.id)
+        if samples:
+            impostors.extend(samples)
+            print(f"    impostor '{u.username}': {len(samples)} sample(s)")
     if impostors:
         print(f"  Real impostor samples from {len(other_users)} other user(s): {len(impostors)}")
+    else:
+        print(f"  No other enrolled users found to use as impostors.")
     return impostors
 
 
