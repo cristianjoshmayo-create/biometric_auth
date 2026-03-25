@@ -299,8 +299,17 @@ const SpeechCapture = {
                     channelCount:       { exact: 1 },
                     sampleRate:         { ideal: 48000 },
                     echoCancellation:   true,
-                    noiseSuppression:   false,  // we handle this ourselves with RNNoise
-                    autoGainControl:    false,  // we handle normalisation ourselves
+                    // Enable browser-native noise suppression (WebRTC NS module).
+                    // Chrome/Edge run this at hardware-accelerated level BEFORE
+                    // RNNoise sees the audio — stacking both gives two independent
+                    // suppression layers before the signal even leaves the browser,
+                    // plus noisereduce on the server = 3 layers total.
+                    // This mimics how directional vlogging mics reject background
+                    // sound at the hardware level before it reaches the recording.
+                    noiseSuppression:   true,
+                    // Keep autoGainControl off — _autoGain() handles normalisation
+                    // so the GBM model sees consistent energy levels across sessions.
+                    autoGainControl:    false,
                 }
             });
 

@@ -441,7 +441,10 @@ def _check_voice_consistency(existing_templates, new_mfcc: list) -> tuple:
     Threshold 0.72 — below this the recordings are too different in timbre
     to reliably belong to the same speaker in the same conditions.
     """
-    CONSISTENCY_THRESHOLD = 0.72
+    # Lowered from 0.72 — laptop mics in real rooms vary ±0.05-0.08 per recording.
+    # 0.65 still rejects a different voice (typically <0.50) while accepting
+    # the same voice under slightly different ambient conditions.
+    CONSISTENCY_THRESHOLD = 0.65
     min_sim = 1.0
     for t in existing_templates:
         if not t.mfcc_features:
@@ -476,25 +479,12 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
     ).all()
     existing_count = len(existing_templates)
 
-    # ── Consistency check (only once we have at least 1 prior sample) ────────
-    # Compare new MFCC against every saved sample. If any pairwise similarity
-    # is below the threshold, reject the sample and ask the user to re-record.
-    # We do NOT save the bad sample — the attempt counter stays the same.
-    if existing_count >= 1 and payload.mfcc_features:
-        consistent, sim, msg = _check_voice_consistency(
-            existing_templates, list(payload.mfcc_features)
-        )
-        if not consistent:
-            print(f"⚠  Voice consistency fail for '{payload.username}': "
-                  f"sim={sim:.2f} — sample rejected")
-            return {
-                "success":             True,   # request itself succeeded
-                "consistency_warning": True,   # but sample was rejected
-                "message":             msg,
-                "attempt_number":      existing_count,  # counter unchanged
-                "similarity":          round(sim, 3),
-                "training_started":    False,
-            }
+    # Consistency check removed — raw MFCC cosine similarity is noise-sensitive
+    # by design. Two recordings of the same voice in different ambient noise
+    # conditions can score near 0% similarity even after noise reduction.
+    # The GBM model + Mahalanobis fusion at verification time handles
+    # inter-session variability robustly. A pre-enrollment gate on raw MFCCs
+    # is redundant and rejects legitimate users in normal room conditions.
 
     template = VoiceTemplate(
         user_id               = user.id,
@@ -687,13 +677,14 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         snr_db = _estimate_snr(audio, sr)
         print(f"Estimated SNR: {snr_db:.1f} dB")
 
-        # Lowered from 10dB to 6dB — typical laptop mic in a normal room
-        # measures 6–12dB. 10dB was blocking almost every real recording.
-        if snr_db < 6.0:
+        # Lowered to 4dB — RNNoise on the frontend already cleaned the audio
+        # before it arrives here, so the SNR we measure is post-denoising.
+        # A 6dB gate on already-cleaned audio was rejecting legitimate users.
+        if snr_db < 4.0:
             return {
                 "success": False,
                 "detail":  (
-                    f"Audio too noisy (SNR={snr_db:.1f}dB, need ≥6dB). "
+                    f"Audio too noisy (SNR={snr_db:.1f}dB, need ≥4dB). "
                     "Move away from fans or loud speakers and try again."
                 ),
                 "snr_db": snr_db,
@@ -723,14 +714,28 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
                 "snr_db": snr_db,
             }
 
-        # ── Spectral subtraction (denoise) ─────────────────────────────────
-        # Apply whenever SNR < 30dB (was 25dB) to cover more real-world cases
+        # ── Noise reduction (noisereduce — non-stationary Wiener filter) ──────
+        # noisereduce is far more effective than the old spectral subtraction
+        # for real-world noise: fans, AC, ambient chatter, keyboard noise.
+        # stationary=False handles non-stationary noise sources.
+        # prop_decrease=0.75 — partial suppression to avoid over-cleaning
+        # (over-cleaning introduces musical noise artefacts that distort MFCCs).
+        # Applied whenever SNR < 30dB — covers almost every laptop mic scenario.
         if snr_db < 30.0:
-            print(f"  Applying spectral subtraction (SNR={snr_db:.1f}dB)")
-            audio_clean = _spectral_subtraction(audio, sr)
+            try:
+                import noisereduce as nr
+                print(f"  Applying noisereduce (SNR={snr_db:.1f}dB)")
+                audio_clean = nr.reduce_noise(
+                    y=audio, sr=sr,
+                    stationary=False,
+                    prop_decrease=0.75,
+                ).astype(np.float32)
+            except ImportError:
+                print("  noisereduce not installed — falling back to spectral subtraction")
+                audio_clean = _spectral_subtraction(audio, sr)
         else:
             audio_clean = audio
-            print(f"  Skipping spectral subtraction (SNR={snr_db:.1f}dB ≥ 30dB)")
+            print(f"  Skipping noise reduction (SNR={snr_db:.1f}dB ≥ 30dB)")
 
         # ── WebRTC VAD ─────────────────────────────────────────────────────
         import webrtcvad
