@@ -1,351 +1,158 @@
 // frontend/js/speech.js
-// v3 — DIAGNOSTIC + LENIENT THRESHOLDS
+// v4 — Silero VAD replacement
 //
-// Root cause of "can't recognise I'm speaking":
-//   6 stacked rejection gates were all calibrated for a professional quiet room.
-//   On a normal laptop mic in a typical room, recordings were silently blocked
-//   before ever reaching the ML model.
+// Root cause of v3 enrollment failures:
+//   Hand-tuned RMS threshold VAD is fragile across mic hardware, browsers,
+//   room noise, and speaking distance. WebRTC VAD (used server-side) only
+//   catches ~50% of real speech frames at a 5% false-positive rate.
 //
-// Changes in v3:
-//   1. MAX_NOISE_FLOOR      0.08  → 0.20   (most rooms have fans/AC)
-//   2. VOICE_THRESHOLD_BASE 0.02  → 0.01   (laptop mics are quieter than expected)
-//   3. noiseFloor multiplier 1.8x → 1.3x   (less aggressive dynamic threshold)
-//   4. SPEECH_BAND_MIN_RATIO 0.15 → 0.08   (softened — speech band check was too strict)
-//   5. MIN_VOICE_DURATION   2000ms → 1500ms (shorter phrase is still enough)
-//   6. SILENCE_DURATION     1200ms → 1500ms (more forgiving pause detection)
-//   7. Diagnostic bar shows live RMS %, speech band %, and threshold — user
-//      can now SEE why their voice isn't triggering
-//   8. Server-side gates also relaxed (see enroll.py): SNR 10→6, voiced 60%→45%
+// Fix: replace custom VAD with @ricky0123/vad-web, which runs Silero VAD
+//   via ONNX Runtime Web entirely in the browser. Silero VAD achieves ~88%
+//   true-positive rate under the same conditions — 4x fewer missed frames.
+//
+// Integration contract (unchanged from v3):
+//   - Calls onVoiceRecorded(featureDict)  during enrollment
+//   - Calls onVoiceAuthComplete(featureDict) during login
+//   - DOM ids used: record-btn, voice-status, diag-text, recording-indicator
+//   - Global startRecording() function preserved
+//   - Sends audio to POST /enroll/extract-mfcc, same as before
+
+// ── CDN deps (loaded in HTML before this file) ───────────────────────────
+// <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
+// <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
 
 const SpeechCapture = {
-    mediaRecorder:  null,
-    audioChunks:    [],
+    myvad:          null,
     isRecording:    false,
     currentAttempt: 1,
     maxAttempts:    3,
 
-    // VAD state
-    audioContext:   null,
-    analyser:       null,
-    microphone:     null,
-    javascriptNode: null,
-    silenceStart:   null,
-    voiced:         false,
-
-    // Noise floor measured before recording
-    noiseFloor:     0.0,
-    noiseEstimated: false,
-
-    // ── Thresholds — calibrated for TRUE time-domain RMS (getFloatTimeDomainData)
-    // Float32 waveform RMS ranges: silence ~0.001–0.005, speech ~0.01–0.08
-    // These are NOT the same scale as the old byte-frequency "RMS" (which was wrong).
-    VOICE_THRESHOLD_BASE:  0.008,  // ~0.8% of full scale — typical speech floor
-    SILENCE_DURATION:      1500,   // ms silence before auto-stop
-    MIN_VOICE_DURATION:    1500,   // ms of speech required
-    MAX_NOISE_FLOOR:       0.015,  // ambient noise above this = warn user
-    SPEECH_BAND_MIN_RATIO: 0.20,   // 20% — blocks silence/noise, allows real speech from all mic types
-                                   // Music spreads energy broadly — typically 10–20%
-                                   // Real speech concentrates energy — typically 40–70%
-
-    _stream: null,
-
-    // ── Noise floor estimation (150ms ambient sample) ──────────────────────
-    async _estimateNoiseFloor(stream) {
-        return new Promise((resolve) => {
-            const ctx      = new (window.AudioContext || window.webkitAudioContext)();
-            const analyser = ctx.createAnalyser();
-            const mic      = ctx.createMediaStreamSource(stream);
-            analyser.fftSize               = 2048;
-            analyser.smoothingTimeConstant = 0.0;
-            mic.connect(analyser);
-
-            const samples   = [];
-            const startTime = Date.now();
-
-            const measure = () => {
-                // FIX: use getFloatTimeDomainData for true time-domain RMS.
-                // getByteFrequencyData returns dB-scaled frequency-domain bytes,
-                // not waveform samples — "RMS" computed from it is wrong.
-                const timeData = new Float32Array(analyser.fftSize);
-                analyser.getFloatTimeDomainData(timeData);
-                let sum = 0;
-                for (let i = 0; i < timeData.length; i++) sum += timeData[i] * timeData[i];
-                samples.push(Math.sqrt(sum / timeData.length));
-
-                if (Date.now() - startTime < 150) {
-                    requestAnimationFrame(measure);
-                } else {
-                    mic.disconnect();
-                    ctx.close();
-                    const floor = samples.reduce((a, b) => a + b, 0) / samples.length;
-                    resolve(floor);
-                }
-            };
-            requestAnimationFrame(measure);
-        });
+    // ── Silero VAD config ─────────────────────────────────────────────────
+    // positiveSpeechThreshold: probability above which a frame is "speech"
+    // negativeSpeechThreshold: probability below which a frame ends speech
+    // minSpeechFrames: minimum consecutive speech frames before firing onSpeechEnd
+    // preSpeechPadFrames: frames of audio before speech start to include
+    VAD_CONFIG: {
+        positiveSpeechThreshold: 0.50,
+        negativeSpeechThreshold: 0.35,
+        minSpeechFrames:         8,     // ~0.5s at 16kHz / 1536 frame size
+        preSpeechPadFrames:      3,
+        redemptionFrames:        10,
+        onnxWASMBasePath:  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
+        baseAssetPath:     "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
     },
 
-    // ── Speech band energy ratio (300–3400 Hz) ─────────────────────────────
-    _getSpeechBandRatio(analyser, sampleRate) {
-        const array  = new Uint8Array(analyser.frequencyBinCount);
-        analyser.getByteFrequencyData(array);
-        const binHz  = sampleRate / analyser.fftSize;
-        const minBin = Math.floor(300  / binHz);
-        const maxBin = Math.floor(3400 / binHz);
-
-        let speechEnergy = 0, totalEnergy = 0;
-        for (let i = 0; i < array.length; i++) {
-            const e = array[i] * array[i];
-            totalEnergy += e;
-            if (i >= minBin && i <= maxBin) speechEnergy += e;
-        }
-        return totalEnergy > 0 ? speechEnergy / totalEnergy : 0;
+    // ── Update live status display ────────────────────────────────────────
+    _setStatus(text, color) {
+        const el = document.getElementById("voice-status");
+        if (!el) return;
+        el.textContent  = text;
+        el.className    = `text-center text-sm mb-4 ${color}`;
     },
 
-    // ── Update the live diagnostic bar ────────────────────────────────────
-    // Shows RMS level, speech band %, and whether voice is detected.
-    // This is the main debugging tool — users can see exactly why voice
-    // isn't triggering instead of getting a silent failure.
-    _updateDiagBar(rms, speechRatio, isVoice) {
-        const bar     = document.getElementById("diag-bar");
-        const diagTxt = document.getElementById("diag-text");
-        if (!bar && !diagTxt) return;
+    _setDiag(text) {
+        const el = document.getElementById("diag-text");
+        if (el) el.textContent = text;
+    },
 
-        const rmsPC    = (rms * 100).toFixed(1);
-        const bandPC   = (speechRatio * 100).toFixed(0);
-        const threshPC = (this.VOICE_THRESHOLD * 100).toFixed(1);
-
-        if (diagTxt) {
-            diagTxt.textContent = isVoice
-                ? `🟢 Voice detected  (level: ${rmsPC}%  band: ${bandPC}%)`
-                : `🔴 No voice  (level: ${rmsPC}% / need ${threshPC}%  band: ${bandPC}% / need ${(this.SPEECH_BAND_MIN_RATIO*100).toFixed(0)}%)`;
-        }
-
-        if (bar) {
-            const fillPct = Math.min(100, (rms / (this.VOICE_THRESHOLD * 2)) * 100);
-            bar.style.width      = `${fillPct}%`;
-            bar.style.background = isVoice ? "#10b981" : rms > this.noiseFloor * 1.1 ? "#f59e0b" : "#ef4444";
-        }
-
-        // Also update the existing recording indicator if present
-        const indicator = document.getElementById("recording-indicator");
-        if (indicator) {
-            indicator.style.backgroundColor = isVoice ? "#10b981" : rms > this.noiseFloor * 1.1 ? "#f59e0b" : "#ef4444";
-            if (isVoice) indicator.classList.remove("animate-pulse");
-            else indicator.classList.add("animate-pulse");
-        }
+    _setIndicator(active) {
+        const el = document.getElementById("recording-indicator");
+        if (!el) return;
+        el.style.backgroundColor = active ? "#10b981" : "#f59e0b";
+        if (active) el.classList.remove("animate-pulse");
+        else        el.classList.add("animate-pulse");
     },
 
     // ── Main entry point ──────────────────────────────────────────────────
     async startRecording() {
         const status = document.getElementById("voice-status");
 
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    channelCount:     1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl:  true,
-                    sampleRate:       16000,
-                }
-            });
-            this._stream = stream;
-
-            // Step 1 — measure noise floor
-            if (status) {
-                status.textContent = "🔇 Measuring background noise…";
-                status.className   = "text-center text-sm mb-4 text-yellow-400";
-            }
-
-            this.noiseFloor     = await this._estimateNoiseFloor(stream);
-            this.noiseEstimated = true;
-
-            // Log actual applied browser settings — constraints are requests not guarantees
-            try {
-                const track    = stream.getAudioTracks()[0];
-                const settings = track.getSettings();
-                console.log("[SpeechCapture] Actual mic settings:", settings);
-                if (settings.sampleRate && settings.sampleRate !== 16000) {
-                    console.warn(`[SpeechCapture] Browser applied sampleRate=${settings.sampleRate}, not 16000 — server will resample`);
-                }
-            } catch(e) { /* getSettings() not supported in all browsers */ }
-
-            // Dynamic threshold: 2.5× noise floor, minimum 0.008
-            // Now using TRUE RMS scale (getFloatTimeDomainData, range 0.0–1.0):
-            //   silence  ≈ 0.001–0.005
-            //   speech   ≈ 0.010–0.080
-            const dynamicThreshold = Math.max(this.VOICE_THRESHOLD_BASE, this.noiseFloor * 2.5);
-            this.VOICE_THRESHOLD   = dynamicThreshold;
-
-            console.log(
-                `[SpeechCapture] noiseFloor=${this.noiseFloor.toFixed(4)} (true RMS)  ` +
-                `voiceThreshold=${dynamicThreshold.toFixed(4)}`
+        // Guard: check Silero VAD library loaded
+        if (typeof vad === "undefined" || !vad.MicVAD) {
+            this._setStatus(
+                "❌ Voice library failed to load. Check your internet connection.",
+                "text-red-400"
             );
+            return false;
+        }
 
-            if (this.noiseFloor > this.MAX_NOISE_FLOOR) {
-                if (status) {
-                    status.textContent =
-                        `⚠️ Background noise is high (${this.noiseFloor.toFixed(3)} RMS). ` +
-                        "Try moving away from fans or speakers.";
-                    status.className = "text-center text-sm mb-4 text-yellow-400";
-                }
-            } else if (status) {
-                status.textContent =
-                    `✅ Ready (noise: ${this.noiseFloor.toFixed(3)} RMS). ` +
-                    "Speak now — recording starts automatically…";
-                status.className = "text-center text-sm mb-4 text-green-400";
-            }
+        try {
+            this._setStatus("⏳ Initialising voice detector…", "text-yellow-400");
+            this._setDiag("");
 
-            // Step 2 — set up VAD
-            this.audioContext   = new (window.AudioContext || window.webkitAudioContext)();
-            this.analyser       = this.audioContext.createAnalyser();
-            this.microphone     = this.audioContext.createMediaStreamSource(stream);
-            this.javascriptNode = this.audioContext.createScriptProcessor(2048, 1, 1);
+            this.myvad = await vad.MicVAD.new({
+                ...this.VAD_CONFIG,
 
-            this.analyser.smoothingTimeConstant = 0.3;
-            this.analyser.fftSize               = 2048;
+                onSpeechStart: () => {
+                    console.log("[SileroVAD] Speech start");
+                    this.isRecording = true;
+                    this._setStatus(
+                        "🔴 Recording — speak the full phrase clearly…",
+                        "text-red-400"
+                    );
+                    this._setIndicator(true);
+                    this._setDiag("🟢 Voice detected");
+                },
 
-            this.microphone.connect(this.analyser);
-            this.analyser.connect(this.javascriptNode);
-            this.javascriptNode.connect(this.audioContext.destination);
+                onSpeechEnd: async (audioFloat32) => {
+                    console.log(`[SileroVAD] Speech end — ${audioFloat32.length} samples (${(audioFloat32.length/16000).toFixed(2)}s)`);
+                    this._setStatus("⚙️ Processing audio…", "text-yellow-400");
+                    this._setDiag("");
+                    this._setIndicator(false);
+                    this.isRecording = false;
 
-            const self            = this;
-            let voiceDetectedTime = null;
-            const sampleRate      = this.audioContext.sampleRate;
+                    // Stop VAD so mic is released
+                    this.myvad.pause();
 
-            this.javascriptNode.onaudioprocess = function () {
-                // TRUE time-domain RMS from waveform samples (not frequency bins)
-                // getByteFrequencyData returns dB-scaled spectral magnitudes — wrong for RMS.
-                const timeData = new Float32Array(self.analyser.fftSize);
-                self.analyser.getFloatTimeDomainData(timeData);
-                let sum = 0;
-                for (let i = 0; i < timeData.length; i++) sum += timeData[i] * timeData[i];
-                const rms = Math.sqrt(sum / timeData.length);
+                    await this._processFloat32(audioFloat32);
+                },
 
-                // Speech band ratio still correctly uses frequency-domain data
-                const speechRatio = self._getSpeechBandRatio(self.analyser, sampleRate);
-                const isVoice     = rms > self.VOICE_THRESHOLD && speechRatio > self.SPEECH_BAND_MIN_RATIO;
+                onVADMisfire: () => {
+                    console.log("[SileroVAD] Misfire — too short, keep speaking");
+                    this._setStatus(
+                        "⚠️ Too short — speak the full phrase without pausing",
+                        "text-yellow-400"
+                    );
+                    this._setDiag("🔴 No voice — keep speaking");
+                    this._setIndicator(false);
+                    this.isRecording = false;
+                },
+            });
 
-                self._updateDiagBar(rms, speechRatio, isVoice);
-
-                if (isVoice) {
-                    if (!self.voiced) {
-                        console.log(`🎤 Voice detected — rms=${(rms*100).toFixed(1)}%  band=${(speechRatio*100).toFixed(0)}%  threshold=${(self.VOICE_THRESHOLD*100).toFixed(1)}%`);
-                        self.voiced       = true;
-                        voiceDetectedTime = Date.now();
-                        if (!self.isRecording) self.startActualRecording(stream);
-                    }
-                    self.silenceStart = null;
-                } else {
-                    if (self.voiced) {
-                        if (self.silenceStart === null) {
-                            self.silenceStart = Date.now();
-                        } else if (Date.now() - self.silenceStart > self.SILENCE_DURATION) {
-                            const voiceDuration = self.silenceStart - voiceDetectedTime;
-                            if (voiceDuration >= self.MIN_VOICE_DURATION) {
-                                console.log(`✅ Voice segment complete: ${voiceDuration}ms`);
-                                self.stopRecording();
-                            } else {
-                                // Too short — keep listening rather than failing
-                                console.log(`⚠️ Voice too short (${voiceDuration}ms < ${self.MIN_VOICE_DURATION}ms) — keep speaking`);
-                                if (status) {
-                                    status.textContent = `⚠️ Keep speaking — need ${(self.MIN_VOICE_DURATION/1000).toFixed(1)}s of voice`;
-                                    status.className   = "text-center text-sm mb-4 text-yellow-400";
-                                }
-                                self.silenceStart = null;
-                                // Reset voiced so they can start a fresh attempt at the phrase
-                                self.voiced = false;
-                            }
-                        }
-                    }
-                }
-            };
-
+            this.myvad.start();
+            this._setStatus(
+                "🎤 Listening… speak when ready",
+                "text-green-400"
+            );
+            this._setDiag("Waiting for speech…");
             return true;
 
         } catch (err) {
-            console.error("Microphone error:", err);
-            if (status) {
-                status.textContent = `❌ Microphone error: ${err.message}`;
-                status.className   = "text-center text-sm mb-4 text-red-400";
-            }
+            console.error("[SileroVAD] Init error:", err);
+            this._setStatus(`❌ Microphone error: ${err.message}`, "text-red-400");
             return false;
         }
     },
 
-    startActualRecording(stream) {
-        if (this.isRecording) return;
+    // ── Convert Float32Array → WAV → base64 → send to /extract-mfcc ──────
+    async _processFloat32(audioFloat32) {
+        // Silero always outputs 16kHz mono Float32 — convert to 16-bit PCM WAV
+        const wavBlob = this._float32ToWav(audioFloat32, 16000);
 
-        this.audioChunks   = [];
-        this.mediaRecorder = new MediaRecorder(stream);
-        this.isRecording   = true;
-
-        const status = document.getElementById("voice-status");
-        if (status) {
-            status.textContent = "🔴 Recording — speak the full phrase clearly…";
-            status.className   = "text-center text-sm mb-4 text-red-400";
-        }
-
-        this.mediaRecorder.ondataavailable = (e) => {
-            if (e.data.size > 0) this.audioChunks.push(e.data);
-        };
-
-        this.mediaRecorder.onstop = () => {
-            const mimeType  = this.mediaRecorder.mimeType || "audio/webm";
-            const audioBlob = new Blob(this.audioChunks, { type: mimeType });
-            console.log(`Recording stopped — ${mimeType}  ${audioBlob.size} bytes`);
-            this.processAudio(audioBlob);
-            stream.getTracks().forEach(t => t.stop());
-            if (this.audioContext) this.audioContext.close();
-        };
-
-        this.mediaRecorder.start();
-
-        // 15 second hard cap (generous — the phrase takes ~4s)
-        setTimeout(() => {
-            if (this.isRecording) {
-                console.log("⏱ Max duration reached, auto-stopping");
-                this.stopRecording();
-            }
-        }, 15000);
-    },
-
-    stopRecording() {
-        if (this.mediaRecorder && this.isRecording) {
-            this.mediaRecorder.stop();
-            this.isRecording = false;
-            this.voiced      = false;
-            if (this.javascriptNode) this.javascriptNode.disconnect();
-            if (this.analyser)       this.analyser.disconnect();
-            if (this.microphone)     this.microphone.disconnect();
-        }
-    },
-
-    async processAudio(audioBlob) {
-        const status = document.getElementById("voice-status");
-        const diagTxt = document.getElementById("diag-text");
-        if (status) status.textContent = "⚙️ Processing audio…";
-        if (diagTxt) diagTxt.textContent = "";
-
-        const mimeType = audioBlob.type || "audio/webm";
-        let format = "webm";
-        if      (mimeType.includes("ogg")) format = "ogg";
-        else if (mimeType.includes("mp4")) format = "mp4";
-        else if (mimeType.includes("wav")) format = "wav";
-
-        // Basic size sanity check before sending
-        if (audioBlob.size < 3000) {
-            if (status) {
-                status.textContent = "❌ Recording too short or silent. Speak louder and try again.";
-                status.className   = "text-center text-sm mb-4 text-red-400";
-            }
-            const btn = document.getElementById("record-btn");
-            if (btn) { btn.disabled = false; btn.textContent = "🎤 Try Again"; }
+        // Minimum duration guard (backend requires ≥1s of speech)
+        const durationSec = audioFloat32.length / 16000;
+        if (durationSec < 1.0 || wavBlob.size < 3000) {
+            this._setStatus(
+                `❌ Recording too short (${durationSec.toFixed(1)}s). Speak the full phrase.`,
+                "text-red-400"
+            );
+            this._resetBtn();
             return;
         }
 
-        const base64Audio = await this.blobToBase64(audioBlob);
+        console.log(`[SileroVAD] WAV size: ${wavBlob.size} bytes  duration: ${durationSec.toFixed(2)}s`);
+
+        const base64Audio = await this._blobToBase64(wavBlob);
         const username    = typeof authUsername    !== "undefined" ? authUsername
                           : typeof currentUsername !== "undefined" ? currentUsername
                           : "";
@@ -354,32 +161,35 @@ const SpeechCapture = {
             const response = await fetch(`${API_BASE}/enroll/extract-mfcc`, {
                 method:  "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ audio_data: base64Audio, audio_format: format, username })
+                body: JSON.stringify({
+                    audio_data:   base64Audio,
+                    audio_format: "wav",   // always WAV — no format ambiguity
+                    username
+                })
             });
 
             const result = await response.json();
-            console.log("extract-mfcc result:", result);
+            console.log("[SileroVAD] extract-mfcc result:", result);
 
             if (!result.success) {
-                // Show the exact rejection reason so the user knows what to fix
                 const detail = result.detail || "Processing failed";
-                const snrTxt = result.snr_db != null ? ` (SNR: ${result.snr_db.toFixed(1)} dB)` : "";
-                if (status) {
-                    status.textContent = `❌ ${detail}${snrTxt}`;
-                    status.className   = "text-center text-sm mb-4 text-red-400";
-                }
-                const btn = document.getElementById("record-btn");
-                if (btn) { btn.disabled = false; btn.textContent = "🎤 Try Again"; }
+                const snrTxt = result.snr_db != null
+                    ? ` (SNR: ${result.snr_db.toFixed(1)} dB)`
+                    : "";
+                this._setStatus(`❌ ${detail}${snrTxt}`, "text-red-400");
+                this._resetBtn();
                 return;
             }
 
-            // Show quality info in console for debugging
+            // Log quality
             if (result.snr_db != null) {
-                const q = result.snr_db > 25 ? "excellent" : result.snr_db > 15 ? "good" : result.snr_db > 8 ? "acceptable" : "poor";
-                console.log(`✅ Audio quality: ${q} (SNR=${result.snr_db.toFixed(1)}dB  voiced=${(result.voiced_fraction*100).toFixed(0)}%)`);
+                const q = result.snr_db > 25 ? "excellent"
+                        : result.snr_db > 15 ? "good"
+                        : result.snr_db > 8  ? "acceptable" : "poor";
+                console.log(`[SileroVAD] Audio quality: ${q} (SNR=${result.snr_db.toFixed(1)}dB  voiced=${(result.voiced_fraction*100).toFixed(0)}%)`);
             }
 
-            // Build full 62-feature dict
+            // Build full 62-feature dict (same as v3)
             const fullFeatureDict = {
                 mfcc_features:          result.mfcc_features          || [],
                 mfcc_std:               result.mfcc_std               || [],
@@ -398,15 +208,16 @@ const SpeechCapture = {
                 snr_db:                 result.snr_db                 || 0,
             };
 
+            // Route to enrollment or authentication callback (same as v3)
             if (typeof onVoiceAuthComplete === "function") {
-                if (status) status.textContent = "⏳ Verifying voice…";
+                this._setStatus("⏳ Verifying voice…", "text-yellow-400");
                 onVoiceAuthComplete(fullFeatureDict);
 
             } else if (typeof onVoiceRecorded === "function") {
-                if (status) {
-                    status.textContent = `✅ Recording ${this.currentAttempt} saved!`;
-                    status.className   = "text-center text-sm mb-4 text-green-400";
-                }
+                this._setStatus(
+                    `✅ Recording ${this.currentAttempt} saved!`,
+                    "text-green-400"
+                );
                 onVoiceRecorded(fullFeatureDict);
                 this.currentAttempt++;
 
@@ -425,15 +236,57 @@ const SpeechCapture = {
             }
 
         } catch (err) {
-            console.error("Audio processing error:", err);
-            if (status) {
-                status.textContent = "❌ Could not connect to server.";
-                status.className   = "text-center text-sm mb-4 text-red-400";
-            }
+            console.error("[SileroVAD] API error:", err);
+            this._setStatus("❌ Could not connect to server.", "text-red-400");
+            this._resetBtn();
         }
     },
 
-    blobToBase64(blob) {
+    // ── Float32Array → 16-bit PCM WAV Blob ───────────────────────────────
+    // Silero outputs Float32 at 16kHz. Backend expects WAV.
+    // This avoids the webm/ogg/mp4 format ambiguity that caused pydub errors.
+    _float32ToWav(samples, sampleRate) {
+        const numChannels = 1;
+        const bitsPerSample = 16;
+        const bytesPerSample = bitsPerSample / 8;
+        const blockAlign = numChannels * bytesPerSample;
+        const byteRate = sampleRate * blockAlign;
+        const dataSize = samples.length * bytesPerSample;
+        const bufferSize = 44 + dataSize;
+
+        const buffer = new ArrayBuffer(bufferSize);
+        const view   = new DataView(buffer);
+
+        // WAV header
+        const writeStr = (offset, str) => {
+            for (let i = 0; i < str.length; i++)
+                view.setUint8(offset + i, str.charCodeAt(i));
+        };
+        writeStr(0,  "RIFF");
+        view.setUint32(4,  36 + dataSize, true);
+        writeStr(8,  "WAVE");
+        writeStr(12, "fmt ");
+        view.setUint32(16, 16, true);            // chunk size
+        view.setUint16(20, 1,  true);            // PCM
+        view.setUint16(22, numChannels, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, byteRate, true);
+        view.setUint16(32, blockAlign, true);
+        view.setUint16(34, bitsPerSample, true);
+        writeStr(36, "data");
+        view.setUint32(40, dataSize, true);
+
+        // PCM samples: clamp Float32 [-1, 1] → Int16
+        let offset = 44;
+        for (let i = 0; i < samples.length; i++, offset += 2) {
+            const s = Math.max(-1, Math.min(1, samples[i]));
+            view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        }
+
+        return new Blob([buffer], { type: "audio/wav" });
+    },
+
+    _blobToBase64(blob) {
         return new Promise((resolve, reject) => {
             const reader     = new FileReader();
             reader.onloadend = () => resolve(reader.result.split(",")[1]);
@@ -442,50 +295,51 @@ const SpeechCapture = {
         });
     },
 
+    _resetBtn() {
+        const btn = document.getElementById("record-btn");
+        if (btn) {
+            btn.disabled    = false;
+            btn.textContent = "🎤 Try Again";
+            if (!btn.classList.contains("bg-red-600"))
+                btn.classList.replace("bg-gray-600", "bg-red-600");
+        }
+    },
+
     reset() {
-        this.audioChunks    = [];
+        if (this.myvad) {
+            try { this.myvad.destroy(); } catch (_) {}
+            this.myvad = null;
+        }
         this.isRecording    = false;
         this.currentAttempt = 1;
-        this.mediaRecorder  = null;
-        this.voiced         = false;
-        this.silenceStart   = null;
-        this.noiseFloor     = 0.0;
-        this.noiseEstimated = false;
-        if (this.audioContext) {
-            this.audioContext.close();
-            this.audioContext = null;
-        }
     }
 };
 
+
+// ── Global startRecording() — called by record-btn onclick ───────────────
 function startRecording() {
     const btn       = document.getElementById("record-btn");
     const indicator = document.getElementById("recording-indicator");
-    const status    = document.getElementById("voice-status");
     const diagTxt   = document.getElementById("diag-text");
 
     if (btn) {
         btn.disabled    = true;
-        btn.textContent = "🎤 Measuring…";
+        btn.textContent = "🎤 Initialising…";
         btn.classList.replace("bg-red-600", "bg-yellow-600");
     }
     if (indicator) {
         indicator.classList.remove("hidden");
         indicator.style.backgroundColor = "#f59e0b";
     }
-    if (status) {
-        status.textContent = "🔇 Stay quiet for a moment…";
-        status.className   = "text-center text-sm mb-4 text-yellow-400";
-    }
     if (diagTxt) diagTxt.textContent = "";
 
     SpeechCapture.reset();
     SpeechCapture.startRecording().then(ok => {
-        if (ok && btn) {
-            btn.textContent = "🎤 Listening…";
-            btn.classList.replace("bg-yellow-600", "bg-red-600");
-        } else if (!ok) {
-            if (btn) {
+        if (btn) {
+            if (ok) {
+                btn.textContent = "🎤 Listening…";
+                btn.classList.replace("bg-yellow-600", "bg-red-600");
+            } else {
                 btn.disabled    = false;
                 btn.textContent = "🎤 Try Again";
                 btn.classList.replace("bg-yellow-600", "bg-red-600");
