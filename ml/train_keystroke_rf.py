@@ -72,7 +72,7 @@ FEATURE_NAMES = [
     'dwell_mean_norm',  'dwell_std_norm',
     'flight_mean_norm', 'flight_std_norm',
     'p2p_std_norm',     'r2r_mean_norm',
-    'shift_lag_norm',   # FIX: was computed and stored but missing from model
+    'shift_lag_norm',
 ]
 
 COUNT_FEATURES = {'pause_count', 'backspace_count', 'seek_time_count'}
@@ -112,7 +112,14 @@ DIGRAPH_RANGE = (20, 300)
 #  DATA EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_feature_vector(template) -> np.ndarray:
+def extract_feature_vector(template, extra_keys: list = None) -> np.ndarray:
+    """
+    Build the feature vector for a template.
+    If extra_keys is provided (a list of digraph pair strings like ['pe','ea',...]),
+    those timings are appended from template.extra_digraphs after the standard
+    FEATURE_NAMES features.  This is the dynamic-digraph path for users enrolled
+    with unique passphrases.
+    """
     vals = []
     for name in FEATURE_NAMES:
         raw = getattr(template, name, 0.0)
@@ -123,6 +130,15 @@ def extract_feature_vector(template) -> np.ndarray:
                 vals.append(float(raw or 0.0))
             except (TypeError, ValueError):
                 vals.append(0.0)
+
+    if extra_keys:
+        extra_map = getattr(template, 'extra_digraphs', None) or {}
+        for pair in extra_keys:
+            try:
+                vals.append(float(extra_map.get(pair, 0.0) or 0.0))
+            except (TypeError, ValueError):
+                vals.append(0.0)
+
     return np.array(vals, dtype=np.float64)
 
 
@@ -148,7 +164,7 @@ def _is_quality_sample(vec: np.ndarray, feat_names: list = None) -> tuple:
     return True, "ok"
 
 
-def load_enrollment_samples(db, user_id: int):
+def load_enrollment_samples(db, user_id: int, extra_keys: list = None):
     templates = (
         db.query(KeystrokeTemplate)
         .filter(KeystrokeTemplate.user_id == user_id)
@@ -157,7 +173,7 @@ def load_enrollment_samples(db, user_id: int):
     )
     vectors = []
     for t in templates:
-        vec = extract_feature_vector(t)
+        vec = extract_feature_vector(t, extra_keys=extra_keys)
         ok, reason = _is_quality_sample(vec)
         if not ok:
             print(f"  ⚠  Skipping sample id={t.id}: {reason}")
@@ -167,10 +183,6 @@ def load_enrollment_samples(db, user_id: int):
 
 
 def load_real_impostors(db, exclude_user_id: int, n_genuine: int = 99):
-    # Skip real enrolled impostors when the genuine set is too small.
-    # With < 8 genuine samples the real-impostor pool can dominate and
-    # corrupt the decision boundary, causing the model to reject the
-    # legitimate user while accepting others.
     if n_genuine < 8:
         print(f"  Skipping real enrolled impostors (n_genuine={n_genuine} < 8) — using CMU + synthetic only")
         return []
@@ -194,10 +206,6 @@ def load_cmu_impostors() -> list:
         vecs = pickle.load(f)
     print(f"  CMU impostor profiles loaded: {len(vecs)} subjects")
 
-    # Validate that CMU vectors match current FEATURE_NAMES length.
-    # If the pkl was built with an older FEATURE_NAMES (e.g. 59 features before
-    # shift_lag_norm was added), the vectors will have the wrong length and will
-    # produce incorrectly-stripped arrays downstream.
     expected_len = len(FEATURE_NAMES)
     valid_vecs = [v for v in vecs if hasattr(v, '__len__') and len(v) == expected_len]
     if len(valid_vecs) != len(vecs):
@@ -220,27 +228,11 @@ def load_cmu_impostors() -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42, feat_names: list = None):
-    """
-    For 5 enrollment samples we need heavy augmentation to give the model
-    enough genuine examples to learn a tight boundary.
-
-    Key tuning vs v2:
-    - Noise tightened to 7% (was 10%) — keeps augmented samples close to
-      the genuine distribution so the boundary stays narrow
-    - n default raised to 600 (was 120) — more augmented genuine samples
-      compensate for the tiny real set
-    - Per-feature std floored at 5% of mean so features that are perfectly
-      consistent across 5 samples still get some augmentation spread
-    """
     rng  = np.random.default_rng(rng_seed)
     base = np.array(genuine_vectors)
     if feat_names is None:
         feat_names = FEATURE_NAMES
 
-    # Guard: feat_names must match the actual vector length.
-    # If they differ (e.g. vectors were already stripped but feat_names still
-    # refers to the full FEATURE_NAMES list), infer feat_names from the vector
-    # length to prevent "index N out of bounds for axis 0 with size N" crashes.
     vec_len = base.shape[1] if base.ndim == 2 else len(base[0])
     if len(feat_names) != vec_len:
         raise ValueError(
@@ -255,8 +247,6 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42, 
     else:
         within_std = np.abs(base[0]) * 0.07
 
-    # Floor: even perfectly consistent features get a tiny spread so the
-    # model doesn't overfit to exact values from 5 samples
     mean_vals  = np.abs(base.mean(axis=0))
     within_std = np.maximum(within_std, mean_vals * 0.05)
 
@@ -274,7 +264,6 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42, 
                 noisy[i] = float(np.clip(
                     noisy[i] + rng.normal(0, within_std[i] * 0.7 + 0.01), 0, 2))
             else:
-                # Tighter noise: 7% (was 10%)
                 factor  = rng.normal(1.0, 0.07)
                 factor  = np.clip(factor, 0.84, 1.16)
                 noisy[i] = noisy[i] * factor
@@ -289,20 +278,10 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42, 
 
 
 def generate_impostor_samples(profile_mean, profile_std, n: int = 1200, rng_seed: int = 42, feat_names: list = None):
-    """
-    With only 5 genuine samples, we need more synthetic impostors to
-    properly define the boundary on the other side.
-    n raised from 300 to 1200 for small enrollment sets.
-
-    Hard-negative strategy: for the 7 most discriminative features,
-    impostors must differ by at least 1.5σ from the enrolled user.
-    This pushes the decision boundary closer to the genuine cluster.
-    """
     rng = np.random.default_rng(rng_seed)
     if feat_names is None:
         feat_names = FEATURE_NAMES
 
-    # Guard: profile_mean/std must match feat_names length.
     if len(profile_mean) != len(feat_names):
         raise ValueError(
             f"generate_impostor_samples: profile_mean has {len(profile_mean)} entries "
@@ -321,7 +300,7 @@ def generate_impostor_samples(profile_mean, profile_std, n: int = 1200, rng_seed
         for i, name in enumerate(feat_names):
             if name in HUMAN_RANGES:
                 lo, hi = HUMAN_RANGES[name]
-            elif name.startswith('digraph_'):
+            elif name.startswith('digraph_') or name.startswith('extra_'):
                 lo, hi = DIGRAPH_RANGE
             else:
                 lo = profile_mean[i] * 0.3
@@ -345,11 +324,6 @@ def generate_impostor_samples(profile_mean, profile_std, n: int = 1200, rng_seed
 # ─────────────────────────────────────────────────────────────────────────────
 
 def mahalanobis_score(vec, profile_mean, profile_std):
-    """
-    Diagonal Mahalanobis using variance (std²) — accounts for each feature's
-    natural spread rather than treating all features equally (old version used
-    mean absolute z-score which treated all features identically).
-    """
     var      = profile_std ** 2
     safe_var = np.where(var < 1e-10, 1e-10, var)
     diff     = vec - profile_mean
@@ -364,13 +338,6 @@ def mahalanobis_score(vec, profile_mean, profile_std):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_pipeline(n_enrollment: int) -> Pipeline:
-    """
-    GradientBoosting works better than RandomForest when genuine samples
-    are very few (≤7). It builds trees sequentially focusing on hard
-    misclassified cases, which sharpens the boundary near the genuine cluster.
-    RandomForest is preferred once the genuine set is larger (>7) because
-    it's more stable and parallelises well.
-    """
     if n_enrollment <= 7:
         print(f"  Using GradientBoosting (n_enrollment={n_enrollment} ≤ 7)")
         clf = GradientBoostingClassifier(
@@ -399,8 +366,7 @@ def build_pipeline(n_enrollment: int) -> Pipeline:
 
 
 def _safe_filename(username: str) -> str:
-    """Sanitize email address for use as a filename.
-    user@gmail.com → user_at_gmail_com (safe on all OS)"""
+    """user@gmail.com → user_at_gmail_com (safe on all OS)"""
     return username.replace("@", "_at_").replace(".", "_").replace(" ", "_")
 
 
@@ -408,28 +374,37 @@ def _safe_filename(username: str) -> str:
 #  PHRASE-AWARE DIGRAPH FILTERING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_active_digraphs(phrase: str) -> set:
+def get_active_digraphs(phrase: str) -> tuple:
     """
-    Return the set of digraph feature names that actually appear in the
-    user's assigned phrase.  Digraphs NOT in the phrase will always be 0
-    at both enrollment and login — keeping them only teaches the model
-    'zero = genuine' which is wrong and hurts accuracy.
+    Return two values:
+      - standard_active : digraph feature names from FEATURE_NAMES that appear in phrase
+      - extra_pairs     : letter pairs in the phrase NOT in FEATURE_NAMES (stored in
+                          extra_digraphs JSON column and appended to the feature vector)
 
-    Example:
-        phrase = "maple stone orbit"
-        → digraph_ma, digraph_ap, digraph_pl, digraph_le, digraph_st,
-          digraph_to, digraph_on, digraph_ne, digraph_or, digraph_rb,
-          digraph_bi, digraph_it  (only those also in FEATURE_NAMES)
+    Example for phrase "pearl proof thing large":
+        standard_active = {'digraph_th', 'digraph_ro'}   (only 2 of the 27 hardcoded)
+        extra_pairs     = ['pe','ea','ar','rl','pr','oo','of','hi','in','ng','la','rg']
     """
     all_digraph_features = {f for f in FEATURE_NAMES if f.startswith("digraph_")}
     phrase_clean = phrase.lower().replace(" ", "")
-    present = set()
+    seen = set()
+    standard_active = set()
+    extra_pairs = []
+
     for i in range(len(phrase_clean) - 1):
         pair = phrase_clean[i] + phrase_clean[i + 1]
+        if pair in seen:
+            continue
+        if not pair.isalpha():
+            continue
+        seen.add(pair)
         feat = f"digraph_{pair}"
         if feat in all_digraph_features:
-            present.add(feat)
-    return present
+            standard_active.add(feat)
+        else:
+            extra_pairs.append(pair)
+
+    return standard_active, extra_pairs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -437,12 +412,6 @@ def get_active_digraphs(phrase: str) -> set:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train_random_forest(username: str):
-    # ── Phase 1: Fetch all data from DB then close immediately ───────────────
-    # Supabase closes idle connections after ~60 seconds.
-    # Training (cross-validation) takes 30–120 seconds.
-    # If the DB stays open during training it will time out and crash on close.
-    # Solution: load everything into memory first, close the connection,
-    # then do all computation with no DB connection open.
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.username == username).first()
@@ -455,7 +424,6 @@ def train_random_forest(username: str):
             print("❌ No valid enrollment samples found.")
             return None
 
-        # Load impostor data while DB is still open
         cmu_impostors  = load_cmu_impostors()
         real_impostors = load_real_impostors(db, user.id, n_genuine=len(genuine_vectors))
         user_id        = user.id
@@ -465,33 +433,58 @@ def train_random_forest(username: str):
         try:
             db.close()
         except Exception:
-            pass  # already timed out — safe to ignore
+            pass
 
-    # ── Phase 2: All training in memory — no DB connection needed ────────────
     print(f"\n{'='*70}")
     print(f"  KEYSTROKE RF TRAINING v4  —  user: {username}")
     print(f"{'='*70}")
 
+    # ── Phrase-aware digraph filtering ────────────────────────────────────────
+    # get_active_digraphs returns TWO values:
+    #   standard_active : subset of the 27 hardcoded FEATURE_NAMES digraphs
+    #   extra_pairs     : all other bigrams in the phrase (stored in extra_digraphs JSON)
+    standard_active, extra_pairs = get_active_digraphs(user_phrase)
+    all_digraph_feats = {f for f in FEATURE_NAMES if f.startswith("digraph_")}
+    inactive_digraphs = all_digraph_feats - standard_active
+    drop_indices      = [i for i, n in enumerate(FEATURE_NAMES) if n in inactive_digraphs]
+    active_feat_names = (
+        [n for n in FEATURE_NAMES if n not in inactive_digraphs]
+        + [f"extra_{p}" for p in extra_pairs]
+    )
+
+    # Reload genuine samples WITH extra_keys so extra_digraphs are appended
+    db2 = SessionLocal()
+    try:
+        genuine_vectors = load_enrollment_samples(db2, user_id, extra_keys=extra_pairs)
+        if not genuine_vectors:
+            print("❌ No valid enrollment samples found.")
+            return None
+    finally:
+        try:
+            db2.close()
+        except Exception:
+            pass
+
     n_genuine_real = len(genuine_vectors)
     print(f"\n  Enrollment samples loaded: {n_genuine_real}")
 
-    # ── Phrase-aware digraph filtering ────────────────────────────────────────
-    # Drop digraph features not present in the user's phrase.
-    # Inactive digraphs are always 0 at both enrollment and login —
-    # keeping them teaches the model "zero = genuine" which is incorrect.
-    active_digraphs   = get_active_digraphs(user_phrase)
-    all_digraph_feats = {f for f in FEATURE_NAMES if f.startswith("digraph_")}
-    inactive_digraphs = all_digraph_feats - active_digraphs
-    drop_indices      = [i for i, n in enumerate(FEATURE_NAMES) if n in inactive_digraphs]
-    active_feat_names = [n for n in FEATURE_NAMES if n not in inactive_digraphs]
-
     def _strip_inactive(vecs):
-        return [np.delete(v, drop_indices) for v in vecs]
+        """Strip inactive hardcoded digraphs; pad zeros for extra_pairs on impostor vecs."""
+        stripped = []
+        for v in vecs:
+            base = np.delete(v[:len(FEATURE_NAMES)], drop_indices)
+            if len(v) > len(FEATURE_NAMES):
+                extra = v[len(FEATURE_NAMES):]
+            else:
+                extra = np.zeros(len(extra_pairs))
+            stripped.append(np.concatenate([base, extra]))
+        return stripped
 
     genuine_vectors = _strip_inactive(genuine_vectors)
 
     print(f"  User phrase      : '{user_phrase}'")
-    print(f"  Active digraphs  : {len(active_digraphs)}  ({', '.join(sorted(active_digraphs)) or 'none'})")
+    print(f"  Standard active  : {len(standard_active)}  ({', '.join(sorted(standard_active)) or 'none'})")
+    print(f"  Extra pairs      : {len(extra_pairs)}  ({', '.join(extra_pairs) or 'none'})")
     print(f"  Dropped digraphs : {len(inactive_digraphs)}")
     print(f"  Active features  : {len(active_feat_names)} (was {len(FEATURE_NAMES)})")
 
@@ -521,22 +514,20 @@ def train_random_forest(username: str):
         if feat in fn:
             print(f"    {label:20s}: {profile_mean[fn.index(feat)]:.3f}")
 
-    # Scale augmentation count to enrollment size
     n_aug     = max(600, n_genuine_real * 120)
     n_imp_syn = max(1200, n_aug * 2)
 
     genuine_aug = generate_genuine_samples(genuine_vectors, n=n_aug, feat_names=active_feat_names)
 
-    # Strip inactive digraphs from impostor pools too so dimensions match
     cmu_impostors  = _strip_inactive(cmu_impostors)
     real_impostors = _strip_inactive(real_impostors)
     real_pool      = cmu_impostors + real_impostors
 
-    n_synthetic     = max(0, n_imp_syn - len(real_pool))
-    syn_impostors   = generate_impostor_samples(
+    n_synthetic   = max(0, n_imp_syn - len(real_pool))
+    syn_impostors = generate_impostor_samples(
         profile_mean, profile_std, n=n_synthetic, feat_names=active_feat_names
     ) if n_synthetic > 0 else []
-    all_impostors   = real_pool + syn_impostors
+    all_impostors = real_pool + syn_impostors
 
     n_feats = len(active_feat_names)
     def _is_valid(v):
@@ -597,16 +588,13 @@ def train_random_forest(username: str):
             marker      = " ◄ best EER"
         print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}{marker}")
 
-    # Floor threshold at 0.45 — never go lower regardless of EER optimum
     final_thresh = max(best_thresh, 0.45)
 
-    # For highly variable typers, lower slightly to reduce false rejects
     if consistency_cv > 0.25:
         final_thresh = max(final_thresh - 0.04, 0.42)
         print(f"\n  ⚠  High variability (CV={consistency_cv:.2f}) → "
               f"threshold adjusted to {final_thresh:.2f}")
 
-    # Report final metrics at chosen threshold
     y_final = (y_prob_cv >= final_thresh).astype(int)
     cm_f    = confusion_matrix(y, y_final)
     tn_f, fp_f, fn_f, tp_f = cm_f.ravel()
@@ -621,7 +609,6 @@ def train_random_forest(username: str):
     print(f"\n  Training final model on full dataset ...")
     pipeline.fit(X, y)
 
-    # Feature importance (works for both RF and GBM)
     try:
         clf_step = pipeline.named_steps["clf"]
         importances = clf_step.feature_importances_
@@ -638,9 +625,9 @@ def train_random_forest(username: str):
 
     model_data = {
         'pipeline':       pipeline,
-        'feature_names':  active_feat_names,   # only features present in user's phrase
+        'feature_names':  active_feat_names,
         'username':       username,
-        'user_id':        user.id,
+        'user_id':        user_id,
         'n_enrollment':   n_genuine_real,
         'profile_mean':   profile_mean,
         'profile_std':    profile_std,
@@ -650,7 +637,7 @@ def train_random_forest(username: str):
         'far':            float(far_f),
         'frr':            float(frr_f),
         'eer':            float(best_eer),
-        'phrase':         user_phrase,         # stored for reference/debugging
+        'phrase':         user_phrase,
     }
 
     model_path = os.path.join(model_dir, f"{_safe_filename(username)}_keystroke_rf.pkl")
@@ -686,10 +673,16 @@ def predict_keystroke(username: str, feature_dict: dict) -> dict:
     profile_std  = model_data['profile_std']
     threshold    = model_data['threshold']
 
-    vec = np.array([
-        float(feature_dict.get(name, 0.0) or 0.0)
-        for name in feat_names
-    ])
+    # extra_digraphs from the login payload (dict of pair → mean_ms)
+    extra_map = feature_dict.get('extra_digraphs') or {}
+
+    def _get_val(name):
+        if name.startswith('extra_'):
+            pair = name[len('extra_'):]
+            return float(extra_map.get(pair, 0.0) or 0.0)
+        return float(feature_dict.get(name, 0.0) or 0.0)
+
+    vec = np.array([_get_val(n) for n in feat_names])
 
     ok, reason = _is_quality_sample(vec, feat_names)
     if not ok:

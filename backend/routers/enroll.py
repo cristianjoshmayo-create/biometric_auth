@@ -242,6 +242,7 @@ class KeystrokeEnroll(BaseModel):
     p2p_std_norm:     float = 0
     r2r_mean_norm:    float = 0
     shift_lag_norm:   float = 0
+    extra_digraphs:   Optional[dict] = {}
 
 
 class VoiceEnroll(VoiceFeatures):
@@ -401,6 +402,7 @@ def enroll_keystroke(payload: KeystrokeEnroll, db: Session = Depends(get_db)):
         p2p_std_norm            = payload.p2p_std_norm,
         r2r_mean_norm           = payload.r2r_mean_norm,
         shift_lag_norm          = payload.shift_lag_norm,
+        extra_digraphs          = payload.extra_digraphs or {},
     )
     db.add(template)
     db.commit()

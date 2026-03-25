@@ -24,12 +24,10 @@ const KeystrokeCapture = {
         right_pinky:  new Set('p0'),
     },
 
-    trackedDigraphs: [
-        'bi','io','om','me','et','tr','ri','ic',
-        'vo','oi','ce',
-        'ke','ey','ys','st','ro','ok',
-        'au','ut','th','he','en','nt','ti','ca','at','on'
-    ],
+    // Populated dynamically by setPhrase() — all letter pairs in the user's phrase.
+    // This replaces the old hardcoded list which was designed for a fixed passphrase
+    // and left ~25 digraphs as permanent zeros for any other phrase.
+    trackedDigraphs: [],
 
     attach(inputElementId) {
         const input = document.getElementById(inputElementId);
@@ -308,8 +306,12 @@ const KeystrokeCapture = {
             shift_lag_std:   _std(shiftLags),
             shift_lag_count: shiftLags.length,
 
-            // Raw arrays for database storage
-            dwell_times:  dwellTimes,
+            // extra_digraphs: phrase-specific bigram timings sent to backend as a
+            // separate JSON dict so the DB/model can use them without schema changes
+            // to the 27 hardcoded digraph columns.
+            extra_digraphs: Object.fromEntries(
+                this.trackedDigraphs.map(dg => [dg, _mean(digraphMap[dg])])
+            ),
             flight_times: flightTimes,
             typing_speed: typingSpeedCpm / 60,
         };
@@ -341,6 +343,26 @@ const KeystrokeCapture = {
 
     setPhrase(phrase) {
         this.targetPhrase = phrase.trim();
+
+        // Compute all unique letter-pair bigrams that actually appear in this
+        // phrase (spaces stripped, lowercased).  Only these will be non-zero at
+        // both enrollment AND login, so the model never learns "zero = genuine".
+        const clean = phrase.toLowerCase().replace(/\s+/g, '');
+        const seen  = new Set();
+        const pairs = [];
+        for (let i = 0; i < clean.length - 1; i++) {
+            const pair = clean[i] + clean[i + 1];
+            // Only track alphabetic pairs (skip if either char is not a-z)
+            if (/^[a-z]{2}$/.test(pair) && !seen.has(pair)) {
+                seen.add(pair);
+                pairs.push(pair);
+            }
+        }
+        this.trackedDigraphs = pairs;
+        console.log(
+            `[KeystrokeCapture] Dynamic digraphs for phrase "${phrase}":`,
+            pairs.join(', ') || '(none)'
+        );
     },
 
     reset() {

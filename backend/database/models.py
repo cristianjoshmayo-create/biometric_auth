@@ -2,7 +2,7 @@
 
 from sqlalchemy import (
     Column, Integer, String, Float,
-    ARRAY, ForeignKey, DateTime, Text, Boolean
+    ARRAY, ForeignKey, DateTime, Text, Boolean, JSON
 )
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -32,8 +32,8 @@ class KeystrokeTemplate(Base):
     user_id            = Column(Integer, ForeignKey("users.id"), nullable=False)
     attempt_number     = Column(Integer, default=1)
     enrollment_session = Column(Integer, default=1)
-    sample_order       = Column(Integer, default=0)   # ← ADD THIS
-    source             = Column(String(50), default="enrollment")  # ← ADD THIS
+    sample_order       = Column(Integer, default=0)
+    source             = Column(String(50), default="enrollment")
 
     dwell_times  = Column(ARRAY(Float), nullable=False)
     flight_times = Column(ARRAY(Float), nullable=False)
@@ -82,6 +82,13 @@ class KeystrokeTemplate(Base):
     digraph_at = Column(Float, default=0)
     digraph_on = Column(Float, default=0)
 
+    # Phrase-specific digraph timings — all letter pairs that appear in the
+    # user's unique passphrase.  Stored as {pair: mean_ms, ...} so the model
+    # can use them without adding new Float columns per user.
+    # Required DB migration (run once):
+    #   ALTER TABLE keystroke_templates ADD COLUMN extra_digraphs JSON DEFAULT '{}';
+    extra_digraphs = Column(JSON, default=dict)
+
     typing_speed_cpm        = Column(Float, default=0)
     typing_duration         = Column(Float, default=0)
     rhythm_mean             = Column(Float, default=0)
@@ -120,42 +127,27 @@ class VoiceTemplate(Base):
     user_id        = Column(Integer, ForeignKey("users.id"), nullable=False)
     attempt_number = Column(Integer, default=1)
 
-    # 13 MFCC means — spectral shape of voice
     mfcc_features = Column(ARRAY(Float), nullable=False)
-    # 13 MFCC stds — how much each coefficient varies (new)
     mfcc_std      = Column(ARRAY(Float), default=list)
 
-    # Pitch — fundamental frequency, highly speaker-specific
     pitch_mean = Column(Float, default=0)
     pitch_std  = Column(Float, default=0)
 
-    # Speaking rate — how fast the phrase is spoken
     speaking_rate = Column(Float, default=0)
 
-    # Energy
     energy_mean = Column(Float, default=0)
     energy_std  = Column(Float, default=0)
 
-    # Spectral
     zcr_mean               = Column(Float, default=0)
     spectral_centroid_mean = Column(Float, default=0)
     spectral_rolloff_mean  = Column(Float, default=0)
 
-    # NEW v2 — required for 62-feature improved model
-    # Delta MFCCs: capture temporal dynamics (HOW the voice changes over time)
     delta_mfcc_mean  = Column(ARRAY(Float), default=list)
     delta2_mfcc_mean = Column(ARRAY(Float), default=list)
 
-    # Spectral flux: average frame-to-frame spectral change
-    # Distinguishes voiced speech from erratic background noise
     spectral_flux_mean = Column(Float, default=0)
-
-    # Voiced fraction: what % of the recording was classified as voiced
-    # Low voiced_fraction → recording contained too much silence/noise
-    voiced_fraction = Column(Float, default=0)
-
-    # SNR estimate at enrollment time (for quality tracking / debugging)
-    snr_db = Column(Float, default=0)
+    voiced_fraction    = Column(Float, default=0)
+    snr_db             = Column(Float, default=0)
 
     enrolled_at = Column(DateTime, default=func.now())
     user = relationship("User", back_populates="voice_template")
