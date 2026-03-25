@@ -126,18 +126,25 @@ def extract_feature_vector(template) -> np.ndarray:
     return np.array(vals, dtype=np.float64)
 
 
-def _is_quality_sample(vec: np.ndarray) -> tuple:
-    idx        = {name: i for i, name in enumerate(FEATURE_NAMES)}
-    dwell_mean = vec[idx['dwell_mean']]
-    dwell_std  = vec[idx['dwell_std']]
-    p2p_mean   = vec[idx['p2p_mean']]
-    cpm        = vec[idx['typing_speed_cpm']]
+def _is_quality_sample(vec: np.ndarray, feat_names: list = None) -> tuple:
+    names = feat_names if feat_names is not None else FEATURE_NAMES
+    idx   = {name: i for i, name in enumerate(names)}
 
-    if dwell_mean < 20:   return False, f"dwell_mean too low ({dwell_mean:.0f}ms)"
-    if dwell_mean > 600:  return False, f"dwell_mean too high ({dwell_mean:.0f}ms)"
-    if p2p_mean   < 50:   return False, f"p2p_mean impossibly fast ({p2p_mean:.0f}ms)"
-    if dwell_std  < 1.0:  return False, "dwell_std ≈ 0 (automated/copy-paste)"
-    if cpm        > 800:  return False, f"typing_speed_cpm impossibly high ({cpm:.0f})"
+    def _get(key):
+        i = idx.get(key)
+        return vec[i] if i is not None and i < len(vec) else None
+
+    dwell_mean = _get('dwell_mean')
+    dwell_std  = _get('dwell_std')
+    p2p_mean   = _get('p2p_mean')
+    cpm        = _get('typing_speed_cpm')
+
+    if dwell_mean is not None:
+        if dwell_mean < 20:  return False, f"dwell_mean too low ({dwell_mean:.0f}ms)"
+        if dwell_mean > 600: return False, f"dwell_mean too high ({dwell_mean:.0f}ms)"
+    if p2p_mean  is not None and p2p_mean  < 50:  return False, f"p2p_mean impossibly fast ({p2p_mean:.0f}ms)"
+    if dwell_std is not None and dwell_std < 1.0:  return False, "dwell_std ≈ 0 (automated/copy-paste)"
+    if cpm       is not None and cpm       > 800:  return False, f"typing_speed_cpm impossibly high ({cpm:.0f})"
     return True, "ok"
 
 
@@ -193,7 +200,7 @@ def load_cmu_impostors() -> list:
 #  AUGMENTATION — tuned for small enrollment sets (5 samples)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42):
+def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42, feat_names: list = None):
     """
     For 5 enrollment samples we need heavy augmentation to give the model
     enough genuine examples to learn a tight boundary.
@@ -208,6 +215,8 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42):
     """
     rng  = np.random.default_rng(rng_seed)
     base = np.array(genuine_vectors)
+    if feat_names is None:
+        feat_names = FEATURE_NAMES
 
     if base.shape[0] > 1:
         within_std = base.std(axis=0)
@@ -226,7 +235,7 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42):
         idx   = rng.integers(0, len(genuine_vectors))
         noisy = genuine_vectors[idx].copy()
 
-        for i, name in enumerate(FEATURE_NAMES):
+        for i, name in enumerate(feat_names):
             if name in COUNT_FEATURES:
                 noisy[i] = max(0, noisy[i] + rng.integers(-1, 2))
             elif name in RATIO_FEATURES:
@@ -238,7 +247,7 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42):
                 factor  = np.clip(factor, 0.84, 1.16)
                 noisy[i] = noisy[i] * factor
 
-        ok, _ = _is_quality_sample(noisy)
+        ok, _ = _is_quality_sample(noisy, feat_names)
         if ok:
             samples.append(noisy)
 
@@ -247,7 +256,7 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42):
     return samples
 
 
-def generate_impostor_samples(profile_mean, profile_std, n: int = 1200, rng_seed: int = 42):
+def generate_impostor_samples(profile_mean, profile_std, n: int = 1200, rng_seed: int = 42, feat_names: list = None):
     """
     With only 5 genuine samples, we need more synthetic impostors to
     properly define the boundary on the other side.
@@ -258,6 +267,8 @@ def generate_impostor_samples(profile_mean, profile_std, n: int = 1200, rng_seed
     This pushes the decision boundary closer to the genuine cluster.
     """
     rng = np.random.default_rng(rng_seed)
+    if feat_names is None:
+        feat_names = FEATURE_NAMES
 
     KEY_FEATURES = {
         'dwell_mean', 'flight_mean', 'p2p_mean', 'typing_speed_cpm',
@@ -266,8 +277,8 @@ def generate_impostor_samples(profile_mean, profile_std, n: int = 1200, rng_seed
 
     samples = []
     for _ in range(n):
-        vec = np.zeros(len(FEATURE_NAMES))
-        for i, name in enumerate(FEATURE_NAMES):
+        vec = np.zeros(len(feat_names))
+        for i, name in enumerate(feat_names):
             if name in HUMAN_RANGES:
                 lo, hi = HUMAN_RANGES[name]
             elif name.startswith('digraph_'):
@@ -474,7 +485,7 @@ def train_random_forest(username: str):
     n_aug     = max(600, n_genuine_real * 120)
     n_imp_syn = max(1200, n_aug * 2)
 
-    genuine_aug = generate_genuine_samples(genuine_vectors, n=n_aug)
+    genuine_aug = generate_genuine_samples(genuine_vectors, n=n_aug, feat_names=active_feat_names)
 
     # Strip inactive digraphs from impostor pools too so dimensions match
     cmu_impostors  = _strip_inactive(cmu_impostors)
@@ -483,7 +494,7 @@ def train_random_forest(username: str):
 
     n_synthetic     = max(0, n_imp_syn - len(real_pool))
     syn_impostors   = generate_impostor_samples(
-        profile_mean, profile_std, n=n_synthetic
+        profile_mean, profile_std, n=n_synthetic, feat_names=active_feat_names
     ) if n_synthetic > 0 else []
     all_impostors   = real_pool + syn_impostors
 
@@ -574,7 +585,7 @@ def train_random_forest(username: str):
     try:
         clf_step = pipeline.named_steps["clf"]
         importances = clf_step.feature_importances_
-        pairs = sorted(zip(FEATURE_NAMES, importances), key=lambda x: x[1], reverse=True)
+        pairs = sorted(zip(active_feat_names, importances), key=lambda x: x[1], reverse=True)
         print(f"\n  TOP 10 MOST IMPORTANT FEATURES")
         for i, (feat, imp) in enumerate(pairs[:10], 1):
             bar = "█" * int(imp * 200)
@@ -640,7 +651,7 @@ def predict_keystroke(username: str, feature_dict: dict) -> dict:
         for name in feat_names
     ])
 
-    ok, reason = _is_quality_sample(vec)
+    ok, reason = _is_quality_sample(vec, feat_names)
     if not ok:
         return {
             'match':      False,

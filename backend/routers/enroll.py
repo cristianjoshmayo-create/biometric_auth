@@ -129,7 +129,7 @@ def _run_training(username: str):
 
 
 def trigger_training(username: str):
-    t = threading.Thread(target=_run_training, args=(username,), daemon=True)
+    t = threading.Thread(target=_run_training, args=(username,), daemon=False)
     t.start()
 
 
@@ -152,7 +152,7 @@ def _run_voice_training(username: str):
 
 
 def trigger_voice_training(username: str):
-    t = threading.Thread(target=_run_voice_training, args=(username,), daemon=True)
+    t = threading.Thread(target=_run_voice_training, args=(username,), daemon=False)
     t.start()
 
 
@@ -279,7 +279,7 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
 
     existing = db.query(User).filter(User.username == email).first()
     if existing:
-        return {"success": True, "message": "User already exists", "user_id": existing.id, "phrase": existing.phrase}
+        raise HTTPException(status_code=409, detail="An account with this email already exists. Please log in instead.")
 
     if len(payload.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
@@ -425,6 +425,40 @@ def enroll_keystroke(payload: KeystrokeEnroll, db: Session = Depends(get_db)):
 
 
 @router.post("/voice")
+def _mfcc_cosine_similarity(a: list, b: list) -> float:
+    """Cosine similarity between two MFCC mean vectors."""
+    va = np.array(a[:13], dtype=np.float64)
+    vb = np.array(b[:13], dtype=np.float64)
+    norm = np.linalg.norm(va) * np.linalg.norm(vb)
+    return float(np.dot(va, vb) / norm) if norm > 1e-9 else 0.0
+
+
+def _check_voice_consistency(existing_templates, new_mfcc: list) -> tuple:
+    """
+    Compare the new MFCC vector against all previously saved enrollment
+    samples using cosine similarity on the first 13 MFCC coefficients.
+
+    Returns (is_consistent: bool, min_similarity: float, message: str).
+    Threshold 0.72 — below this the recordings are too different in timbre
+    to reliably belong to the same speaker in the same conditions.
+    """
+    CONSISTENCY_THRESHOLD = 0.72
+    min_sim = 1.0
+    for t in existing_templates:
+        if not t.mfcc_features:
+            continue
+        sim = _mfcc_cosine_similarity(list(t.mfcc_features), new_mfcc)
+        if sim < min_sim:
+            min_sim = sim
+    if min_sim < CONSISTENCY_THRESHOLD:
+        return False, min_sim, (
+            f"This recording sounds too different from your previous ones "
+            f"(similarity {min_sim:.0%}, need ≥{CONSISTENCY_THRESHOLD:.0%}). "
+            "Try recording in the same spot, same distance from the mic."
+        )
+    return True, min_sim, "ok"
+
+
 def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == payload.username).first()
     if not user:
@@ -437,9 +471,30 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
     if missing_features:
         print(f"⚠  PARTIAL ENROLLMENT for '{payload.username}': missing features")
 
-    existing_count = db.query(VoiceTemplate).filter(
+    existing_templates = db.query(VoiceTemplate).filter(
         VoiceTemplate.user_id == user.id
-    ).count()
+    ).all()
+    existing_count = len(existing_templates)
+
+    # ── Consistency check (only once we have at least 1 prior sample) ────────
+    # Compare new MFCC against every saved sample. If any pairwise similarity
+    # is below the threshold, reject the sample and ask the user to re-record.
+    # We do NOT save the bad sample — the attempt counter stays the same.
+    if existing_count >= 1 and payload.mfcc_features:
+        consistent, sim, msg = _check_voice_consistency(
+            existing_templates, list(payload.mfcc_features)
+        )
+        if not consistent:
+            print(f"⚠  Voice consistency fail for '{payload.username}': "
+                  f"sim={sim:.2f} — sample rejected")
+            return {
+                "success":             True,   # request itself succeeded
+                "consistency_warning": True,   # but sample was rejected
+                "message":             msg,
+                "attempt_number":      existing_count,  # counter unchanged
+                "similarity":          round(sim, 3),
+                "training_started":    False,
+            }
 
     template = VoiceTemplate(
         user_id               = user.id,
@@ -475,12 +530,13 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
         trigger_voice_training(payload.username)
 
     return {
-        "success":           True,
-        "message":           f"Voice attempt #{attempt_num} saved",
-        "attempt_number":    attempt_num,
-        "has_full_features": not missing_features,
-        "training_started":  training_started,
-        "training_note":     "Voice model training started in background." if training_started else "",
+        "success":             True,
+        "consistency_warning": False,
+        "message":             f"Voice attempt #{attempt_num} saved",
+        "attempt_number":      attempt_num,
+        "has_full_features":   not missing_features,
+        "training_started":    training_started,
+        "training_note":       "Voice model training started in background." if training_started else "",
     }
 
 

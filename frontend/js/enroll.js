@@ -439,6 +439,19 @@ async function onVoiceRecorded(fullFeatureDict) {
             return;
         }
 
+        // ── Consistency check failed — sample rejected, ask user to redo ──
+        if (result.consistency_warning) {
+            status.textContent = "⚠️ " + result.message;
+            status.className   = "text-center text-sm mb-4 text-yellow-400";
+
+            const btn = document.getElementById("record-btn");
+            if (btn) {
+                btn.disabled    = false;
+                btn.textContent = `🎤 Re-record ${voiceAttemptsSaved + 1}/${VOICE_TARGET}`;
+            }
+            return;  // counter unchanged — user records the same slot again
+        }
+
         voiceAttemptsSaved = result.attempt_number;
         saveEnrollState("voice");
         updateVoiceAttemptUI(voiceAttemptsSaved);
