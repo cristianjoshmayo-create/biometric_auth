@@ -271,15 +271,14 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             authenticated = False
 
     else:
-        print(f"[keystroke] No RF model for '{payload.username}', using fallback")
-        template = db.query(KeystrokeTemplate).filter(
-            KeystrokeTemplate.user_id == user.id
-        ).first()
-        if not template:
-            raise HTTPException(status_code=404, detail="No keystroke template found")
-
-        confidence    = feature_similarity(template.dwell_times, payload.dwell_times, 0.35)
-        authenticated = confidence >= 0.40
+        # No trained model — hard reject.
+        # The old dwell-time similarity fallback (threshold 0.40) was too
+        # loose and granted access to anyone with a vaguely similar typing
+        # speed.  Until the RF model is trained, deny all keystroke attempts
+        # so the user falls through to voice → security question.
+        print(f"[keystroke] No RF model for '{payload.username}' — hard reject until model is trained")
+        confidence    = 0.0
+        authenticated = False
 
     print(f"[keystroke] user={payload.username}  "
           f"confidence={confidence:.3f}  result={'PASS' if authenticated else 'FAIL'}")
@@ -289,9 +288,12 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
 
     # ═════════════════════════════════════════════════════════════════
     # ADAPTIVE LEARNING: Save login sample + Auto-retrain
+    # Only save high-confidence matches — borderline passes risk saving
+    # an impostor's sample as genuine data, corrupting the model.
     # ═════════════════════════════════════════════════════════════════
+    SAVE_CONFIDENCE_MINIMUM = 0.70
 
-    if authenticated:
+    if authenticated and confidence >= SAVE_CONFIDENCE_MINIMUM:
         # Get current sample count
         total_samples = db.query(KeystrokeTemplate).filter(
             KeystrokeTemplate.user_id == user.id

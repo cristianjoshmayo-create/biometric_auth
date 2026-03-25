@@ -1,7 +1,16 @@
 # ml/train_keystroke_rf.py
-# v3 — max reliability from 5 enrollment samples
+# v4 — unique-phrase-per-user support
 #
-# Key changes vs v2:
+# Key changes vs v3:
+#  1. get_active_digraphs() — only digraphs present in the user's actual
+#     phrase are kept; inactive digraphs are dropped before training so
+#     the model never learns "zero digraph = genuine".
+#  2. load_real_impostors() now accepts n_genuine and skips real enrolled
+#     impostors when the genuine set is too small (< 8 samples), preventing
+#     the model boundary from being contaminated when only a few users exist.
+#  3. Fallback in auth is now a hard reject (no loose dwell-time comparison).
+#
+# Key changes vs v2 (carried over from v3):
 #  1. shift_lag_norm added to FEATURE_NAMES (was computed/stored but ignored)
 #  2. CMU digraphs fixed — plausible timing estimates instead of all-zero
 #  3. Augmentation scaled harder for small sets (5 samples → 600 genuine aug)
@@ -150,7 +159,14 @@ def load_enrollment_samples(db, user_id: int):
     return vectors
 
 
-def load_real_impostors(db, exclude_user_id: int):
+def load_real_impostors(db, exclude_user_id: int, n_genuine: int = 99):
+    # Skip real enrolled impostors when the genuine set is too small.
+    # With < 8 genuine samples the real-impostor pool can dominate and
+    # corrupt the decision boundary, causing the model to reject the
+    # legitimate user while accepting others.
+    if n_genuine < 8:
+        print(f"  Skipping real enrolled impostors (n_genuine={n_genuine} < 8) — using CMU + synthetic only")
+        return []
     other_users = db.query(User).filter(User.id != exclude_user_id).all()
     impostors   = []
     for u in other_users:
@@ -338,6 +354,34 @@ def _safe_filename(username: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  PHRASE-AWARE DIGRAPH FILTERING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_active_digraphs(phrase: str) -> set:
+    """
+    Return the set of digraph feature names that actually appear in the
+    user's assigned phrase.  Digraphs NOT in the phrase will always be 0
+    at both enrollment and login — keeping them only teaches the model
+    'zero = genuine' which is wrong and hurts accuracy.
+
+    Example:
+        phrase = "maple stone orbit"
+        → digraph_ma, digraph_ap, digraph_pl, digraph_le, digraph_st,
+          digraph_to, digraph_on, digraph_ne, digraph_or, digraph_rb,
+          digraph_bi, digraph_it  (only those also in FEATURE_NAMES)
+    """
+    all_digraph_features = {f for f in FEATURE_NAMES if f.startswith("digraph_")}
+    phrase_clean = phrase.lower().replace(" ", "")
+    present = set()
+    for i in range(len(phrase_clean) - 1):
+        pair = phrase_clean[i] + phrase_clean[i + 1]
+        feat = f"digraph_{pair}"
+        if feat in all_digraph_features:
+            present.add(feat)
+    return present
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  TRAINING
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -362,8 +406,9 @@ def train_random_forest(username: str):
 
         # Load impostor data while DB is still open
         cmu_impostors  = load_cmu_impostors()
-        real_impostors = load_real_impostors(db, user.id)
+        real_impostors = load_real_impostors(db, user.id, n_genuine=len(genuine_vectors))
         user_id        = user.id
+        user_phrase    = user.phrase or ""
 
     finally:
         try:
@@ -373,26 +418,46 @@ def train_random_forest(username: str):
 
     # ── Phase 2: All training in memory — no DB connection needed ────────────
     print(f"\n{'='*70}")
-    print(f"  KEYSTROKE RF TRAINING v3  —  user: {username}")
+    print(f"  KEYSTROKE RF TRAINING v4  —  user: {username}")
     print(f"{'='*70}")
 
     n_genuine_real = len(genuine_vectors)
     print(f"\n  Enrollment samples loaded: {n_genuine_real}")
 
+    # ── Phrase-aware digraph filtering ────────────────────────────────────────
+    # Drop digraph features not present in the user's phrase.
+    # Inactive digraphs are always 0 at both enrollment and login —
+    # keeping them teaches the model "zero = genuine" which is incorrect.
+    active_digraphs   = get_active_digraphs(user_phrase)
+    all_digraph_feats = {f for f in FEATURE_NAMES if f.startswith("digraph_")}
+    inactive_digraphs = all_digraph_feats - active_digraphs
+    drop_indices      = [i for i, n in enumerate(FEATURE_NAMES) if n in inactive_digraphs]
+    active_feat_names = [n for n in FEATURE_NAMES if n not in inactive_digraphs]
+
+    def _strip_inactive(vecs):
+        return [np.delete(v, drop_indices) for v in vecs]
+
+    genuine_vectors = _strip_inactive(genuine_vectors)
+
+    print(f"  User phrase      : '{user_phrase}'")
+    print(f"  Active digraphs  : {len(active_digraphs)}  ({', '.join(sorted(active_digraphs)) or 'none'})")
+    print(f"  Dropped digraphs : {len(inactive_digraphs)}")
+    print(f"  Active features  : {len(active_feat_names)} (was {len(FEATURE_NAMES)})")
+
     profile_mean = np.array(genuine_vectors).mean(axis=0)
     profile_std  = np.array(genuine_vectors).std(axis=0) + 1e-9
     profile_var  = profile_std ** 2
 
-    key_idxs = [FEATURE_NAMES.index(f) for f in
+    key_idxs = [active_feat_names.index(f) for f in
                 ['dwell_mean', 'flight_mean', 'p2p_mean', 'typing_speed_cpm']
-                if f in FEATURE_NAMES]
+                if f in active_feat_names]
     consistency_cv = np.mean(
         profile_std[key_idxs] / (np.abs(profile_mean[key_idxs]) + 1e-9)
     )
     print(f"  Enrollment consistency CV: {consistency_cv:.3f} "
           f"({'consistent' if consistency_cv < 0.15 else 'variable'})")
 
-    fn = FEATURE_NAMES
+    fn = active_feat_names
     print(f"\n  Profile (mean across {n_genuine_real} attempt(s)):")
     for label, feat in [
         ("typing_speed_cpm", "typing_speed_cpm"),
@@ -411,7 +476,10 @@ def train_random_forest(username: str):
 
     genuine_aug = generate_genuine_samples(genuine_vectors, n=n_aug)
 
-    real_pool     = cmu_impostors + real_impostors
+    # Strip inactive digraphs from impostor pools too so dimensions match
+    cmu_impostors  = _strip_inactive(cmu_impostors)
+    real_impostors = _strip_inactive(real_impostors)
+    real_pool      = cmu_impostors + real_impostors
 
     n_synthetic     = max(0, n_imp_syn - len(real_pool))
     syn_impostors   = generate_impostor_samples(
@@ -419,7 +487,7 @@ def train_random_forest(username: str):
     ) if n_synthetic > 0 else []
     all_impostors   = real_pool + syn_impostors
 
-    n_feats = len(FEATURE_NAMES)
+    n_feats = len(active_feat_names)
     def _is_valid(v):
         try:
             arr = np.asarray(v, dtype=np.float64)
@@ -439,7 +507,7 @@ def train_random_forest(username: str):
     print(f"  Enrolled impostors : {len(real_impostors)}  (other users in DB)")
     print(f"  Synthetic impostors: {len(syn_impostors)}")
     print(f"  Total impostors    : {len(all_impostors)}")
-    print(f"  Feature dims       : {len(FEATURE_NAMES)}")
+    print(f"  Feature dims       : {len(active_feat_names)}")
     print(f"  Impostor ratio     : {len(all_impostors)/max(len(genuine_aug),1):.1f}:1")
 
     X = np.vstack([genuine_aug, all_impostors])
@@ -519,7 +587,7 @@ def train_random_forest(username: str):
 
     model_data = {
         'pipeline':       pipeline,
-        'feature_names':  FEATURE_NAMES,
+        'feature_names':  active_feat_names,   # only features present in user's phrase
         'username':       username,
         'user_id':        user.id,
         'n_enrollment':   n_genuine_real,
@@ -531,6 +599,7 @@ def train_random_forest(username: str):
         'far':            float(far_f),
         'frr':            float(frr_f),
         'eer':            float(best_eer),
+        'phrase':         user_phrase,         # stored for reference/debugging
     }
 
     model_path = os.path.join(model_dir, f"{_safe_filename(username)}_keystroke_rf.pkl")
