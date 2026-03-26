@@ -253,36 +253,79 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
 
             profile_std = model_data.get('profile_std', None)
             if profile_std is not None and len(profile_std) == len(profile_mean):
-                # FIX: use the SAME normalised-d² sigmoid formula that
-                # train_keystroke_rf.py uses in mahalanobis_score().
-                # The old inline formula (mean of raw z-scores) produced a
-                # different score distribution than the training formula, so
-                # the threshold tuned during CV was meaningless at auth time.
-                var      = profile_std ** 2
-                safe_var = np.where(var < 1e-10, 1e-10, var)
-                diff     = vec[0] - profile_mean
-                d_sq     = float(np.sum(diff ** 2 / safe_var))
-                d_sq_norm = d_sq / len(vec[0])
-                mah_score = float(1.0 / (1.0 + np.exp(2.5 * (d_sq_norm - 1.0))))
+                var       = profile_std ** 2
+                safe_var  = np.where(var < 1e-10, 1e-10, var)
+                diff      = vec[0] - profile_mean
+                d_sq      = float(np.sum(diff ** 2 / safe_var))
+                d_sq_norm = d_sq / max(len(vec[0]), 1)
+                # Clamp exponent to prevent overflow (np.exp overflows at ~710)
+                exponent  = float(np.clip(2.5 * (d_sq_norm - 1.0), -500, 500))
+                mah_score = float(1.0 / (1.0 + np.exp(exponent)))
             else:
                 diff      = np.linalg.norm(vec[0] - profile_mean)
                 scale     = np.linalg.norm(profile_mean) + 1e-9
                 mah_score = float(max(0, 1 - diff / scale))
- 
-            # ML model carries 75% of the decision, Mahalanobis 25% sanity check
-            confidence = 0.75 * rf_score + 0.25 * mah_score
- 
-            # REMOVED: lenient early-phase threshold multiplier (0.85x was too loose)
-            # All phases now use the same threshold — security must not degrade
-            # just because the user is new.
-            effective_threshold = threshold
-            phase = "standard"
- 
-            authenticated = confidence >= effective_threshold
+
+            # ── Hard sanity gates ─────────────────────────────────────────────
+            # These catch cases where the RF is overconfident but raw timing
+            # numbers are obviously wrong for this user.  Gates fire BEFORE the
+            # fused score so RF=1.0 cannot override clearly anomalous typing.
+            hard_reject   = False
+            reject_reason = ""
+
+            fn_list = list(feat_names)
+            def _fv(name):
+                try:
+                    return float(vec[0][fn_list.index(name)])
+                except (ValueError, IndexError):
+                    return None
+
+            # Gate 1: dwell_mean z-score (how long keys are held)
+            if not hard_reject and profile_std is not None and 'dwell_mean' in fn_list:
+                e_dwell     = float(profile_mean[fn_list.index('dwell_mean')])
+                e_dwell_std = float(profile_std[fn_list.index('dwell_mean')]) + 1e-9
+                l_dwell     = _fv('dwell_mean')
+                if l_dwell is not None:
+                    dwell_z = abs(l_dwell - e_dwell) / e_dwell_std
+                    if dwell_z > 4.5:
+                        hard_reject   = True
+                        reject_reason = (f"dwell_mean z={dwell_z:.1f} "
+                                         f"(live={l_dwell:.0f}ms enrolled={e_dwell:.0f}ms)")
+
+            # Gate 2: typing_speed_cpm z-score
+            if not hard_reject and profile_std is not None and 'typing_speed_cpm' in fn_list:
+                e_cpm     = float(profile_mean[fn_list.index('typing_speed_cpm')])
+                e_cpm_std = float(profile_std[fn_list.index('typing_speed_cpm')]) + 1e-9
+                l_cpm     = _fv('typing_speed_cpm')
+                if l_cpm is not None:
+                    cpm_z = abs(l_cpm - e_cpm) / e_cpm_std
+                    if cpm_z > 4.5:
+                        hard_reject   = True
+                        reject_reason = (f"typing_speed_cpm z={cpm_z:.1f} "
+                                         f"(live={l_cpm:.0f} enrolled={e_cpm:.0f})")
+
+            # Gate 3: Mahalanobis hard floor.
+            # mah_score < 0.05 means d_sq_norm >> 1 — the vector is far outside
+            # the genuine cluster in all dimensions simultaneously.
+            if not hard_reject and mah_score < 0.05:
+                hard_reject   = True
+                reject_reason = (f"Mahalanobis floor breach "
+                                 f"(mah={mah_score:.4f}, d_sq_norm={d_sq_norm:.2f})")
+
+            if hard_reject:
+                confidence    = 0.0
+                authenticated = False
+                print(f"  \u26d4 Hard reject: {reject_reason}")
+            else:
+                # RF=75% + Mahalanobis=25%.  Mah acts as geometric sanity check:
+                # if RF is overconfident but timing is far from the enrolled
+                # cluster, the Mah term pulls the fused score down.
+                confidence    = 0.75 * rf_score + 0.25 * mah_score
+                authenticated = confidence >= threshold
 
             print(f"  RF={rf_score:.3f}  Mah={mah_score:.3f}  "
-                  f"Fused={confidence:.3f}  Threshold={effective_threshold:.3f} "
-                  f"[{phase}]  → {'PASS' if authenticated else 'FAIL'}")
+                  f"Fused={confidence:.3f}  Threshold={threshold:.3f}"
+                  f"  \u2192 {'PASS' if authenticated else 'FAIL'}")
 
         except Exception as e:
             print(f"[keystroke] RF model error: {e}")

@@ -1,14 +1,32 @@
 # ml/train_keystroke_rf.py
-# v4 — unique-phrase-per-user support
+# v5 — phrase-aware impostor generation (security fix)
 #
-# Key changes vs v3:
+# Key changes vs v4:
+#  1. generate_impostor_samples() now uses THREE tiers instead of one flat
+#     random distribution:
+#       Tier 1 (40%): Near impostors — same phrase, different person timing.
+#                     Forces the model to distinguish on ms-level differences,
+#                     not on structural zeros in the feature vector.
+#       Tier 2 (30%): Speed-shifted impostors — consistently faster or slower
+#                     typist.  Covers the case where an impostor's overall
+#                     rhythm is very different from the genuine user.
+#       Tier 3 (30%): Random impostors — original broad-range behaviour for
+#                     full input-space coverage.
+#  2. _strip_inactive() / _patch_impostor_digraphs(): CMU and enrolled-other-
+#     user impostors previously had zeros for phrase-specific extra_ digraph
+#     columns (they typed a different phrase).  This caused the model to learn
+#     "extra_ = 0 → impostor" rather than learning timing patterns.  We now
+#     replace those zeros with realistic phrase-plausible-but-distinct values
+#     so the model must compete on actual timing.
+#  3. Threshold search is now FAR-weighted (3:1 penalty on false accepts vs
+#     false rejects) — a security system should bias toward rejection.
+#     Minimum threshold floor raised from 0.45 → 0.50.
+#
+# Key changes vs v3 (carried over from v4):
 #  1. get_active_digraphs() — only digraphs present in the user's actual
-#     phrase are kept; inactive digraphs are dropped before training so
-#     the model never learns "zero digraph = genuine".
-#  2. load_real_impostors() now accepts n_genuine and skips real enrolled
-#     impostors when the genuine set is too small (< 8 samples), preventing
-#     the model boundary from being contaminated when only a few users exist.
-#  3. Fallback in auth is now a hard reject (no loose dwell-time comparison).
+#     phrase are kept; inactive digraphs are dropped before training.
+#  2. load_real_impostors() threshold lowered from 8 → 3 genuine samples.
+#  3. Fallback in auth is a hard reject (no loose dwell-time comparison).
 #
 # Key changes vs v2 (carried over from v3):
 #  1. shift_lag_norm added to FEATURE_NAMES (was computed/stored but ignored)
@@ -291,6 +309,31 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42, 
 
 
 def generate_impostor_samples(profile_mean, profile_std, n: int = 1200, rng_seed: int = 42, feat_names: list = None):
+    """
+    Generate synthetic impostor samples in three tiers:
+
+    Tier 1 — NEAR impostors (40% of n):
+        Simulate a real person typing the SAME phrase but with their own rhythm.
+        Values are drawn from a Gaussian centred on the genuine user's mean but
+        pushed at least 1.5–2.0 std away on KEY_FEATURES and extra_ digraphs.
+        This is the most realistic attack vector (a friend typing your passphrase).
+
+    Tier 2 — SHIFTED impostors (30% of n):
+        A different typing speed / dwell profile — e.g. a fast typist vs a slow
+        genuine user.  All timing features are scaled by a random factor drawn
+        from (0.45–0.75) or (1.35–2.2), keeping internal consistency.
+
+    Tier 3 — RANDOM impostors (30% of n):
+        Original behaviour — uniform sample from human plausible ranges.
+        Keeps the decision boundary from collapsing to a tight ball around
+        the genuine mean and gives the model coverage of the full input space.
+
+    KEY insight for extra_ digraphs:
+        CMU / enrolled impostors have zeros for phrase-specific bigrams because
+        they typed a different phrase.  Tier-1 and Tier-2 impostors fill those
+        columns with plausible non-zero values (the same phrase, different person),
+        so the model learns to distinguish on TIMING, not on zero vs non-zero.
+    """
     rng = np.random.default_rng(rng_seed)
     if feat_names is None:
         feat_names = FEATURE_NAMES
@@ -304,31 +347,123 @@ def generate_impostor_samples(profile_mean, profile_std, n: int = 1200, rng_seed
 
     KEY_FEATURES = {
         'dwell_mean', 'flight_mean', 'p2p_mean', 'typing_speed_cpm',
-        'rhythm_mean', 'dwell_mean_norm', 'flight_mean_norm', 'shift_lag_norm'
+        'rhythm_mean', 'dwell_mean_norm', 'flight_mean_norm', 'shift_lag_norm',
+        'r2r_mean', 'p2p_std',
     }
 
+    n_near    = int(n * 0.40)
+    n_shifted = int(n * 0.30)
+    n_random  = n - n_near - n_shifted
+
     samples = []
-    for _ in range(n):
+
+    # ── Tier 1: Near impostors ────────────────────────────────────────────────
+    # Same phrase, different person → values cluster near genuine mean but are
+    # pushed away enough to be distinguishable on key timing features.
+    for _ in range(n_near):
         vec = np.zeros(len(feat_names))
         for i, name in enumerate(feat_names):
+            genuine_val = float(profile_mean[i])
+            genuine_std = float(profile_std[i])
+
+            if name in COUNT_FEATURES:
+                # Integer counts — shift by ±1–3
+                vec[i] = max(0, genuine_val + rng.integers(-2, 4))
+                continue
+
+            if name in RATIO_FEATURES:
+                # Ratios — perturb moderately
+                vec[i] = float(np.clip(
+                    genuine_val + rng.normal(0, genuine_std * 2.5 + 0.05), 0, 2))
+                continue
+
+            # Timing features (ms) and extra digraphs
+            # Strategy: draw from a Gaussian around genuine_mean, then
+            # enforce a minimum separation so they don't collapse into genuine.
+            if name in KEY_FEATURES or name.startswith('extra_') or name.startswith('digraph_'):
+                # Minimum separation: at least 20% of genuine mean OR 1.5× std
+                min_sep = max(genuine_std * 1.5, abs(genuine_val) * 0.20, 8.0)
+                for _ in range(20):
+                    # Wide spread: ±2.5 std — realistic human variation
+                    v = rng.normal(genuine_val, genuine_std * 2.5 + 15.0)
+                    # Keep in human range
+                    if name.startswith('extra_') or name.startswith('digraph_'):
+                        v = np.clip(v, DIGRAPH_RANGE[0], DIGRAPH_RANGE[1])
+                    elif name in HUMAN_RANGES:
+                        v = np.clip(v, HUMAN_RANGES[name][0], HUMAN_RANGES[name][1])
+                    else:
+                        v = max(0, v)
+                    if abs(v - genuine_val) >= min_sep:
+                        break
+                vec[i] = float(v)
+            elif name in HUMAN_RANGES:
+                lo, hi = HUMAN_RANGES[name]
+                vec[i] = float(np.clip(rng.normal(genuine_val, genuine_std * 2.0), lo, hi))
+            else:
+                vec[i] = float(max(0, rng.normal(genuine_val, genuine_std * 2.0)))
+
+        samples.append(vec)
+
+    # ── Tier 2: Speed-shifted impostors ──────────────────────────────────────
+    # Model a typist with a systematically faster or slower rhythm.
+    # All timing values are scaled by a consistent factor, keeping the
+    # internal ratios plausible while moving the profile far from genuine.
+    for _ in range(n_shifted):
+        # Avoid factors near 1.0 — those would overlap with genuine augmentation
+        if rng.random() < 0.5:
+            speed_factor = rng.uniform(0.40, 0.72)   # faster typist
+        else:
+            speed_factor = rng.uniform(1.35, 2.20)   # slower typist
+
+        vec = np.zeros(len(feat_names))
+        for i, name in enumerate(feat_names):
+            genuine_val = float(profile_mean[i])
+            genuine_std = float(profile_std[i])
+
+            if name in COUNT_FEATURES:
+                vec[i] = max(0, genuine_val + rng.integers(-1, 3))
+            elif name in RATIO_FEATURES:
+                vec[i] = float(np.clip(
+                    genuine_val + rng.normal(0, genuine_std * 1.5 + 0.03), 0, 2))
+            elif name.startswith('extra_') or name.startswith('digraph_'):
+                # Digraphs scale with typing speed + small individual noise
+                raw = genuine_val * speed_factor + rng.normal(0, genuine_std * 0.8)
+                vec[i] = float(np.clip(raw, DIGRAPH_RANGE[0], DIGRAPH_RANGE[1]))
+            elif name in HUMAN_RANGES:
+                raw = genuine_val * speed_factor + rng.normal(0, genuine_std * 0.5)
+                lo, hi = HUMAN_RANGES[name]
+                vec[i] = float(np.clip(raw, lo, hi))
+            else:
+                vec[i] = float(max(0, genuine_val * speed_factor))
+
+        samples.append(vec)
+
+    # ── Tier 3: Random impostors (original behaviour) ─────────────────────────
+    # Uniform coverage of the human-plausible input space.
+    for _ in range(n_random):
+        vec = np.zeros(len(feat_names))
+        for i, name in enumerate(feat_names):
+            genuine_val = float(profile_mean[i])
+
             if name in HUMAN_RANGES:
                 lo, hi = HUMAN_RANGES[name]
             elif name.startswith('digraph_') or name.startswith('extra_'):
                 lo, hi = DIGRAPH_RANGE
             else:
-                lo = profile_mean[i] * 0.3
-                hi = profile_mean[i] * 2.0
+                lo = genuine_val * 0.3
+                hi = genuine_val * 2.0
 
             for _ in range(15):
                 v = rng.uniform(lo, hi)
                 if name in KEY_FEATURES:
-                    min_dist = max(profile_std[i] * 1.5, profile_mean[i] * 0.20)
-                    if abs(v - profile_mean[i]) >= min_dist:
+                    min_dist = max(profile_std[i] * 1.5, abs(genuine_val) * 0.20)
+                    if abs(v - genuine_val) >= min_dist:
                         break
                 else:
                     break
-            vec[i] = v
+            vec[i] = float(v)
         samples.append(vec)
+
     return samples
 
 
@@ -481,19 +616,74 @@ def train_random_forest(username: str):
     n_genuine_real = len(genuine_vectors)
     print(f"\n  Enrollment samples loaded: {n_genuine_real}")
 
-    def _strip_inactive(vecs):
-        """Strip inactive hardcoded digraphs; pad zeros for extra_pairs on impostor vecs."""
+    # Pre-compute extra-digraph stats from genuine enrollment so we can generate
+    # realistic (non-zero) values for real impostors who typed a different phrase.
+    # We do this BEFORE _strip_inactive is called so profile_mean/std are available.
+    # (They are computed from genuine_vectors right after this block.)
+    _extra_start_idx = len(FEATURE_NAMES) - len(inactive_digraphs)  # index in stripped vec where extra cols begin
+
+    def _strip_inactive(vecs, is_impostor: bool = False, rng_inst=None):
+        """
+        Strip inactive hardcoded digraphs from every vector.
+
+        For GENUINE vectors the extra_pairs columns are already appended and
+        contain real timing data — keep them as-is.
+
+        For IMPOSTOR vectors (CMU / enrolled-other-user) the extra_pairs columns
+        are missing because those people typed a different phrase.  Instead of
+        padding with zeros (which taught the model 'zero extra_ = impostor'),
+        we inject phrase-plausible noise drawn from the genuine user's digraph
+        distribution shifted away by ±1.5–3 std.  This forces the model to
+        learn on TIMING differences, not on the zero/non-zero artifact.
+        """
+        _rng = rng_inst if rng_inst is not None else np.random.default_rng(99)
         stripped = []
         for v in vecs:
             base = np.delete(v[:len(FEATURE_NAMES)], drop_indices)
-            if len(v) > len(FEATURE_NAMES):
+            if not is_impostor and len(v) > len(FEATURE_NAMES):
+                # Genuine vector — real extra digraph timings already appended
                 extra = v[len(FEATURE_NAMES):]
             else:
+                # Impostor vector — generate realistic but distinct digraph timings.
+                # We don't have profile_mean yet at definition time, so we use a
+                # closure-safe approach: sample from DIGRAPH_RANGE with a bias
+                # toward the genuine mean (computed later and patched in).
+                # The actual patching happens in _patch_impostor_digraphs() below.
                 extra = np.zeros(len(extra_pairs))
             stripped.append(np.concatenate([base, extra]))
         return stripped
 
-    genuine_vectors = _strip_inactive(genuine_vectors)
+    def _patch_impostor_digraphs(vecs, p_mean, p_std, rng_inst):
+        """
+        After profile_mean/std are known, replace the zero extra_ columns on
+        impostor vectors with phrase-plausible but genuinely-distinct timings.
+
+        Strategy: for each extra_ column, draw from N(genuine_mean, 2.5*genuine_std)
+        and reject samples that fall within 1.5*std of the genuine mean (too close
+        to be a useful impostor example).  Clamp to DIGRAPH_RANGE.
+        """
+        if not extra_pairs:
+            return vecs
+        extra_col_start = len(p_mean) - len(extra_pairs)
+        patched = []
+        for v in vecs:
+            v = v.copy()
+            for j, _ in enumerate(extra_pairs):
+                col = extra_col_start + j
+                g_mean = p_mean[col]
+                g_std  = p_std[col]
+                min_sep = max(g_std * 1.5, g_mean * 0.20, 8.0)
+                for _ in range(20):
+                    val = rng_inst.normal(g_mean, g_std * 2.5 + 15.0)
+                    val = float(np.clip(val, DIGRAPH_RANGE[0], DIGRAPH_RANGE[1]))
+                    if abs(val - g_mean) >= min_sep:
+                        break
+                v[col] = val
+            patched.append(v)
+        return patched
+
+    _rng_patch = np.random.default_rng(77)
+    genuine_vectors = _strip_inactive(genuine_vectors, is_impostor=False)
 
     print(f"  User phrase      : '{user_phrase}'")
     print(f"  Standard active  : {len(standard_active)}  ({', '.join(sorted(standard_active)) or 'none'})")
@@ -532,8 +722,16 @@ def train_random_forest(username: str):
 
     genuine_aug = generate_genuine_samples(genuine_vectors, n=n_aug, feat_names=active_feat_names)
 
-    cmu_impostors  = _strip_inactive(cmu_impostors)
-    real_impostors = _strip_inactive(real_impostors)
+    cmu_impostors  = _strip_inactive(cmu_impostors,  is_impostor=True)
+    real_impostors = _strip_inactive(real_impostors, is_impostor=True)
+
+    # Now that profile_mean/std are computed, replace the placeholder zeros in
+    # real impostor extra_ columns with realistic phrase-plausible timings.
+    # This is the core fix: CMU and enrolled impostors no longer signal
+    # "impostor" via zero digraph values — the model must learn on timing.
+    cmu_impostors  = _patch_impostor_digraphs(cmu_impostors,  profile_mean, profile_std, _rng_patch)
+    real_impostors = _patch_impostor_digraphs(real_impostors, profile_mean, profile_std, _rng_patch)
+
     real_pool      = cmu_impostors + real_impostors
 
     n_synthetic   = max(0, n_imp_syn - len(real_pool))
@@ -558,9 +756,15 @@ def train_random_forest(username: str):
     print(f"{'='*70}")
     print(f"  Genuine (real)     : {n_genuine_real}")
     print(f"  Genuine (augmented): {len(genuine_aug)}")
-    print(f"  CMU impostors      : {len(cmu_impostors)}  (51 real humans)")
-    print(f"  Enrolled impostors : {len(real_impostors)}  (other users in DB)")
+    print(f"  CMU impostors      : {len(cmu_impostors)}  (51 real humans, digraphs patched)")
+    print(f"  Enrolled impostors : {len(real_impostors)}  (other users in DB, digraphs patched)")
+    n_near_syn    = int(n_synthetic * 0.40)
+    n_shifted_syn = int(n_synthetic * 0.30)
+    n_random_syn  = n_synthetic - n_near_syn - n_shifted_syn
     print(f"  Synthetic impostors: {len(syn_impostors)}")
+    print(f"    ├─ Near (same phrase, diff person): ~{n_near_syn}")
+    print(f"    ├─ Speed-shifted (fast/slow typist): ~{n_shifted_syn}")
+    print(f"    └─ Random (broad human range):       ~{n_random_syn}")
     print(f"  Total impostors    : {len(all_impostors)}")
     print(f"  Feature dims       : {len(active_feat_names)}")
     print(f"  Impostor ratio     : {len(all_impostors)/max(len(genuine_aug),1):.1f}:1")
@@ -575,12 +779,13 @@ def train_random_forest(username: str):
     y_prob_cv = cross_val_predict(pipeline, X, y, cv=cv, method="predict_proba")[:, 1]
 
     print(f"\n{'='*70}")
-    print(f"  THRESHOLD SEARCH")
+    print(f"  THRESHOLD SEARCH  (FAR-weighted — security biased 3:1 over FRR)")
     print(f"{'='*70}")
-    print(f"  {'Threshold':>10}  {'FAR':>8}  {'FRR':>8}  {'EER':>8}")
+    print(f"  {'Threshold':>10}  {'FAR':>8}  {'FRR':>8}  {'EER':>8}  {'Score':>8}")
 
-    best_thresh = 0.50
-    best_eer    = 1.0
+    best_thresh     = 0.50
+    best_eer        = 1.0
+    best_far_score  = 1.0   # weighted metric: (3*FAR + FRR) / 4
 
     for t in np.arange(0.35, 0.92, 0.02):
         y_at_t = (y_prob_cv >= t).astype(int)
@@ -590,18 +795,27 @@ def train_random_forest(username: str):
         if cm_t.shape != (2, 2):
             continue
         tn_t, fp_t, fn_t, tp_t = cm_t.ravel()
-        far_t = fp_t / (fp_t + tn_t) if (fp_t + tn_t) > 0 else 0
-        frr_t = fn_t / (fn_t + tp_t) if (fn_t + tp_t) > 0 else 0
-        eer_t = (far_t + frr_t) / 2
+        far_t   = fp_t / (fp_t + tn_t) if (fp_t + tn_t) > 0 else 0
+        frr_t   = fn_t / (fn_t + tp_t) if (fn_t + tp_t) > 0 else 0
+        eer_t   = (far_t + frr_t) / 2
+        # Security bias: penalise false accepts 3× more than false rejects.
+        # A legitimate user being asked to retry is annoying; an impostor
+        # getting through is a security breach.
+        score_t = (3 * far_t + frr_t) / 4
 
         marker = ""
         if eer_t < best_eer:
-            best_eer    = eer_t
-            best_thresh = float(t)
-            marker      = " ◄ best EER"
-        print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}{marker}")
+            best_eer = eer_t
+        if score_t < best_far_score:
+            best_far_score = score_t
+            best_thresh    = float(t)
+            marker         = " ◄ best"
+        print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}  {score_t:>8.2%}{marker}")
 
-    final_thresh = max(best_thresh, 0.45)
+    # Security floor: never accept a threshold below 0.50 regardless of EER.
+    # With 5 enrollment samples the CV scores are noisy — a threshold of 0.45
+    # found by CV may not hold on real data.  0.50 is a conservative minimum.
+    final_thresh = max(best_thresh, 0.50)
 
     if consistency_cv > 0.25:
         final_thresh = max(final_thresh - 0.04, 0.42)
