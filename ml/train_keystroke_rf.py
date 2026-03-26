@@ -60,6 +60,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import accuracy_score, confusion_matrix
 from sklearn.pipeline import Pipeline
+from sklearn.calibration import CalibratedClassifierCV
 
 from database.db import SessionLocal
 from database.models import User, KeystrokeTemplate
@@ -507,22 +508,24 @@ def build_pipeline(n_enrollment: int) -> Pipeline:
             random_state=42,
         )
     else:
-        print(f"  Using RandomForest (n_enrollment={n_enrollment} > 7)")
-        clf = RandomForestClassifier(
+        print(f"  Using RandomForest + Isotonic Calibration (n_enrollment={n_enrollment} > 7)")
+        # RF predict_proba saturates at 1.0 with small genuine sets because all
+        # 500 trees agree — it's a vote count, not a real probability.
+        # CalibratedClassifierCV(method='isotonic') remaps the raw vote ratios
+        # to actual probabilities using cross-validation, so an impostor who
+        # scores RF_raw=0.97 gets mapped down to a realistic ~0.40–0.55,
+        # making the fused score (RF*0.75 + Mah*0.25) actually discriminate.
+        base_rf = RandomForestClassifier(
             n_estimators=500,
             max_depth=10,
             min_samples_split=4,
             min_samples_leaf=3,
             max_features='sqrt',
-            # FIX: was {0: 1, 1: 2} which penalised false REJECTS more.
-            # For a security system, a false ACCEPT (impostor gets through) is
-            # far more harmful than a false REJECT (user must retry).
-            # 3:1 weight on impostors (class 0) vs genuine (class 1) makes the
-            # model biased toward rejection of ambiguous borderline samples.
             class_weight={0: 3, 1: 1},
             random_state=42,
             n_jobs=-1,
         )
+        clf = CalibratedClassifierCV(base_rf, method='isotonic', cv=3)
     return Pipeline([("scaler", StandardScaler()), ("clf", clf)])
 
 
@@ -855,7 +858,14 @@ def train_random_forest(username: str):
 
     try:
         clf_step = pipeline.named_steps["clf"]
-        importances = clf_step.feature_importances_
+        # CalibratedClassifierCV wraps the base estimator — unwrap it to get importances
+        if hasattr(clf_step, 'estimator'):
+            base_clf = clf_step.estimator
+        elif hasattr(clf_step, 'calibrated_classifiers_'):
+            base_clf = clf_step.calibrated_classifiers_[0].estimator
+        else:
+            base_clf = clf_step
+        importances = base_clf.feature_importances_
         pairs = sorted(zip(active_feat_names, importances), key=lambda x: x[1], reverse=True)
         print(f"\n  TOP 10 MOST IMPORTANT FEATURES")
         for i, (feat, imp) in enumerate(pairs[:10], 1):
