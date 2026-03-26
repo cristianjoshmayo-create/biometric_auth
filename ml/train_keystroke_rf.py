@@ -276,10 +276,13 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42, 
     if base.shape[0] > 1:
         within_std = base.std(axis=0)
     else:
-        within_std = np.abs(base[0]) * 0.07
+        within_std = np.abs(base[0]) * 0.04
 
     mean_vals  = np.abs(base.mean(axis=0))
-    within_std = np.maximum(within_std, mean_vals * 0.05)
+    # FIX: tighten genuine augmentation from 5% floor → 3% floor.
+    # The old 5% floor combined with ±16% factor created a genuine cluster
+    # wide enough to contain nearby impostors (groupmates with similar speed).
+    within_std = np.maximum(within_std, mean_vals * 0.03)
 
     samples  = []
     attempts = 0
@@ -293,10 +296,15 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42, 
                 noisy[i] = max(0, noisy[i] + rng.integers(-1, 2))
             elif name in RATIO_FEATURES:
                 noisy[i] = float(np.clip(
-                    noisy[i] + rng.normal(0, within_std[i] * 0.7 + 0.01), 0, 2))
+                    noisy[i] + rng.normal(0, within_std[i] * 0.5 + 0.01), 0, 2))
             else:
-                factor  = rng.normal(1.0, 0.07)
-                factor  = np.clip(factor, 0.84, 1.16)
+                # FIX: tighter factor: normal(1.0, 0.04) clipped to (0.92, 1.08).
+                # Old: normal(1.0, 0.07) clipped to (0.84, 1.16) = ±16% spread.
+                # New: ±8% spread — keeps the genuine cluster tight so nearby
+                # impostors (groupmates typing ~10-15% differently) are correctly
+                # outside the genuine zone and get labelled as impostors.
+                factor  = rng.normal(1.0, 0.04)
+                factor  = np.clip(factor, 0.92, 1.08)
                 noisy[i] = noisy[i] * factor
 
         ok, _ = _is_quality_sample(noisy, feat_names)
@@ -382,7 +390,7 @@ def generate_impostor_samples(profile_mean, profile_std, n: int = 1200, rng_seed
             # enforce a minimum separation so they don't collapse into genuine.
             if name in KEY_FEATURES or name.startswith('extra_') or name.startswith('digraph_'):
                 # Minimum separation: at least 20% of genuine mean OR 1.5× std
-                min_sep = max(genuine_std * 1.5, abs(genuine_val) * 0.20, 8.0)
+                min_sep = max(genuine_std * 1.0, abs(genuine_val) * 0.08, 5.0)  # FIX: was (1.5*std, 20%) — gap allowed groupmates to slip in
                 for _ in range(20):
                     # Wide spread: ±2.5 std — realistic human variation
                     v = rng.normal(genuine_val, genuine_std * 2.5 + 15.0)
@@ -506,7 +514,12 @@ def build_pipeline(n_enrollment: int) -> Pipeline:
             min_samples_split=4,
             min_samples_leaf=3,
             max_features='sqrt',
-            class_weight={0: 1, 1: 2},
+            # FIX: was {0: 1, 1: 2} which penalised false REJECTS more.
+            # For a security system, a false ACCEPT (impostor gets through) is
+            # far more harmful than a false REJECT (user must retry).
+            # 3:1 weight on impostors (class 0) vs genuine (class 1) makes the
+            # model biased toward rejection of ambiguous borderline samples.
+            class_weight={0: 3, 1: 1},
             random_state=42,
             n_jobs=-1,
         )
@@ -812,15 +825,19 @@ def train_random_forest(username: str):
             marker         = " ◄ best"
         print(f"  {t:>10.2f}  {far_t:>8.2%}  {frr_t:>8.2%}  {eer_t:>8.2%}  {score_t:>8.2%}{marker}")
 
-    # Security floor: never accept a threshold below 0.50 regardless of EER.
-    # With 5 enrollment samples the CV scores are noisy — a threshold of 0.45
-    # found by CV may not hold on real data.  0.50 is a conservative minimum.
-    final_thresh = max(best_thresh, 0.50)
+    # Security floor: never accept a threshold below 0.55 regardless of EER.
+    # FIX: raised from 0.50 → 0.55 for extra security margin.
+    # FIX: removed the consistency_cv branch that lowered the floor to 0.42.
+    #   Old logic: "high variability → lower threshold so the genuine user can
+    #   still log in." This is backwards — high variability means the genuine
+    #   profile is noisy, so we should be MORE conservative, not less.
+    #   Lowering to 0.42 essentially disabled the security gate and let
+    #   groupmates (who scored ~0.45-0.50) pass through.
+    final_thresh = max(best_thresh, 0.55)
 
     if consistency_cv > 0.25:
-        final_thresh = max(final_thresh - 0.04, 0.42)
-        print(f"\n  ⚠  High variability (CV={consistency_cv:.2f}) → "
-              f"threshold adjusted to {final_thresh:.2f}")
+        print(f"\n  ⚠  High variability (CV={consistency_cv:.2f}) — "
+              f"keeping conservative threshold {final_thresh:.2f} (NOT lowering it)")
 
     y_final = (y_prob_cv >= final_thresh).astype(int)
     cm_f    = confusion_matrix(y, y_final)

@@ -287,7 +287,12 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                 l_dwell     = _fv('dwell_mean')
                 if l_dwell is not None:
                     dwell_z = abs(l_dwell - e_dwell) / e_dwell_std
-                    if dwell_z > 4.5:
+                    # FIX: tightened from 4.5 → 3.0 z-score.
+                    # 4.5 std is extreme — only fires if the impostor types
+                    # nearly 5x slower/faster than the genuine user. At 3.0,
+                    # groupmates who differ by 3 standard deviations (a clearly
+                    # different typing rhythm) are hard-rejected immediately.
+                    if dwell_z > 3.0:
                         hard_reject   = True
                         reject_reason = (f"dwell_mean z={dwell_z:.1f} "
                                          f"(live={l_dwell:.0f}ms enrolled={e_dwell:.0f}ms)")
@@ -299,15 +304,17 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                 l_cpm     = _fv('typing_speed_cpm')
                 if l_cpm is not None:
                     cpm_z = abs(l_cpm - e_cpm) / e_cpm_std
-                    if cpm_z > 4.5:
+                    if cpm_z > 3.0:
                         hard_reject   = True
                         reject_reason = (f"typing_speed_cpm z={cpm_z:.1f} "
                                          f"(live={l_cpm:.0f} enrolled={e_cpm:.0f})")
 
             # Gate 3: Mahalanobis hard floor.
-            # mah_score < 0.05 means d_sq_norm >> 1 — the vector is far outside
-            # the genuine cluster in all dimensions simultaneously.
-            if not hard_reject and mah_score < 0.05:
+            # FIX: raised from 0.05 → 0.15. mah_score < 0.05 only fired for
+            # extreme outliers (d_sq_norm >> 3). Groupmates who type similarly
+            # land at mah_score ~0.10–0.30; raising the floor catches them
+            # before the RF score can override.
+            if not hard_reject and mah_score < 0.15:
                 hard_reject   = True
                 reject_reason = (f"Mahalanobis floor breach "
                                  f"(mah={mah_score:.4f}, d_sq_norm={d_sq_norm:.2f})")
