@@ -103,6 +103,11 @@ class KeystrokeAuth(BaseModel):
     p2p_std_norm:     float = 0
     r2r_mean_norm:    float = 0
     shift_lag_norm:   float = 0
+    # FIX: phrase-specific bigram timings — sent as a dict from keystroke.js.
+    # The training script strips inactive hardcoded digraphs and appends these
+    # as extra_XX features. Without this field they were silently zeroed at
+    # auth time, making the login vector look nothing like the enrolled vector.
+    extra_digraphs:   Optional[dict] = {}
 
 
 class VoiceAuth(VoiceFeatures):
@@ -230,20 +235,35 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             profile_mean = model_data['profile_mean']
             threshold    = model_data['threshold']
 
+            # FIX: features whose names start with "extra_" were produced by
+            # the phrase-aware digraph filter in train_keystroke_rf.py.
+            # They must be looked up from payload.extra_digraphs (a dict keyed
+            # by the 2-letter bigram), NOT via getattr which always returns 0.0.
+            # Zeroing every extra_* feature was the primary reason keystroke
+            # auth always failed for users with unique passphrases.
+            extra_map = payload.extra_digraphs or {}
             vec = np.array([
-                float(getattr(payload, name, 0.0) or 0.0)
+                float(extra_map.get(name[6:], 0.0) or 0.0)
+                if name.startswith("extra_")
+                else float(getattr(payload, name, 0.0) or 0.0)
                 for name in feat_names
             ]).reshape(1, -1)
 
             rf_score = float(pipeline.predict_proba(vec)[0][1])
- 
+
             profile_std = model_data.get('profile_std', None)
             if profile_std is not None and len(profile_std) == len(profile_mean):
-                safe_std  = np.where(profile_std < 1e-6, 1e-6, profile_std)
-                z         = np.abs((vec[0] - profile_mean) / safe_std)
-                # OLD: mah_score = float(1.0 / (1.0 + np.exp(np.mean(z) - 1.5)))
-                # NEW: steeper sigmoid, harder gate
-                mah_score = float(1.0 / (1.0 + np.exp(2.5 * (np.mean(z) - 1.0))))
+                # FIX: use the SAME normalised-d² sigmoid formula that
+                # train_keystroke_rf.py uses in mahalanobis_score().
+                # The old inline formula (mean of raw z-scores) produced a
+                # different score distribution than the training formula, so
+                # the threshold tuned during CV was meaningless at auth time.
+                var      = profile_std ** 2
+                safe_var = np.where(var < 1e-10, 1e-10, var)
+                diff     = vec[0] - profile_mean
+                d_sq     = float(np.sum(diff ** 2 / safe_var))
+                d_sq_norm = d_sq / len(vec[0])
+                mah_score = float(1.0 / (1.0 + np.exp(2.5 * (d_sq_norm - 1.0))))
             else:
                 diff      = np.linalg.norm(vec[0] - profile_mean)
                 scale     = np.linalg.norm(profile_mean) + 1e-9
@@ -386,6 +406,9 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             p2p_std_norm=payload.p2p_std_norm,
             r2r_mean_norm=payload.r2r_mean_norm,
             shift_lag_norm=payload.shift_lag_norm,
+            # FIX: persist phrase-specific bigram timings so adaptive
+            # retraining can load them via extract_feature_vector(extra_keys=...)
+            extra_digraphs=payload.extra_digraphs or {},
         )
         db.add(new_sample)
         db.commit()
