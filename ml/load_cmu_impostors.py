@@ -167,7 +167,7 @@ def extract_cmu_features(rows):
 def profiles_to_vectors(profiles: dict) -> list:
     ml_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, ml_dir)
-    from train_keystroke_rf import FEATURE_NAMES
+    from ml.train_keystroke_rf import FEATURE_NAMES
 
     vectors = []
     for subj, feat in profiles.items():
@@ -193,7 +193,7 @@ def build_and_save():
     vecs = profiles_to_vectors(profiles)
     arr  = np.array(vecs)
     print(f"\n  Sanity check (mean across all CMU subjects):")
-    from train_keystroke_rf import FEATURE_NAMES
+    from ml.train_keystroke_rf import FEATURE_NAMES
     for feat in ['dwell_mean', 'flight_mean', 'typing_speed_cpm', 'rhythm_cv', 'digraph_th']:
         if feat in FEATURE_NAMES:
             idx = FEATURE_NAMES.index(feat)
