@@ -140,7 +140,7 @@ def _run_voice_training(username: str):
         )
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
-        from ml.train_voice_cnn import train_voice_model
+        from ml.ml.train_voice_cnn import train_voice_model
         print(f"\n🔄 Auto-training voice model for '{username}' ...")
         model_path = train_voice_model(username)
         if model_path:
@@ -505,7 +505,7 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
 
     # Save new fields if the model column exists (graceful for older DB schemas)
     for field in ['delta_mfcc_mean', 'delta2_mfcc_mean', 'spectral_flux_mean',
-                  'voiced_fraction', 'snr_db', 'mfcc_frames']:
+                  'voiced_fraction', 'snr_db', 'ecapa_embedding']:
         val = getattr(payload, field, None)
         if val is not None and hasattr(template, field):
             setattr(template, field, val)
@@ -517,6 +517,24 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
     print(f"✅ Voice attempt #{attempt_num} for '{payload.username}' | "
           f"pitch={payload.pitch_mean:.1f}Hz  energy={payload.energy_mean:.4f}  "
           f"snr={payload.snr_db:.1f}dB  voiced={payload.voiced_fraction:.0%}")
+
+    # ── Update ECAPA profile immediately after every recording ────────────
+    # Profile = mean of all enrollment embeddings — no training step needed.
+    # Auth works after the very first recording.
+    ecapa_emb = getattr(payload, 'ecapa_embedding', None)
+    if ecapa_emb and len(ecapa_emb) == 192:
+        try:
+            project_root = os.path.normpath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+            )
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            from ml.voice_ecapa import save_enrollment as ecapa_save
+            ecapa_save(payload.username, ecapa_emb)
+        except Exception as _ecapa_err:
+            print(f"  ⚠  ECAPA profile update skipped: {_ecapa_err}")
+    else:
+        print(f"  ⚠  ECAPA: no valid embedding in payload (len={len(ecapa_emb) if ecapa_emb else 0})")
 
     training_started = attempt_num >= MAX_VOICE_SAMPLES
     if training_started:
@@ -938,10 +956,30 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         print(f"  Voiced fraction={voiced_fraction:.2%}")
         print(f"  SNR={snr_db:.1f}dB")
 
+        # ── ECAPA-TDNN speaker embedding ───────────────────────────────────
+        # Runs on audio_clean (denoised 16kHz) after all quality gates pass.
+        # If SpeechBrain is not installed, returns [] and enrollment continues.
+        ecapa_embedding = []
+        try:
+            project_root = os.path.normpath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+            )
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            from ml.voice_ecapa import extract_embedding as ecapa_extract
+            emb = ecapa_extract(audio_clean, sr=sr)
+            if emb:
+                ecapa_embedding = emb
+                print(f"  ECAPA embedding: {len(emb)}-dim  norm={float(np.linalg.norm(emb)):.4f}")
+            else:
+                print("  ⚠  ECAPA embedding returned None — check SpeechBrain install")
+        except Exception as _ecapa_err:
+            print(f"  ⚠  ECAPA extraction skipped: {_ecapa_err}")
+
         return {
             "success":              True,
+            "ecapa_embedding":      ecapa_embedding,
             "mfcc_features":        mfcc_mean.tolist(),
-            "mfcc_std":             mfcc_std.tolist(),
             "delta_mfcc_mean":      delta_mfcc_mean.tolist(),   # NEW
             "delta2_mfcc_mean":     delta2_mfcc_mean.tolist(),  # NEW
             "mfcc_frames":          mfcc_cmvn.T.tolist(),        # CNN v4: raw (T,13) frame matrix

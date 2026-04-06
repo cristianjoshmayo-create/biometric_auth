@@ -541,23 +541,49 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
 
     model_path = os.path.join(_model_dir(), f"{_safe_filename(payload.username)}_voice_cnn.pkl")
 
-    if os.path.exists(model_path):
-        print(f"[voice] Using trained .pkl model for '{payload.username}'")
-        try:
-            project_root = os.path.normpath(os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), '..', '..'
-            ))
-            if project_root not in sys.path:
-                sys.path.insert(0, project_root)
-            from ml.train_voice_cnn import predict_voice
+    # ── PRIMARY AUTH: ECAPA-TDNN pretrained speaker verification ────────────
+    # Works after the first enrollment recording. No pkl model file needed —
+    # just the profile built by save_enrollment() during voice enrollment.
+    try:
+        project_root = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), '..', '..'
+        ))
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from ml.voice_ecapa import predict_voice as ecapa_predict
 
-            # FIX v3: pass ALL 62 features — delta/flux/voiced were missing,
-            # causing the 62-feature GBM model to run on a 34-feature input.
+        ecapa_result  = ecapa_predict(
+            payload.username,
+            getattr(payload, 'ecapa_embedding', [])
+        )
+        confidence    = ecapa_result["similarity"]
+        authenticated = ecapa_result["match"]
+
+        print(f"  [ECAPA] similarity={ecapa_result['similarity']:.4f}  "
+              f"threshold={ecapa_result['threshold']:.2f}  "
+              f"n_enrolled={ecapa_result.get('n_enrollment', '?')}  "
+              f"→ {'PASS' if authenticated else 'FAIL'}")
+
+        if "error" in ecapa_result:
+            print(f"  [ECAPA] note: {ecapa_result['error']}")
+
+    except Exception as e:
+        print(f"[voice] ECAPA error: {e}")
+        import traceback; traceback.print_exc()
+        confidence    = 0.0
+        authenticated = False
+
+    # ── SECONDARY (logged only — not used for decision) ───────────────────
+    # CNN and Resemblyzer still run so you can compare scores in the console.
+    # Their results do NOT affect whether the user is granted access.
+    try:
+        from ml.train_voice_cnn import predict_voice as cnn_predict
+        if os.path.exists(model_path):
             feature_dict = {
                 "mfcc_features":          payload.mfcc_features,
                 "mfcc_std":               payload.mfcc_std,
-                "delta_mfcc_mean":        payload.delta_mfcc_mean,        # v2
-                "delta2_mfcc_mean":       payload.delta2_mfcc_mean,       # v2
+                "delta_mfcc_mean":        payload.delta_mfcc_mean,
+                "delta2_mfcc_mean":       payload.delta2_mfcc_mean,
                 "pitch_mean":             payload.pitch_mean,
                 "pitch_std":              payload.pitch_std,
                 "speaking_rate":          payload.speaking_rate,
@@ -566,47 +592,22 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
                 "zcr_mean":               payload.zcr_mean,
                 "spectral_centroid_mean": payload.spectral_centroid_mean,
                 "spectral_rolloff_mean":  payload.spectral_rolloff_mean,
-                "spectral_flux_mean":     payload.spectral_flux_mean,     # v2
-                "voiced_fraction":        payload.voiced_fraction,        # v2
-                "mfcc_frames":            payload.mfcc_frames,            # v4 CNN
+                "spectral_flux_mean":     payload.spectral_flux_mean,
+                "voiced_fraction":        payload.voiced_fraction,
             }
+            cnn_r = cnn_predict(payload.username, feature_dict)
+            print(f"  [CNN log-only] fused={cnn_r.get('fused_score', 0):.1f}%")
+        else:
+            print(f"  [CNN log-only] no model yet for '{payload.username}'")
+    except Exception as _e:
+        print(f"  [CNN log-only] skipped — {_e}")
 
-            result = predict_voice(payload.username, feature_dict)
-
-            if "error" in result:
-                raise ValueError(result["error"])
-
-            confidence    = result["fused_score"] / 100.0
-            authenticated = result["match"]
-
-            print(f"  MLP={result['confidence']:.1f}%  "
-                  f"Mah={result['mahalanobis']:.1f}%  "
-                  f"Fused={result['fused_score']:.1f}%  "
-                  f"Threshold={result['threshold']:.1f}%  "
-                  f"→ {'PASS' if authenticated else 'FAIL'}")
-
-        except Exception as e:
-            print(f"[voice] Model error: {e}")
-            import traceback; traceback.print_exc()
-            confidence    = 0.0
-            authenticated = False
-
-    else:
-        # No trained model exists — this means enrollment is incomplete.
-        # The cosine similarity fallback is too loose and grants access to
-        # anyone whose MFCC means loosely resemble the enrolled sample.
-        # Correct behaviour: reject and tell the user to complete enrollment.
-        print(f"[voice] No trained model for '{payload.username}' — rejecting")
-        template = db.query(VoiceTemplate).filter(
-            VoiceTemplate.user_id == user.id
-        ).first()
-        if not template:
-            raise HTTPException(status_code=404, detail="No voice template found. Please enroll first.")
-
-        # Hard reject — enrollment not complete, no reliable model to verify against
-        confidence    = 0.0
-        authenticated = False
-        print(f"[voice] Enrollment incomplete — voice model not yet trained, access denied")
+    try:
+        from ml.voice_resemblyzer import predict_voice as resem_predict
+        resem_r = resem_predict(payload.username, getattr(payload, 'resemblyzer_embedding', []))
+        print(f"  [Resemblyzer log-only] similarity={resem_r.get('similarity', 0):.4f}")
+    except Exception as _e:
+        print(f"  [Resemblyzer log-only] skipped — {_e}")
 
     print(f"[voice] user={payload.username}  "
           f"confidence={confidence:.3f}  result={'PASS' if authenticated else 'FAIL'}")

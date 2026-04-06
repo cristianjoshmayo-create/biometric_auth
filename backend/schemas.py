@@ -43,6 +43,16 @@ class VoiceFeatures(BaseModel):
     voiced_fraction:        float = 0
     snr_db:                 float = 0   # quality logging only
 
+    # ECAPA-TDNN — 192-dim pretrained speaker embedding
+    # Computed by /enroll/extract-mfcc and passed through enroll + auth.
+    # Defaults to [] for users enrolled before this update (must re-enroll).
+    ecapa_embedding:        List[float] = []
+
+    # Resemblyzer — pretrained 256-dim speaker embedding
+    # Computed by extract_mfcc endpoint and passed through enroll/auth flow.
+    # Empty list = old enrolled user (before Resemblyzer was added).
+    resemblyzer_embedding:  List[float] = []
+
     # v4 CNN — raw per-frame MFCC matrix (T × 13)
     # Returned by /enroll/extract-mfcc and stored in voice_templates.mfcc_frames.
     # If empty (old enrolled users), CNN inference falls back to score=0.0.
