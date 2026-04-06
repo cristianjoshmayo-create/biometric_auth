@@ -557,7 +557,9 @@ def main(username: str):
     text_dependent_vs_independent_note()
 
     # ── Save CSV ──────────────────────────────────────────────────────────────
-    out_path = os.path.join(SCRIPT_DIR, f"{_safe_filename(username)}_voice_benchmark.csv")
+    results_dir = os.path.join(SCRIPT_DIR, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    out_path = os.path.join(results_dir, f"{_safe_filename(username)}_voice_benchmark.csv")
     import csv
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["model", "accuracy", "far", "frr", "eer", "threshold", "time_s"])
@@ -580,4 +582,3 @@ if __name__ == "__main__":
     else:
         uname = input("Enter username: ").strip()
     main(uname)
-    

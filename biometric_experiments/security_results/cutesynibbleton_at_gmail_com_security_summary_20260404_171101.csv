@@ -1,0 +1,4 @@
+Section,Accuracy,FAR,FRR,EER,Attack_Success_Rate,N_Impostor,N_Genuine
+keystroke,12.09%,88.89%,0.00%,56.89%,88.89%,450,5
+voice,55.77%,44.86%,0.00%,15.71%,44.86%,350,5
+multimodal,47.80%,53.50%,0.00%,27.25%,53.50%,200,5

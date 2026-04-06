@@ -417,7 +417,9 @@ def main(username: str):
     print_literature_comparison(results)
 
     # ── Save CSV for thesis ───────────────────────────────────────────────────
-    out_path = os.path.join(SCRIPT_DIR, f"{_safe_filename(username)}_keystroke_benchmark.csv")
+    results_dir = os.path.join(SCRIPT_DIR, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    out_path = os.path.join(results_dir, f"{_safe_filename(username)}_keystroke_benchmark.csv")
     import csv
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["model", "accuracy", "far", "frr", "eer", "threshold", "time_s"])

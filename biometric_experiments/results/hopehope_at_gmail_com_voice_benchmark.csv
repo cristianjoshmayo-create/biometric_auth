@@ -1,0 +1,4 @@
+model,accuracy,far,frr,eer,threshold,time_s
+MFCC + HMM (Gaussian),0.6878,0.0000,1.0000,0.5000,inf,0.0006
+CNN (1-D MFCC),0.9209,0.0787,0.0800,0.0793,0.1275,0.2015
+LSTM (voice),0.9906,0.0121,0.0033,0.0077,0.6493,0.2649
