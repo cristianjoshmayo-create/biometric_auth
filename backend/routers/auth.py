@@ -539,12 +539,12 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    model_path = os.path.join(_model_dir(), f"{_safe_filename(payload.username)}_voice_cnn.pkl")
 
-    # ── PRIMARY AUTH: Azure Speaker Recognition ───────────────────────────
-    # Sends raw audio WAV to Azure cloud API for speaker verification.
-    # Azure returns Accept/Reject + confidence score.
-    # No local ML model, no PyTorch, no DLL issues.
+    # ── PRIMARY AUTH: ECAPA-TDNN Speaker Verification ─────────────────────
+    # Uses the pretrained SpeechBrain ECAPA-TDNN model (192-dim embeddings).
+    # The ecapa_embedding was extracted from raw audio during /extract-mfcc
+    # and is sent here as part of the VoiceAuth payload.
+    # No per-user training needed — just cosine similarity vs enrolled profile.
     confidence    = 0.0
     authenticated = False
     try:
@@ -553,75 +553,29 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
         ))
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
-        from ml.voice_azure import predict_voice as azure_predict, is_available as azure_ok
+        from ml.voice_ecapa import predict_voice as ecapa_predict
 
-        if not azure_ok():
-            print("  ⚠  Azure not configured — set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION")
+        ecapa_embedding = getattr(payload, 'ecapa_embedding', []) or []
+        if ecapa_embedding:
+            ecapa_r       = ecapa_predict(payload.username, ecapa_embedding)
+            confidence    = ecapa_r.get("confidence", 0.0) / 100.0   # normalise to [0,1]
+            authenticated = ecapa_r.get("match", False)
+            print(f"  [ECAPA] similarity={ecapa_r.get('similarity', 0):.4f}  "
+                  f"threshold={ecapa_r.get('threshold', 0):.2f}  "
+                  f"→ {'PASS' if authenticated else 'FAIL'}")
+            if "error" in ecapa_r:
+                print(f"  [ECAPA] note: {ecapa_r['error']}")
         else:
-            # Decode the raw audio from payload for Azure
-            import base64, numpy as np, librosa, tempfile, os as _os
-            raw_audio_b64 = getattr(payload, 'raw_audio_b64', None)
-            if raw_audio_b64:
-                audio_bytes = base64.b64decode(raw_audio_b64)
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp.write(audio_bytes)
-                    tmp_path = tmp.name
-                try:
-                    audio, sr = librosa.load(tmp_path, sr=16000, mono=True)
-                    az_result     = azure_predict(payload.username, audio, sr=sr)
-                    confidence    = az_result.get("confidence", 0.0)
-                    authenticated = az_result.get("match", False)
-                    print(f"  [Azure] result={az_result.get('result')}  "
-                          f"score={confidence:.4f}  "
-                          f"→ {'PASS' if authenticated else 'FAIL'}")
-                    if "error" in az_result:
-                        print(f"  [Azure] note: {az_result['error']}")
-                finally:
-                    _os.unlink(tmp_path)
-            else:
-                print("  ⚠  Azure: no raw_audio_b64 in payload — re-enroll required")
+            print("  ⚠  ECAPA: no embedding in payload — re-enroll voice to generate ECAPA profile")
+            confidence    = 0.0
+            authenticated = False
 
     except Exception as e:
-        print(f"[voice] Azure error: {e}")
+        print(f"[voice] ECAPA error: {e}")
         import traceback; traceback.print_exc()
         confidence    = 0.0
         authenticated = False
 
-    # ── SECONDARY (logged only — not used for decision) ───────────────────
-    # CNN and Resemblyzer still run so you can compare scores in the console.
-    # Their results do NOT affect whether the user is granted access.
-    try:
-        from ml.train_voice_cnn import predict_voice as cnn_predict
-        if os.path.exists(model_path):
-            feature_dict = {
-                "mfcc_features":          payload.mfcc_features,
-                "mfcc_std":               payload.mfcc_std,
-                "delta_mfcc_mean":        payload.delta_mfcc_mean,
-                "delta2_mfcc_mean":       payload.delta2_mfcc_mean,
-                "pitch_mean":             payload.pitch_mean,
-                "pitch_std":              payload.pitch_std,
-                "speaking_rate":          payload.speaking_rate,
-                "energy_mean":            payload.energy_mean,
-                "energy_std":             payload.energy_std,
-                "zcr_mean":               payload.zcr_mean,
-                "spectral_centroid_mean": payload.spectral_centroid_mean,
-                "spectral_rolloff_mean":  payload.spectral_rolloff_mean,
-                "spectral_flux_mean":     payload.spectral_flux_mean,
-                "voiced_fraction":        payload.voiced_fraction,
-            }
-            cnn_r = cnn_predict(payload.username, feature_dict)
-            print(f"  [CNN log-only] fused={cnn_r.get('fused_score', 0):.1f}%")
-        else:
-            print(f"  [CNN log-only] no model yet for '{payload.username}'")
-    except Exception as _e:
-        print(f"  [CNN log-only] skipped — {_e}")
-
-    try:
-        from ml.voice_resemblyzer import predict_voice as resem_predict
-        resem_r = resem_predict(payload.username, getattr(payload, 'resemblyzer_embedding', []))
-        print(f"  [Resemblyzer log-only] similarity={resem_r.get('similarity', 0):.4f}")
-    except Exception as _e:
-        print(f"  [Resemblyzer log-only] skipped — {_e}")
 
     print(f"[voice] user={payload.username}  "
           f"confidence={confidence:.3f}  result={'PASS' if authenticated else 'FAIL'}")
@@ -641,103 +595,18 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
             db.commit()
             print(f"  ⚠️ User '{payload.username}' flagged after {voice_denials} voice failures")
 
-    # ── Adaptive learning: save login sample and retrain periodically ─────
+    # ── Adaptive learning: update ECAPA profile with new login embedding ────
+    # ECAPA needs no retraining — just append the new embedding to the profile
+    # so the mean vector gradually adapts to the user's voice over time.
     if authenticated:
-        MAX_VOICE_SAMPLES = 50
-
-        total_voice = db.query(VoiceTemplate).filter(
-            VoiceTemplate.user_id == user.id
-        ).count()
-
-        # Rolling window — delete oldest if at limit
-        if total_voice >= MAX_VOICE_SAMPLES:
-            oldest = db.query(VoiceTemplate).filter(
-                VoiceTemplate.user_id == user.id
-            ).order_by(VoiceTemplate.attempt_number.asc()).first()
-            if oldest:
-                db.delete(oldest)
-                db.flush()
-
-        # Save this login attempt as a new voice sample (with ALL v2 fields)
-        new_voice = VoiceTemplate(
-            user_id        = user.id,
-            attempt_number = min(total_voice + 1, MAX_VOICE_SAMPLES),
-            mfcc_features  = payload.mfcc_features,
-            mfcc_std       = payload.mfcc_std,
-            pitch_mean     = payload.pitch_mean,
-            pitch_std      = payload.pitch_std,
-            speaking_rate  = payload.speaking_rate,
-            energy_mean    = payload.energy_mean,
-            energy_std     = payload.energy_std,
-            zcr_mean               = payload.zcr_mean,
-            spectral_centroid_mean = payload.spectral_centroid_mean,
-            spectral_rolloff_mean  = payload.spectral_rolloff_mean,
-            delta_mfcc_mean        = payload.delta_mfcc_mean,    # v2
-            delta2_mfcc_mean       = payload.delta2_mfcc_mean,   # v2
-            spectral_flux_mean     = payload.spectral_flux_mean, # v2
-            voiced_fraction        = payload.voiced_fraction,    # v2
-            snr_db                 = payload.snr_db,             # v2
-        )
-        db.add(new_voice)
-        db.commit()
-
-        updated_voice_count = db.query(VoiceTemplate).filter(
-            VoiceTemplate.user_id == user.id
-        ).count()
-
-        print(f"  💾 Saved voice login sample (total: {updated_voice_count}/{MAX_VOICE_SAMPLES})")
-
-        # Adaptive retrain intervals
-        successful_voice_logins = db.query(AuthLog).filter(
-            AuthLog.user_id == user.id,
-            AuthLog.auth_method == "voice",
-            AuthLog.result == "granted"
-        ).count()
-
-        if updated_voice_count <= 10:
-            retrain_interval = 2
-        elif updated_voice_count <= 30:
-            retrain_interval = 5
-        else:
-            retrain_interval = 10
-
-        voice_milestones = [10, 20, 30, 40, 50]
-        should_retrain = (
-            successful_voice_logins % retrain_interval == 0 or
-            updated_voice_count in voice_milestones
-        )
-
-        if should_retrain:
-            retrain_reason = (
-                f"milestone ({updated_voice_count} samples)"
-                if updated_voice_count in voice_milestones
-                else f"interval ({retrain_interval} logins)"
-            )
-            print(f"  🔄 Triggering voice retrain: {retrain_reason}")
-            try:
-                script_path = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                    'ml', 'train_voice_cnn.py'
-                )
-                lock_path = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                    'ml', 'models', f"{_safe_filename(payload.username)}_voice_cnn.pkl.retraining"
-                )
-                # Skip if another retrain is already running for this user
-                if not os.path.exists(lock_path):
-                    open(lock_path, 'w').close()
-                    subprocess.Popen(
-                        [sys.executable, script_path, payload.username,
-                         f"--lock={lock_path}"],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-                    )
-                    print(f"  ✅ Voice retraining started in background")
-                else:
-                    print(f"  ⏭  Voice retrain skipped — already running")
-            except Exception as e:
-                print(f"  ⚠️ Voice retrain failed to start: {e}")
+        try:
+            from ml.voice_ecapa import save_enrollment as ecapa_enroll
+            ecapa_embedding = getattr(payload, 'ecapa_embedding', []) or []
+            if ecapa_embedding:
+                ecapa_enroll(payload.username, ecapa_embedding)
+                print(f"  💾 ECAPA profile updated with login embedding")
+        except Exception as _e:
+            print(f"  ⚠️ ECAPA profile update skipped: {_e}")
 
     return {"authenticated": bool(authenticated), "confidence": float(confidence)}
 

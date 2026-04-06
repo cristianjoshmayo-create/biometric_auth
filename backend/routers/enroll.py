@@ -468,6 +468,7 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == payload.username).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    print(f"  [DEBUG] ecapa_embedding in payload: len={len(getattr(payload, 'ecapa_embedding', []))}")
 
     missing_features = (
         not payload.mfcc_std or all(v == 0 for v in payload.mfcc_std)
@@ -522,11 +523,22 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
     # The /enroll/voice endpoint receives features only — no raw audio.
     # Azure profile was already updated when /extract-mfcc was called.
     # Nothing to do here for Azure.
-    print(f"  Azure: enrollment recording saved via extract-mfcc step.")
+    # ── Save ECAPA-TDNN profile (pkl file used at auth time) ─────────────────
+    ecapa_emb = getattr(payload, 'ecapa_embedding', None) or []
+    if ecapa_emb and len(ecapa_emb) == 192:
+        try:
+            project_root = os.path.normpath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+            )
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            from ml.voice_ecapa import save_enrollment as ecapa_save
+            ecapa_save(payload.username, ecapa_emb)
+        except Exception as _ecapa_err:
+            print(f"  ⚠  ECAPA profile save failed: {_ecapa_err}")
+    else:
+        print(f"  ⚠  ECAPA: no valid embedding in payload (len={len(ecapa_emb)}) — profile not updated")
 
-    training_started = attempt_num >= MAX_VOICE_SAMPLES
-    if training_started:
-        trigger_voice_training(payload.username)
 
     return {
         "success":             True,
@@ -534,8 +546,8 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
         "message":             f"Voice attempt #{attempt_num} saved",
         "attempt_number":      attempt_num,
         "has_full_features":   not missing_features,
-        "training_started":    training_started,
-        "training_note":       "Voice model training started in background." if training_started else "",
+        "training_started":    False,
+        "training_note":       "",
     }
 
 

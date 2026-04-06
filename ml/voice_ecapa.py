@@ -29,13 +29,80 @@ import pickle
 import numpy as np
 from typing import List, Optional
 
-# ── Windows symlink fix — MUST be set before speechbrain/huggingface imports ──
-# WinError 1314 happens because HuggingFace tries to create symlinks which
-# require Developer Mode or admin rights on Windows. Setting these env vars
-# forces it to copy files instead. Must be done before any HF/SpeechBrain
-# import because the strategy is read at import time, not at download time.
+# ── Windows symlink fix — applied at MODULE LOAD TIME, before any SpeechBrain ──
+# import touches the filesystem.
+#
+# Root cause of WinError 1314:
+#   HuggingFace hub + SpeechBrain's Pretrainer both default to LocalStrategy.SYMLINK.
+#   Creating symlinks on Windows requires Developer Mode or admin rights.
+#
+# Fix — three layers to be 100% sure:
+#   1. Env var: tells HF hub to copy instead of symlink.
+#   2. Monkey-patch fetching.fetch() default arg → LocalStrategy.COPY.
+#   3. Remap LocalStrategy.SYMLINK → COPY so any caller that passes the enum
+#      value explicitly (including Pretrainer.collect) still ends up copying.
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 os.environ["HUGGINGFACE_HUB_VERBOSITY"] = "warning"
+
+def _apply_speechbrain_copy_patch():
+    """
+    Force SpeechBrain to use file-copy instead of symlinks on Windows.
+    Must be called before EncoderClassifier (or any SpeechBrain inference class)
+    is imported, because Pretrainer reads the strategy at instantiation time.
+    """
+    try:
+        import speechbrain.utils.fetching as _sb_fetch
+
+        _COPY = _sb_fetch.LocalStrategy.COPY
+
+        # Layer 2 — patch the fetch() function so its default is COPY
+        _orig_fetch = _sb_fetch.fetch
+
+        def _patched_fetch(filename, source, savedir=None, save_filename=None,
+                           local_strategy=_COPY,
+                           fetch_config=_sb_fetch.FetchConfig()):
+            return _orig_fetch(filename, source, savedir=savedir,
+                               save_filename=save_filename,
+                               local_strategy=_COPY,   # always COPY, ignore caller's value
+                               fetch_config=fetch_config)
+
+        _sb_fetch.fetch = _patched_fetch
+
+        # Layer 3 — remap the SYMLINK enum member to COPY so Pretrainer.collect()
+        # which passes local_strategy=LocalStrategy.SYMLINK explicitly also copies.
+        try:
+            _sb_fetch.LocalStrategy.SYMLINK = _COPY
+        except (AttributeError, TypeError):
+            pass  # read-only enum on some versions — layer 2 is sufficient
+
+        # Propagate patch to parameter_transfer which has its own 'fetch' reference
+        try:
+            import speechbrain.utils.parameter_transfer as _sb_pt
+            if hasattr(_sb_pt, "fetch"):
+                _sb_pt.fetch = _patched_fetch
+            # Also patch Pretrainer.collect default kwarg if accessible
+            import inspect, functools
+            if hasattr(_sb_pt, "Pretrainer"):
+                _orig_collect = _sb_pt.Pretrainer.collect
+
+                @functools.wraps(_orig_collect)
+                async def _patched_collect(self, *args, **kwargs):
+                    kwargs.setdefault("local_strategy", _COPY)
+                    kwargs["local_strategy"] = _COPY
+                    return await _orig_collect(self, *args, **kwargs)
+
+                _sb_pt.Pretrainer.collect = _patched_collect
+        except Exception:
+            pass  # non-critical; layers 1+2 already cover most cases
+
+        print("  SpeechBrain patched → LocalStrategy.COPY (no symlinks)")
+        return True
+    except Exception as e:
+        print(f"  SpeechBrain patch skipped: {e}")
+        return False
+
+# Apply the patch NOW, before EncoderClassifier is imported below.
+_apply_speechbrain_copy_patch()
 
 # ── SpeechBrain import with friendly error ────────────────────────────────────
 try:
@@ -123,39 +190,6 @@ def _get_encoder() -> Optional["EncoderClassifier"]:
     try:
         print("  Loading ECAPA-TDNN pretrained model ...")
         print("  (Downloads ~80 MB from HuggingFace on first run — cached after that)")
-
-        # ── Windows WinError 1314 permanent fix ──────────────────────────────
-        # SpeechBrain.fetch() defaults to LocalStrategy.SYMLINK which requires
-        # Developer Mode or admin rights on Windows.
-        # Fix: monkey-patch the fetch() default argument to LocalStrategy.COPY,
-        # which uses shutil.copy() instead — works on any Windows setup.
-        try:
-            import inspect, speechbrain.utils.fetching as _sb_fetch
-
-            # Patch fetch() to use COPY instead of SYMLINK as its default strategy
-            _orig_fetch = _sb_fetch.fetch
-            _COPY = _sb_fetch.LocalStrategy.COPY
-
-            def _patched_fetch(filename, source, savedir=None, save_filename=None,
-                               local_strategy=_COPY, fetch_config=_sb_fetch.FetchConfig()):
-                return _orig_fetch(filename, source, savedir=savedir,
-                                   save_filename=save_filename,
-                                   local_strategy=local_strategy,
-                                   fetch_config=fetch_config)
-
-            _sb_fetch.fetch = _patched_fetch
-
-            # Also patch it on the parameter_transfer module which imports fetch directly
-            try:
-                import speechbrain.utils.parameter_transfer as _sb_pt
-                if hasattr(_sb_pt, "fetch"):
-                    _sb_pt.fetch = _patched_fetch
-            except Exception:
-                pass
-
-            print("  SpeechBrain patched → LocalStrategy.COPY (no symlinks)")
-        except Exception as _patch_err:
-            print(f"  SpeechBrain patch skipped: {_patch_err}")
 
         # Download / locate the model snapshot in the HuggingFace cache.
         try:
