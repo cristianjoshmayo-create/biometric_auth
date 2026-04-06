@@ -1,9 +1,17 @@
 # backend/schemas.py
 # Shared Pydantic base models.
 #
-# Previously VoiceEnroll (enroll.py) and VoiceAuth (auth.py) were maintained
-# separately and had already drifted — auth.py was missing the 4 v2 fields.
-# Both now inherit from VoiceFeatures so they can never drift again.
+# VoiceFeatures is the single source of truth for all voice fields — both
+# enrollment (VoiceEnroll) and authentication (VoiceAuth) inherit from it
+# so the two can never drift out of sync again.
+#
+# v4 adds:
+#   mfcc_frames : List[List[float]]
+#     Raw per-frame MFCC matrix returned by /enroll/extract-mfcc.
+#     Shape: (T, 13) stored as a list of lists.
+#     Required by the CNN model for sequence-level training and inference.
+#     Defaults to [] for backwards compatibility with old enrolled users
+#     (they will fall back to CNN score = 0.0 until they re-enroll).
 
 from pydantic import BaseModel
 from typing import List
@@ -11,7 +19,7 @@ from typing import List
 
 class VoiceFeatures(BaseModel):
     """
-    All 62 voice features extracted by extract-mfcc.
+    All voice features extracted by /enroll/extract-mfcc.
     Shared by enrollment and authentication — single source of truth.
     """
     mfcc_features:          List[float]
@@ -34,3 +42,8 @@ class VoiceFeatures(BaseModel):
     spectral_flux_mean:     float = 0
     voiced_fraction:        float = 0
     snr_db:                 float = 0   # quality logging only
+
+    # v4 CNN — raw per-frame MFCC matrix (T × 13)
+    # Returned by /enroll/extract-mfcc and stored in voice_templates.mfcc_frames.
+    # If empty (old enrolled users), CNN inference falls back to score=0.0.
+    mfcc_frames:            List[List[float]] = []

@@ -82,11 +82,6 @@ class KeystrokeTemplate(Base):
     digraph_at = Column(Float, default=0)
     digraph_on = Column(Float, default=0)
 
-    # Phrase-specific digraph timings — all letter pairs that appear in the
-    # user's unique passphrase.  Stored as {pair: mean_ms, ...} so the model
-    # can use them without adding new Float columns per user.
-    # Required DB migration (run once):
-    #   ALTER TABLE keystroke_templates ADD COLUMN extra_digraphs JSON DEFAULT '{}';
     extra_digraphs = Column(JSON, default=dict)
 
     typing_speed_cpm        = Column(Float, default=0)
@@ -148,6 +143,15 @@ class VoiceTemplate(Base):
     spectral_flux_mean = Column(Float, default=0)
     voiced_fraction    = Column(Float, default=0)
     snr_db             = Column(Float, default=0)
+
+    # v4 CNN — raw per-frame MFCC matrix stored as JSON.
+    # Shape when loaded: list of T lists of 13 floats  →  (T, 13).
+    # The CNN training script converts this to a (39, T_MAX) tensor by
+    # computing delta + delta² on the fly and padding to T_MAX=300 frames.
+    # Run the migration SQL before deploying this change:
+    #   ALTER TABLE voice_templates
+    #   ADD COLUMN IF NOT EXISTS mfcc_frames JSON DEFAULT '[]';
+    mfcc_frames = Column(JSON, default=list)
 
     enrolled_at = Column(DateTime, default=func.now())
     user = relationship("User", back_populates="voice_template")

@@ -504,7 +504,8 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
     )
 
     # Save new fields if the model column exists (graceful for older DB schemas)
-    for field in ['delta_mfcc_mean', 'delta2_mfcc_mean', 'spectral_flux_mean', 'voiced_fraction', 'snr_db']:
+    for field in ['delta_mfcc_mean', 'delta2_mfcc_mean', 'spectral_flux_mean',
+                  'voiced_fraction', 'snr_db', 'mfcc_frames']:
         val = getattr(payload, field, None)
         if val is not None and hasattr(template, field):
             setattr(template, field, val)
@@ -943,6 +944,7 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
             "mfcc_std":             mfcc_std.tolist(),
             "delta_mfcc_mean":      delta_mfcc_mean.tolist(),   # NEW
             "delta2_mfcc_mean":     delta2_mfcc_mean.tolist(),  # NEW
+            "mfcc_frames":          mfcc_cmvn.T.tolist(),        # CNN v4: raw (T,13) frame matrix
             "pitch_mean":           pitch_mean,
             "pitch_std":            pitch_std,
             "speaking_rate":        speaking_rate,

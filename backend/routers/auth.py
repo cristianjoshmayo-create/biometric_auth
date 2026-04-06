@@ -13,6 +13,8 @@ import sys
 import subprocess
 import bcrypt  # ← ADDED
 
+from utils.fusion import fuse_keystroke_scores, fuse_voice_scores, fuse_multimodal
+
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion, AuthLog
 from schemas import VoiceFeatures
@@ -324,10 +326,9 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                 authenticated = False
                 print(f"  \u26d4 Hard reject: {reject_reason}")
             else:
-                # RF=75% + Mahalanobis=25%.  Mah acts as geometric sanity check:
-                # if RF is overconfident but timing is far from the enrolled
-                # cluster, the Mah term pulls the fused score down.
-                confidence    = 0.75 * rf_score + 0.25 * mah_score
+                # Intra-modal fusion: RF (75%) + Mahalanobis (25%).
+                # Weights are defined in utils/fusion.py — single source of truth.
+                confidence    = fuse_keystroke_scores(rf_score, mah_score)
                 authenticated = confidence >= threshold
 
             print(f"  RF={rf_score:.3f}  Mah={mah_score:.3f}  "
@@ -567,6 +568,7 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
                 "spectral_rolloff_mean":  payload.spectral_rolloff_mean,
                 "spectral_flux_mean":     payload.spectral_flux_mean,     # v2
                 "voiced_fraction":        payload.voiced_fraction,        # v2
+                "mfcc_frames":            payload.mfcc_frames,            # v4 CNN
             }
 
             result = predict_voice(payload.username, feature_dict)

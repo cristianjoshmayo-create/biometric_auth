@@ -939,8 +939,10 @@ def predict_keystroke(username: str, feature_dict: dict) -> dict:
 
     rf_score  = float(pipeline.predict_proba(vec.reshape(1, -1))[0][1])
     mah_score = mahalanobis_score(vec, profile_mean, profile_std)
-    fused     = 0.75 * rf_score + 0.25 * mah_score
-    match     = fused >= threshold
+
+    from utils.fusion import fuse_keystroke_scores
+    fused = fuse_keystroke_scores(rf_score, mah_score)
+    match = fused >= threshold
 
     return {
         'match':      bool(match),
