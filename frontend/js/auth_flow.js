@@ -314,19 +314,12 @@ async function submitSecurityAuth() {
         const result = await Api.verifySecurityQuestion(authUsername, answer);
 
         if (result.authenticated) {
-            // Correct → re-authenticate from keystroke (Figure 9)
-            status.textContent = "✅ Correct! Please re-authenticate with your biometrics.";
+            // Correct → grant access directly (security question IS the fallback auth)
+            status.textContent = "✅ Correct! Access granted.";
             status.className   = "text-center text-sm mb-4 text-green-400";
             setTimeout(() => {
-                _ksScore       = null;
-                _voiceScore    = null;
-                failedAttempts = 0;
-                [1, 2, 3].forEach(i => {
-                    const dot = document.getElementById(`fail-${i}`);
-                    if (dot) dot.classList.replace("bg-red-500", "bg-gray-700");
-                });
-                moveToKeystrokeAuth();
-            }, 1500);
+                showSuccess("Security Question", 1.0);
+            }, 800);
         } else {
             // Wrong → flagged and rejected
             recordFailedAttempt();

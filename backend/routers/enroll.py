@@ -538,6 +538,9 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
             print(f"  ⚠  ECAPA profile save failed: {_ecapa_err}")
     else:
         print(f"  ⚠  ECAPA: no valid embedding in payload (len={len(ecapa_emb)}) — profile not updated")
+        print(f"  ⚠  Root cause: SpeechBrain/ECAPA failed during /extract-mfcc for '{payload.username}'.")
+        print(f"  ⚠  Check the server logs from the /extract-mfcc call above for the real error.")
+        print(f"  ⚠  This user will FAIL voice auth. They must re-enroll after fixing ECAPA.")
 
 
     return {
@@ -977,7 +980,9 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
             else:
                 print("  ⚠  ECAPA embedding returned None — check SpeechBrain install")
         except Exception as _ecapa_err:
-            print(f"  ⚠  ECAPA extraction skipped: {_ecapa_err}")
+            import traceback as _tb
+            print(f"  ⚠  ECAPA extraction FAILED: {type(_ecapa_err).__name__}: {_ecapa_err}")
+            _tb.print_exc()
 
         return {
             "success":              True,

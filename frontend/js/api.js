@@ -1,11 +1,15 @@
 // frontend/js/api.js
-// FIXED v3:
-//  1. Single API_BASE constant — change here, affects everywhere (was duplicated in speech.js too)
-//  2. enrollVoice and verifyVoice now forward ALL 62 features (delta_mfcc_mean,
-//     delta2_mfcc_mean, spectral_flux_mean, voiced_fraction were silently dropped)
+// FIXED v4:
+//  1. API_BASE auto-detects the current host — works for both localhost AND ngrok/remote.
+//     No longer relies on main.py rewriting this file at serve time.
+//  2. enrollVoice and verifyVoice forward ALL 62 features
 //  3. verifyVoice passes snr_db for server-side logging
 
-const API_BASE = "http://127.0.0.1:8000/api";
+// Auto-detect the backend URL from wherever the page is being served.
+// - On localhost: resolves to "http://127.0.0.1:8000/api"
+// - On ngrok:     resolves to "https://abc123.ngrok-free.app/api"
+// - On any host:  always correct, no manual changes needed
+const API_BASE = `${window.location.protocol}//${window.location.host}/api`;
 
 // ── Shared voice feature builder ──────────────────────────────────────────────
 // Single source of truth — used by both enroll and verify so they can never drift.
