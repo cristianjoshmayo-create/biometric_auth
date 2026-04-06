@@ -27,6 +27,10 @@ function _buildVoicePayload(username, d) {
         spectral_flux_mean:     d.spectral_flux_mean     || 0,    // v2 feature
         voiced_fraction:        d.voiced_fraction        || 0,    // v2 feature
         snr_db:                 d.snr_db                 || 0,    // for logging
+        // ECAPA-TDNN embedding (kept for compatibility).
+        ecapa_embedding:        d.ecapa_embedding        || [],
+        // Raw WAV audio as base64 — forwarded to Azure Speaker Recognition for auth.
+        raw_audio_b64:          d.raw_audio_b64          || "",
     };
 }
 

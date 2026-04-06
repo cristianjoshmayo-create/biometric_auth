@@ -554,6 +554,10 @@ const SpeechCapture = {
                 spectral_flux_mean:     result.spectral_flux_mean     || 0,
                 voiced_fraction:        result.voiced_fraction        || 0,
                 snr_db:                 result.snr_db                 || 0,
+                // ECAPA-TDNN 192-dim embedding (kept for compatibility).
+                ecapa_embedding:        result.ecapa_embedding        || [],
+                // Raw audio as base64 WAV — sent to Azure Speaker Recognition during auth.
+                raw_audio_b64:          base64Audio,
             };
 
             // Route to enrollment or auth callback

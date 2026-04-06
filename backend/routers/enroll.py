@@ -140,7 +140,7 @@ def _run_voice_training(username: str):
         )
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
-        from ml.ml.train_voice_cnn import train_voice_model
+        from ml.train_voice_cnn import train_voice_model
         print(f"\n🔄 Auto-training voice model for '{username}' ...")
         model_path = train_voice_model(username)
         if model_path:
@@ -518,23 +518,11 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
           f"pitch={payload.pitch_mean:.1f}Hz  energy={payload.energy_mean:.4f}  "
           f"snr={payload.snr_db:.1f}dB  voiced={payload.voiced_fraction:.0%}")
 
-    # ── Update ECAPA profile immediately after every recording ────────────
-    # Profile = mean of all enrollment embeddings — no training step needed.
-    # Auth works after the very first recording.
-    ecapa_emb = getattr(payload, 'ecapa_embedding', None)
-    if ecapa_emb and len(ecapa_emb) == 192:
-        try:
-            project_root = os.path.normpath(
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
-            )
-            if project_root not in sys.path:
-                sys.path.insert(0, project_root)
-            from ml.voice_ecapa import save_enrollment as ecapa_save
-            ecapa_save(payload.username, ecapa_emb)
-        except Exception as _ecapa_err:
-            print(f"  ⚠  ECAPA profile update skipped: {_ecapa_err}")
-    else:
-        print(f"  ⚠  ECAPA: no valid embedding in payload (len={len(ecapa_emb) if ecapa_emb else 0})")
+    # ── Azure enrollment is handled inside extract_mfcc (raw audio sent there) ──
+    # The /enroll/voice endpoint receives features only — no raw audio.
+    # Azure profile was already updated when /extract-mfcc was called.
+    # Nothing to do here for Azure.
+    print(f"  Azure: enrollment recording saved via extract-mfcc step.")
 
     training_started = attempt_num >= MAX_VOICE_SAMPLES
     if training_started:
@@ -668,6 +656,7 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
     try:
         audio_bytes  = base64.b64decode(payload.audio_data)
         audio_format = payload.audio_format or "webm"
+        username_for_azure = (payload.username or "").strip().lower()
 
         print(f"\n{'='*60}")
         print(f"IMPROVED VOICE FEATURE EXTRACTION")
@@ -751,8 +740,10 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
                     stationary=False,
                     prop_decrease=0.75,
                 ).astype(np.float32)
-            except ImportError:
-                print("  noisereduce not installed — falling back to spectral subtraction")
+            except (ImportError, OSError) as _nr_err:
+                # OSError catches WinError 1114 — torch DLL failed to load.
+                # Fall back to built-in spectral subtraction so enrollment still works.
+                print(f"  noisereduce unavailable ({type(_nr_err).__name__}) — falling back to spectral subtraction")
                 audio_clean = _spectral_subtraction(audio, sr)
         else:
             audio_clean = audio

@@ -1,5 +1,14 @@
 # backend/main.py
 
+# ── Windows symlink fix — must be before ALL other imports ────────────────────
+# Prevents WinError 1314 when SpeechBrain downloads the ECAPA-TDNN model.
+# HuggingFace uses symlinks by default; on Windows this requires Developer Mode
+# or admin rights. These vars force file copies instead.
+import os
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+os.environ["HUGGINGFACE_HUB_VERBOSITY"] = "warning"
+# ─────────────────────────────────────────────────────────────────────────────
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles

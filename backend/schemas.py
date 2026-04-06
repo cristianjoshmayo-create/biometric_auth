@@ -57,3 +57,8 @@ class VoiceFeatures(BaseModel):
     # Returned by /enroll/extract-mfcc and stored in voice_templates.mfcc_frames.
     # If empty (old enrolled users), CNN inference falls back to score=0.0.
     mfcc_frames:            List[List[float]] = []
+
+    # Azure Speaker Recognition — raw audio passed through for auth verification.
+    # Base64-encoded WAV bytes from the browser recording.
+    # Only used during authentication (not stored).
+    raw_audio_b64:          str = ""

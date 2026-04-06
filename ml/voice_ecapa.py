@@ -29,6 +29,14 @@ import pickle
 import numpy as np
 from typing import List, Optional
 
+# ── Windows symlink fix — MUST be set before speechbrain/huggingface imports ──
+# WinError 1314 happens because HuggingFace tries to create symlinks which
+# require Developer Mode or admin rights on Windows. Setting these env vars
+# forces it to copy files instead. Must be done before any HF/SpeechBrain
+# import because the strategy is read at import time, not at download time.
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+os.environ["HUGGINGFACE_HUB_VERBOSITY"] = "warning"
+
 # ── SpeechBrain import with friendly error ────────────────────────────────────
 try:
     import torch
@@ -115,10 +123,53 @@ def _get_encoder() -> Optional["EncoderClassifier"]:
     try:
         print("  Loading ECAPA-TDNN pretrained model ...")
         print("  (Downloads ~80 MB from HuggingFace on first run — cached after that)")
-        os.makedirs(_PRETRAINED_DIR, exist_ok=True)
+
+        # ── Windows WinError 1314 permanent fix ──────────────────────────────
+        # SpeechBrain.fetch() defaults to LocalStrategy.SYMLINK which requires
+        # Developer Mode or admin rights on Windows.
+        # Fix: monkey-patch the fetch() default argument to LocalStrategy.COPY,
+        # which uses shutil.copy() instead — works on any Windows setup.
+        try:
+            import inspect, speechbrain.utils.fetching as _sb_fetch
+
+            # Patch fetch() to use COPY instead of SYMLINK as its default strategy
+            _orig_fetch = _sb_fetch.fetch
+            _COPY = _sb_fetch.LocalStrategy.COPY
+
+            def _patched_fetch(filename, source, savedir=None, save_filename=None,
+                               local_strategy=_COPY, fetch_config=_sb_fetch.FetchConfig()):
+                return _orig_fetch(filename, source, savedir=savedir,
+                                   save_filename=save_filename,
+                                   local_strategy=local_strategy,
+                                   fetch_config=fetch_config)
+
+            _sb_fetch.fetch = _patched_fetch
+
+            # Also patch it on the parameter_transfer module which imports fetch directly
+            try:
+                import speechbrain.utils.parameter_transfer as _sb_pt
+                if hasattr(_sb_pt, "fetch"):
+                    _sb_pt.fetch = _patched_fetch
+            except Exception:
+                pass
+
+            print("  SpeechBrain patched → LocalStrategy.COPY (no symlinks)")
+        except Exception as _patch_err:
+            print(f"  SpeechBrain patch skipped: {_patch_err}")
+
+        # Download / locate the model snapshot in the HuggingFace cache.
+        try:
+            from huggingface_hub import snapshot_download
+            savedir = snapshot_download(repo_id="speechbrain/spkrec-ecapa-voxceleb")
+            print(f"  Model cache: {savedir}")
+        except Exception as hf_err:
+            print(f"  snapshot_download failed ({hf_err}), using local dir")
+            savedir = _PRETRAINED_DIR
+            os.makedirs(savedir, exist_ok=True)
+
         _encoder_instance = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            savedir=_PRETRAINED_DIR,
+            source=savedir,
+            savedir=savedir,
             run_opts={"device": "cpu"},
         )
         print("  ✅ ECAPA-TDNN model loaded")

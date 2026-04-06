@@ -541,34 +541,48 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
 
     model_path = os.path.join(_model_dir(), f"{_safe_filename(payload.username)}_voice_cnn.pkl")
 
-    # ── PRIMARY AUTH: ECAPA-TDNN pretrained speaker verification ────────────
-    # Works after the first enrollment recording. No pkl model file needed —
-    # just the profile built by save_enrollment() during voice enrollment.
+    # ── PRIMARY AUTH: Azure Speaker Recognition ───────────────────────────
+    # Sends raw audio WAV to Azure cloud API for speaker verification.
+    # Azure returns Accept/Reject + confidence score.
+    # No local ML model, no PyTorch, no DLL issues.
+    confidence    = 0.0
+    authenticated = False
     try:
         project_root = os.path.normpath(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), '..', '..'
         ))
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
-        from ml.voice_ecapa import predict_voice as ecapa_predict
+        from ml.voice_azure import predict_voice as azure_predict, is_available as azure_ok
 
-        ecapa_result  = ecapa_predict(
-            payload.username,
-            getattr(payload, 'ecapa_embedding', [])
-        )
-        confidence    = ecapa_result["similarity"]
-        authenticated = ecapa_result["match"]
-
-        print(f"  [ECAPA] similarity={ecapa_result['similarity']:.4f}  "
-              f"threshold={ecapa_result['threshold']:.2f}  "
-              f"n_enrolled={ecapa_result.get('n_enrollment', '?')}  "
-              f"→ {'PASS' if authenticated else 'FAIL'}")
-
-        if "error" in ecapa_result:
-            print(f"  [ECAPA] note: {ecapa_result['error']}")
+        if not azure_ok():
+            print("  ⚠  Azure not configured — set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION")
+        else:
+            # Decode the raw audio from payload for Azure
+            import base64, numpy as np, librosa, tempfile, os as _os
+            raw_audio_b64 = getattr(payload, 'raw_audio_b64', None)
+            if raw_audio_b64:
+                audio_bytes = base64.b64decode(raw_audio_b64)
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(audio_bytes)
+                    tmp_path = tmp.name
+                try:
+                    audio, sr = librosa.load(tmp_path, sr=16000, mono=True)
+                    az_result     = azure_predict(payload.username, audio, sr=sr)
+                    confidence    = az_result.get("confidence", 0.0)
+                    authenticated = az_result.get("match", False)
+                    print(f"  [Azure] result={az_result.get('result')}  "
+                          f"score={confidence:.4f}  "
+                          f"→ {'PASS' if authenticated else 'FAIL'}")
+                    if "error" in az_result:
+                        print(f"  [Azure] note: {az_result['error']}")
+                finally:
+                    _os.unlink(tmp_path)
+            else:
+                print("  ⚠  Azure: no raw_audio_b64 in payload — re-enroll required")
 
     except Exception as e:
-        print(f"[voice] ECAPA error: {e}")
+        print(f"[voice] Azure error: {e}")
         import traceback; traceback.print_exc()
         confidence    = 0.0
         authenticated = False
