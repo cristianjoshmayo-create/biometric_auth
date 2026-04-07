@@ -167,30 +167,28 @@
             <p id="vattempt-label" class="text-center text-gray-400 text-sm mb-3">
                 Recording 1 of 3
             </p>
-            <div id="recording-indicator"
-                 class="hidden w-16 h-16 rounded-full bg-red-600 mx-auto mb-4
-                        flex items-center justify-center animate-pulse">
-                <span class="text-white text-2xl">🎤</span>
-            </div>
-
-            <!-- Live audio level meter -->
-            <div class="mb-3 px-1">
-                <div class="flex justify-between text-xs text-gray-500 mb-1">
-                    <span>🔇 Quiet</span>
-                    <span id="diag-text" class="text-gray-400 text-center text-xs"></span>
-                    <span>🔊 Loud</span>
+            <!-- Mic visual -->
+            <div class="flex flex-col items-center mb-4">
+                <div id="recording-indicator" class="relative flex items-center justify-center">
+                    <!-- Ripple rings (shown when recording) -->
+                    <div id="mic-ring-1" class="absolute w-24 h-24 rounded-full border-2 border-purple-500 opacity-0 scale-75 transition-all duration-500"></div>
+                    <div id="mic-ring-2" class="absolute w-32 h-32 rounded-full border-2 border-purple-400 opacity-0 scale-75 transition-all duration-700"></div>
+                    <!-- Mic SVG button -->
+                    <div id="mic-circle"
+                         class="relative w-20 h-20 rounded-full bg-gray-700 flex items-center justify-center transition-all duration-300 cursor-pointer"
+                         onclick="startRecording()">
+                        <svg id="mic-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                             fill="none" stroke="currentColor" stroke-width="2"
+                             stroke-linecap="round" stroke-linejoin="round"
+                             class="w-9 h-9 text-gray-400 transition-colors duration-300">
+                            <rect x="9" y="2" width="6" height="13" rx="3"/>
+                            <path d="M5 10a7 7 0 0 0 14 0"/>
+                            <line x1="12" y1="19" x2="12" y2="22"/>
+                            <line x1="8"  y1="22" x2="16" y2="22"/>
+                        </svg>
+                    </div>
                 </div>
-                <div id="voice-level-bar"
-                     class="w-full h-3 bg-gray-700 rounded-full overflow-hidden">
-                    <div id="voice-level-fill"
-                         class="h-full bg-gray-500 transition-all duration-75"
-                         style="width:0%"></div>
-                </div>
-                <div class="flex justify-between text-xs text-gray-600 mt-1 px-1">
-                    <span>too quiet</span>
-                    <span class="text-green-600">✓ good range</span>
-                    <span>clipping</span>
-                </div>
+                <span id="diag-text" class="text-gray-500 text-xs mt-3 text-center"></span>
             </div>
 
             <p id="voice-status" class="text-center text-sm mb-4 text-gray-500">

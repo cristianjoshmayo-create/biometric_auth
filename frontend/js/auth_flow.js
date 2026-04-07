@@ -155,65 +155,31 @@ function moveToVoiceAuth() {
 }
 
 function startVoiceAuth() {
-    const btn       = document.getElementById("record-btn");
-    const tryAgain  = document.getElementById("try-again-btn");
-    const indicator = document.getElementById("recording-indicator");
-    const status    = document.getElementById("voice-status");
-
-    if (SpeechCapture.isRecording) {
-        SpeechCapture.stopRecording();
-        return;
-    }
-
-    btn.disabled    = true;
-    btn.textContent = "🎤 Measuring background…";
-    btn.classList.replace("bg-red-600", "bg-yellow-600");
-    if (tryAgain) tryAgain.disabled = true;
-    indicator.classList.remove("hidden");
-    indicator.style.backgroundColor = "#f59e0b";
-    status.textContent = "🔇 Measuring background noise (stay quiet)…";
-    status.className   = "text-center text-sm mb-4 text-yellow-400";
-
-    SpeechCapture.reset();
-    SpeechCapture.startRecording().then(ok => {
-        if (ok) {
-            btn.textContent = "🎤 Listening — speak the phrase…";
-            btn.classList.replace("bg-yellow-600", "bg-red-600");
-        } else {
-            btn.disabled    = false;
-            btn.textContent = "🎤 Try Again";
-            btn.classList.replace("bg-yellow-600", "bg-red-600");
-            if (tryAgain) tryAgain.disabled = false;
-            indicator.classList.add("hidden");
-        }
-    });
+    // Delegates entirely to startRecording() in speech.js.
+    // VAD (Silero) handles start/stop automatically — no manual button wiring needed.
+    startRecording();
 }
 
 // Resets the voice step so the user can try a fresh recording
 function resetVoiceAuth() {
-    if (SpeechCapture.isRecording) SpeechCapture.stopRecording();
-    SpeechCapture.reset();
+    SpeechCapture.reset().then(() => {
+        const btn      = document.getElementById("record-btn");
+        const tryAgain = document.getElementById("try-again-btn");
+        const diagText = document.getElementById("diag-text");
+        const status   = document.getElementById("voice-status");
 
-    const btn      = document.getElementById("record-btn");
-    const tryAgain = document.getElementById("try-again-btn");
-    const indicator = document.getElementById("recording-indicator");
-    const status    = document.getElementById("voice-status");
-    const diagBar   = document.getElementById("diag-bar");
-    const diagText  = document.getElementById("diag-text");
-
-    if (btn) {
-        btn.disabled    = false;
-        btn.textContent = "🎤 Start Recording";
-        btn.classList.replace("bg-yellow-600", "bg-red-600");
-    }
-    if (tryAgain)  tryAgain.disabled = false;
-    if (indicator) indicator.classList.add("hidden");
-    if (diagBar)   { diagBar.style.width = "0%"; diagBar.style.background = "#ef4444"; }
-    if (diagText)  diagText.textContent = "";
-    if (status) {
-        status.textContent = "Click record when ready";
-        status.className   = "text-center text-sm mb-4 text-gray-500";
-    }
+        if (btn) {
+            btn.disabled    = false;
+            btn.textContent = "🎤 Start Recording";
+            btn.onclick     = startVoiceAuth;
+        }
+        if (tryAgain) tryAgain.disabled = false;
+        if (diagText) diagText.textContent = "";
+        if (status) {
+            status.textContent = "Click record when ready";
+            status.className   = "text-center text-sm mb-4 text-gray-500";
+        }
+    });
 }
 
 async function onVoiceAuthComplete(fullFeatureDict) {
@@ -314,12 +280,19 @@ async function submitSecurityAuth() {
         const result = await Api.verifySecurityQuestion(authUsername, answer);
 
         if (result.authenticated) {
-            // Correct → grant access directly (security question IS the fallback auth)
-            status.textContent = "✅ Correct! Access granted.";
+            // Correct → identity confirmed, but must re-authenticate via biometrics
+            status.textContent = "✅ Identity confirmed! Please re-authenticate with biometrics.";
             status.className   = "text-center text-sm mb-4 text-green-400";
+
+            // Reset biometric scores so fusion starts fresh
+            _ksScore    = null;
+            _voiceScore = null;
+
+            // Restart from keystroke step after a short delay
             setTimeout(() => {
-                showSuccess("Security Question", 1.0);
-            }, 800);
+                document.getElementById("security-answer-input").value = "";
+                moveToKeystrokeAuth();
+            }, 1500);
         } else {
             // Wrong → flagged and rejected
             recordFailedAttempt();
