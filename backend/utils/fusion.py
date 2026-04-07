@@ -26,8 +26,8 @@ from typing import Optional, Dict
 # sanity check that prevents an overconfident RF score from granting access
 # to a sample that lies far from the genuine cluster. 3:1 weighting keeps
 # the decision primarily classifier-driven while catching obvious outliers.
-KEYSTROKE_RF_WEIGHT  = 0.75
-KEYSTROKE_MAH_WEIGHT = 0.25
+KEYSTROKE_RF_WEIGHT  = 0.85
+KEYSTROKE_MAH_WEIGHT = 0.15
 
 # Voice: GBM is the primary classifier; Mahalanobis uses raw (non-CMVN)
 # features so it retains per-speaker prosodic variation even after CMVN

@@ -303,8 +303,8 @@ def generate_genuine_samples(genuine_vectors, n: int = 600, rng_seed: int = 42, 
                 # New: ±8% spread — keeps the genuine cluster tight so nearby
                 # impostors (groupmates typing ~10-15% differently) are correctly
                 # outside the genuine zone and get labelled as impostors.
-                factor  = rng.normal(1.0, 0.04)
-                factor  = np.clip(factor, 0.92, 1.08)
+                factor  = rng.normal(1.0, 0.06)
+                factor  = np.clip(factor, 0.88, 1.12)
                 noisy[i] = noisy[i] * factor
 
         ok, _ = _is_quality_sample(noisy, feat_names)
@@ -485,7 +485,7 @@ def mahalanobis_score(vec, profile_mean, profile_std):
     diff     = vec - profile_mean
     d_sq     = float(np.sum(diff ** 2 / safe_var))
     d_sq_norm = d_sq / len(vec)
-    score    = 1.0 / (1.0 + np.exp(2.5 * (d_sq_norm - 1.0)))
+    score    = 1.0 / (1.0 + np.exp(1.5 * (d_sq_norm - 1.0)))
     return float(np.clip(score, 0, 1))
 
 
@@ -519,7 +519,7 @@ def build_pipeline(n_enrollment: int) -> Pipeline:
             # far more harmful than a false REJECT (user must retry).
             # 3:1 weight on impostors (class 0) vs genuine (class 1) makes the
             # model biased toward rejection of ambiguous borderline samples.
-            class_weight={0: 3, 1: 1},
+            class_weight={0: 2, 1: 1},
             random_state=42,
             n_jobs=-1,
         )
@@ -814,7 +814,7 @@ def train_random_forest(username: str):
         # Security bias: penalise false accepts 3× more than false rejects.
         # A legitimate user being asked to retry is annoying; an impostor
         # getting through is a security breach.
-        score_t = (3 * far_t + frr_t) / 4
+        score_t = (2 * far_t + frr_t) / 3
 
         marker = ""
         if eer_t < best_eer:
@@ -833,7 +833,7 @@ def train_random_forest(username: str):
     #   profile is noisy, so we should be MORE conservative, not less.
     #   Lowering to 0.42 essentially disabled the security gate and let
     #   groupmates (who scored ~0.45-0.50) pass through.
-    final_thresh = max(best_thresh, 0.55)
+    final_thresh = max(best_thresh, 0.50)
 
     if consistency_cv > 0.25:
         print(f"\n  ⚠  High variability (CV={consistency_cv:.2f}) — "
