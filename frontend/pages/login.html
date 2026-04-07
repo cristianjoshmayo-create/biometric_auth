@@ -256,16 +256,6 @@
     </div>
 
     <script src="/static/js/keystroke.js?v=4"></script>
-    <!-- FIX: Tell ORT where to find its WASM files before it loads -->
-    <script>
-        self.ORT_CONFIG = {
-            wasm: {
-                wasmPaths: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
-                simd: false,
-                numThreads: 1,
-            }
-        };
-    </script>
     <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
     <script src="/static/js/speech.js?v=4"></script>
