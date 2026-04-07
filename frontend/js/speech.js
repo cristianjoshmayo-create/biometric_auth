@@ -1,16 +1,14 @@
 // frontend/js/speech.js
-// v12 — Zero-dependency VAD using Web Audio API only
+// v13 — AudioWorklet replaces deprecated ScriptProcessorNode
 //
-// Removes @ricky0123/vad-web and onnxruntime-web entirely.
-// Uses ScriptProcessorNode energy detection to find speech boundaries:
-//   - RMS energy above threshold  → speech frame
-//   - 400ms of silence after speech → auto-stop
-//   - 10s watchdog hard stop
+// ScriptProcessorNode (createScriptProcessor) is deprecated and broken in
+// Opera GX — onaudioprocess never fires, so allSamples stays empty and no
+// audio ever reaches the server, meaning no ECAPA profile is created.
 //
-// Works on: Chrome, Firefox, Safari, Edge, Opera, iOS Safari, Android Chrome.
-// No WASM, no ES modules, no CDN dependencies.
+// AudioWorklet is the modern W3C standard and works reliably on:
+//   Chrome 66+, Firefox 76+, Edge 79+, Opera 53+, Opera GX, Safari 14.1+
 //
-// Integration contract (unchanged from v4-v9):
+// The rest of the integration contract is unchanged:
 //   - Global startRecording() called by record-btn onclick
 //   - Calls onVoiceRecorded(featureDict)     during enrollment
 //   - Calls onVoiceAuthComplete(featureDict) during login
@@ -18,8 +16,7 @@
 const SpeechCapture = {
     audioCtx:       null,
     stream:         null,
-    processor:      null,
-    analyser:       null,
+    workletNode:    null,   // replaces processor + analyser
     allSamples:     [],
     isRecording:    false,
     _hasSpeech:     false,
@@ -148,6 +145,40 @@ const SpeechCapture = {
         });
     },
 
+    // ── Build the AudioWorklet module as a Blob URL so no separate file is needed.
+    // The worklet runs in its own thread (AudioWorkletGlobalScope), collecting
+    // 128-sample chunks and posting them back to the main thread via MessagePort.
+    // This is the modern replacement for the deprecated ScriptProcessorNode.
+    _buildWorkletUrl() {
+        const code = `
+            class PCMCollector extends AudioWorkletProcessor {
+                constructor() {
+                    super();
+                    // Buffer up to FRAME_SIZE samples before posting to avoid
+                    // flooding the main thread with 128-sample messages.
+                    this._buf  = new Float32Array(4096);
+                    this._fill = 0;
+                }
+                process(inputs) {
+                    const ch = inputs[0] && inputs[0][0];
+                    if (!ch) return true;
+                    for (let i = 0; i < ch.length; i++) {
+                        this._buf[this._fill++] = ch[i];
+                        if (this._fill === this._buf.length) {
+                            // Post a copy — the original buffer is reused next frame
+                            this.port.postMessage(this._buf.slice(0));
+                            this._fill = 0;
+                        }
+                    }
+                    return true;  // keep processor alive
+                }
+            }
+            registerProcessor('pcm-collector', PCMCollector);
+        `;
+        const blob = new Blob([code], { type: "application/javascript" });
+        return URL.createObjectURL(blob);
+    },
+
     async startRecording() {
         try {
             this._setStatus("⏳ Requesting microphone…", "text-yellow-400");
@@ -162,37 +193,47 @@ const SpeechCapture = {
 
             this.audioCtx  = new (window.AudioContext || window.webkitAudioContext)();
             this._nativeSr = this.audioCtx.sampleRate;
-            const source   = this.audioCtx.createMediaStreamSource(this.stream);
-            this.analyser  = this.audioCtx.createAnalyser();
-            this.analyser.fftSize = 256;
-            this.processor = this.audioCtx.createScriptProcessor(this.FRAME_SIZE, 1, 1);
 
-            source.connect(this.analyser);
-            this.analyser.connect(this.processor);
-            this.processor.connect(this.audioCtx.destination);
+            // ── AudioWorklet setup (replaces createScriptProcessor) ──────────
+            // Works on Chrome, Firefox, Edge, Opera GX, Safari 14.1+.
+            // ScriptProcessorNode is deprecated and broken in Opera GX.
+            const workletUrl = this._buildWorkletUrl();
+            await this.audioCtx.audioWorklet.addModule(workletUrl);
+            URL.revokeObjectURL(workletUrl);  // free the Blob URL immediately
 
-            this.processor.onaudioprocess = (e) => {
+            const source = this.audioCtx.createMediaStreamSource(this.stream);
+            this.workletNode = new AudioWorkletNode(this.audioCtx, "pcm-collector");
+
+            // Receive buffered PCM chunks from the worklet thread
+            this.workletNode.port.onmessage = (e) => {
                 if (!this.isRecording) return;
-                const input = e.inputBuffer.getChannelData(0);
-                this.allSamples.push(new Float32Array(input));
-                const energy   = this._rms(input);
+                const chunk  = new Float32Array(e.data);
+                this.allSamples.push(chunk);
+
+                const energy   = this._rms(chunk);
                 const isSpeech = energy > this.SPEECH_THRESH;
-                // Yellow while waiting for voice, green once voice is detected
+
                 if (isSpeech && !this._hasSpeech) {
                     this._hasSpeech = true;
-                    this._setIndicator("speaking");  // turn green
+                    this._setIndicator("speaking");
                     this._setStatus("🔴 Recording… click Stop when done", "text-green-400");
                 }
-                // Pulse rings with volume
+
+                // Pulse mic rings with volume level
                 const ring1 = document.getElementById("mic-ring-1");
                 const ring2 = document.getElementById("mic-ring-2");
                 if (ring1) ring1.style.opacity = Math.min(energy * 20, 0.8).toFixed(2);
                 if (ring2) ring2.style.opacity = Math.min(energy * 10, 0.4).toFixed(2);
             };
 
+            // Connect: mic stream → worklet (no destination needed — we only read, not play)
+            source.connect(this.workletNode);
+            // Connecting to destination is NOT required and would cause echo.
+            // The worklet keeps running as long as its input is connected.
+
             this.isRecording = true;
             this._watchdogTimer = setTimeout(() => {
-                if (this.isRecording) { console.log("[SpeechCapture] Watchdog"); this.stopRecording(); }
+                if (this.isRecording) { console.log("[SpeechCapture] Watchdog timeout"); this.stopRecording(); }
             }, this.MAX_DURATION_MS);
 
             this._setStatus("🎤 Listening… speak your phrase", "text-blue-400");
@@ -219,10 +260,9 @@ const SpeechCapture = {
         this._setStatus("⚙️ Processing captured voice…", "text-yellow-400");
         this._setDiag("");
         this._setIndicator("idle");
-        if (this.processor) { this.processor.disconnect(); this.processor = null; }
-        if (this.analyser)  { this.analyser.disconnect();  this.analyser  = null; }
-        if (this.audioCtx)  { this.audioCtx.close();       this.audioCtx  = null; }
-        if (this.stream)    { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
+        if (this.workletNode) { this.workletNode.disconnect(); this.workletNode = null; }
+        if (this.audioCtx)   { this.audioCtx.close();         this.audioCtx   = null; }
+        if (this.stream)     { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
         this._processSpeech();
     },
 
@@ -241,8 +281,8 @@ const SpeechCapture = {
         // Trim leading/trailing silence with 200ms padding
         const padFrames = Math.round(this._nativeSr * 0.2);
         let start = 0, end = raw.length - 1;
-        for (let i = 0; i < raw.length; i++)         { if (Math.abs(raw[i]) > this.SPEECH_THRESH * 0.5) { start = Math.max(0, i - padFrames); break; } }
-        for (let i = raw.length - 1; i >= 0; i--)    { if (Math.abs(raw[i]) > this.SPEECH_THRESH * 0.5) { end = Math.min(raw.length - 1, i + padFrames); break; } }
+        for (let i = 0; i < raw.length; i++)      { if (Math.abs(raw[i]) > this.SPEECH_THRESH * 0.5) { start = Math.max(0, i - padFrames); break; } }
+        for (let i = raw.length - 1; i >= 0; i--) { if (Math.abs(raw[i]) > this.SPEECH_THRESH * 0.5) { end = Math.min(raw.length - 1, i + padFrames); break; } }
 
         const trimmed    = raw.slice(start, end + 1);
         const resampled  = this._resample(trimmed, this._nativeSr, this.TARGET_SR);
@@ -336,14 +376,13 @@ const SpeechCapture = {
         this._hasSpeech  = false;
         this._silenceMs  = 0;
         this.allSamples  = [];
-        if (this.processor) { this.processor.disconnect(); this.processor = null; }
-        if (this.analyser)  { this.analyser.disconnect();  this.analyser  = null; }
-        if (this.audioCtx)  { this.audioCtx.close().catch(() => {}); this.audioCtx = null; }
-        if (this.stream)    { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
+        if (this.workletNode) { this.workletNode.disconnect(); this.workletNode = null; }
+        if (this.audioCtx)   { this.audioCtx.close().catch(() => {}); this.audioCtx = null; }
+        if (this.stream)     { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
         this._setIndicator("idle");
-        this._showStartBtn("🎤 Start Recording");   // ← ADD THIS
+        this._showStartBtn("🎤 Start Recording");
         const status = document.getElementById("voice-status");
-        if (status) status.textContent = "Press the mic button and say your phrase.";  // ← ADD THIS
+        if (status) status.textContent = "Press the mic button and say your phrase.";
     }
 };
 
