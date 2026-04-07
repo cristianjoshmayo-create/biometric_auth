@@ -990,7 +990,7 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
             "mfcc_features":        mfcc_mean.tolist(),
             "delta_mfcc_mean":      delta_mfcc_mean.tolist(),   # NEW
             "delta2_mfcc_mean":     delta2_mfcc_mean.tolist(),  # NEW
-            "mfcc_frames":          mfcc_cmvn.T.tolist(),        # CNN v4: raw (T,13) frame matrix
+            
             "pitch_mean":           pitch_mean,
             "pitch_std":            pitch_std,
             "speaking_rate":        speaking_rate,
