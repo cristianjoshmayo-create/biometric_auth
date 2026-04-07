@@ -286,6 +286,7 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             if not hard_reject and profile_std is not None and 'dwell_mean' in fn_list:
                 e_dwell     = float(profile_mean[fn_list.index('dwell_mean')])
                 e_dwell_std = float(profile_std[fn_list.index('dwell_mean')]) + 1e-9
+                e_dwell_std = max(e_dwell_std, e_dwell * 0.10)
                 l_dwell     = _fv('dwell_mean')
                 if l_dwell is not None:
                     dwell_z = abs(l_dwell - e_dwell) / e_dwell_std
@@ -303,10 +304,11 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             if not hard_reject and profile_std is not None and 'typing_speed_cpm' in fn_list:
                 e_cpm     = float(profile_mean[fn_list.index('typing_speed_cpm')])
                 e_cpm_std = float(profile_std[fn_list.index('typing_speed_cpm')]) + 1e-9
+                e_cpm_std = max(e_cpm_std, e_cpm * 0.20)
                 l_cpm     = _fv('typing_speed_cpm')
                 if l_cpm is not None:
                     cpm_z = abs(l_cpm - e_cpm) / e_cpm_std
-                    if cpm_z > 3.0:
+                    if cpm_z > 5.0:
                         hard_reject   = True
                         reject_reason = (f"typing_speed_cpm z={cpm_z:.1f} "
                                          f"(live={l_cpm:.0f} enrolled={e_cpm:.0f})")
@@ -322,9 +324,9 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                                  f"(mah={mah_score:.4f}, d_sq_norm={d_sq_norm:.2f})")
 
             if hard_reject:
-                confidence    = 0.0
+                confidence    = 0.15   # low but non-zero — lets strong voice save via fusion
                 authenticated = False
-                print(f"  \u26d4 Hard reject: {reject_reason}")
+                print(f"  ⛔ Hard reject: {reject_reason}")
             else:
                 # Intra-modal fusion: RF (75%) + Mahalanobis (25%).
                 # Weights are defined in utils/fusion.py — single source of truth.

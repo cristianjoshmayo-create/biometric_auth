@@ -750,10 +750,13 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
             try:
                 import noisereduce as nr
                 print(f"  Applying noisereduce (SNR={snr_db:.1f}dB)")
+                noise_sample = audio[:int(sr * 0.3)]
                 audio_clean = nr.reduce_noise(
-                    y=audio, sr=sr,
-                    stationary=False,
-                    prop_decrease=0.75,
+                    y=audio,
+                    y_noise=noise_sample,
+                    sr=sr,
+                    stationary=True,
+                    prop_decrease=0.90,
                 ).astype(np.float32)
             except (ImportError, OSError) as _nr_err:
                 # OSError catches WinError 1114 — torch DLL failed to load.

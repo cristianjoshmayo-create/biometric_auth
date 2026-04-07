@@ -157,7 +157,7 @@ const SpeechCapture = {
             this._silenceMs = 0;
 
             this.stream = await navigator.mediaDevices.getUserMedia({
-                audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false }
+                audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
             });
 
             this.audioCtx  = new (window.AudioContext || window.webkitAudioContext)();
@@ -341,6 +341,9 @@ const SpeechCapture = {
         if (this.audioCtx)  { this.audioCtx.close().catch(() => {}); this.audioCtx = null; }
         if (this.stream)    { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
         this._setIndicator("idle");
+        this._showStartBtn("🎤 Start Recording");   // ← ADD THIS
+        const status = document.getElementById("voice-status");
+        if (status) status.textContent = "Press the mic button and say your phrase.";  // ← ADD THIS
     }
 };
 

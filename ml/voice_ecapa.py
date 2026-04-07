@@ -121,7 +121,7 @@ except ImportError:
 # conservative but reliable operating point for short passphrases.
 # Lower = more permissive (fewer false rejects, more false accepts).
 # Higher = stricter (fewer false accepts, more false rejects).
-DEFAULT_THRESHOLD = 0.75
+DEFAULT_THRESHOLD = 0.65
 
 EMBEDDING_DIM = 192   # ECAPA-TDNN output dimension
 
@@ -373,6 +373,12 @@ def predict_voice(username: str, embedding: List[float]) -> dict:
 
     similarity = cosine_similarity(login_emb, mean_emb)
     threshold  = profile.get("threshold", DEFAULT_THRESHOLD)
+    # Be more lenient if user only has few enrollment samples
+    n = profile.get("n_enrollment", 1)
+    if n <= 2:
+        threshold -= 0.05   # only 1-2 samples — profile less reliable
+    elif n >= 5:
+        threshold += 0.02   # many samples — profile is robust, can be stricter
     match      = similarity >= threshold
 
     print(

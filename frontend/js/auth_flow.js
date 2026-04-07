@@ -198,36 +198,33 @@ async function onVoiceAuthComplete(fullFeatureDict) {
             ? result.fused_score / 100.0
             : (typeof result.confidence === "number" ? result.confidence : 0.0);
 
-        if (result.authenticated) {
-            // Voice passed individually → grant immediately
-            showSuccess("Speech Biometrics", result.confidence);
+        // Voice always feeds fusion — no individual voice grant
+        // (keystroke already had its chance to grant individually above)
+        _voiceScore = voiceScore;
+
+        // ── Fusion & Decision Module ──────────────────────────
+        const ksScore    = _ksScore !== null ? _ksScore : 0.0;
+        const fusedScore = (FUSION_WEIGHT_KS * ksScore) + (FUSION_WEIGHT_VOICE * _voiceScore);
+
+        console.log(
+            `[Fusion & Decision Module] ` +
+            `keystroke=${(ksScore * 100).toFixed(1)}%  ` +
+            `voice=${(_voiceScore * 100).toFixed(1)}%  ` +
+            `fused=${(fusedScore * 100).toFixed(1)}%  ` +
+            `threshold=${(FUSION_THRESHOLD * 100).toFixed(0)}%`
+        );
+
+        if (fusedScore >= FUSION_THRESHOLD) {
+            // Fusion passed → grant access
+            showSuccess("Fusion & Decision Module", fusedScore);
         } else {
-            _voiceScore = voiceScore;
+            // Fusion failed → security question
             recordFailedAttempt();
-
-            // ── Fusion & Decision Module ──────────────────────
-            const ksScore    = _ksScore !== null ? _ksScore : 0.0;
-            const fusedScore = (FUSION_WEIGHT_KS * ksScore) + (FUSION_WEIGHT_VOICE * _voiceScore);
-
-            console.log(
-                `[Fusion & Decision Module] ` +
-                `keystroke=${(ksScore * 100).toFixed(1)}%  ` +
-                `voice=${(_voiceScore * 100).toFixed(1)}%  ` +
-                `fused=${(fusedScore * 100).toFixed(1)}%  ` +
-                `threshold=${(FUSION_THRESHOLD * 100).toFixed(0)}%`
-            );
-
-            if (fusedScore >= FUSION_THRESHOLD) {
-                // Fusion passed → grant access
-                showSuccess("Fusion & Decision Module", fusedScore);
-            } else {
-                // Fusion failed → security question
-                status.textContent =
-                    `❌ Voice not matched (${(voiceScore * 100).toFixed(1)}%) — ` +
-                    `fused: ${(fusedScore * 100).toFixed(1)}% — proceeding to security question…`;
-                status.className = "text-center text-sm mb-4 text-red-400";
-                setTimeout(() => moveToSecurityAuth(), 800);
-            }
+            status.textContent =
+                `❌ Voice (${(voiceScore * 100).toFixed(1)}%) — ` +
+                `fused: ${(fusedScore * 100).toFixed(1)}% — proceeding to security question…`;
+            status.className = "text-center text-sm mb-4 text-red-400";
+            setTimeout(() => moveToSecurityAuth(), 800);
         }
 
     } catch (err) {
