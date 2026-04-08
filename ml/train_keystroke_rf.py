@@ -628,7 +628,23 @@ def train_random_forest(username: str):
 
     n_genuine_real = len(genuine_vectors)
     print(f"\n  Enrollment samples loaded: {n_genuine_real}")
-
+        # ── Outlier trimming ──────────────────────────────────────────────────────
+    if len(genuine_vectors) >= 4:
+        dwell_idx = (active_feat_names.index('dwell_mean')
+                     if 'dwell_mean' in active_feat_names else None)
+        if dwell_idx is not None:
+            dwells       = np.array([v[dwell_idx] for v in genuine_vectors])
+            median_dwell = np.median(dwells)
+            std_dwell    = max(np.std(dwells), median_dwell * 0.10)
+            trimmed      = [v for v in genuine_vectors
+                            if abs(v[dwell_idx] - median_dwell) <= 2.5 * std_dwell]
+            dropped = len(genuine_vectors) - len(trimmed)
+            if dropped and len(trimmed) >= 3:
+                print(f"  ⚠  Dropped {dropped} outlier enrollment sample(s) "
+                      f"(dwell_mean > 2.5σ from median={median_dwell:.0f}ms)")
+                genuine_vectors = trimmed
+            elif dropped:
+                print(f"  ⚠  Outlier trimming skipped — would leave < 3 samples")
     # Pre-compute extra-digraph stats from genuine enrollment so we can generate
     # realistic (non-zero) values for real impostors who typed a different phrase.
     # We do this BEFORE _strip_inactive is called so profile_mean/std are available.

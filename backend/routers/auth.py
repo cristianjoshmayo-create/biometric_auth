@@ -286,7 +286,7 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             if not hard_reject and profile_std is not None and 'dwell_mean' in fn_list:
                 e_dwell     = float(profile_mean[fn_list.index('dwell_mean')])
                 e_dwell_std = float(profile_std[fn_list.index('dwell_mean')]) + 1e-9
-                e_dwell_std = max(e_dwell_std, e_dwell * 0.10)
+                e_dwell_std = max(e_dwell_std, e_dwell * 0.10, 20.0)
                 l_dwell     = _fv('dwell_mean')
                 if l_dwell is not None:
                     dwell_z = abs(l_dwell - e_dwell) / e_dwell_std
@@ -324,7 +324,7 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                                  f"(mah={mah_score:.4f}, d_sq_norm={d_sq_norm:.2f})")
 
             if hard_reject:
-                confidence    = 0.15   # low but non-zero — lets strong voice save via fusion
+                confidence    = 0.0   # low but non-zero — lets strong voice save via fusion
                 authenticated = False
                 print(f"  ⛔ Hard reject: {reject_reason}")
             else:
