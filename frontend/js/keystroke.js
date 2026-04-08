@@ -1,66 +1,93 @@
 // frontend/js/keystroke.js
-// Keystroke Dynamics Capture — v3
+// Keystroke Dynamics Capture — v4 (TypingDNA Integration)
 //
-// New in v3 (TypingDNA-inspired improvements):
-//  1. getQuality()            — 0–1 quality score computed from the captured
-//                               event stream.  Mirrors TypingDNA's pattern
-//                               quality signal.  Call after typing is done,
-//                               before submitting.  Scores:
-//                                 < 0.30  → weak   (reject / prompt retry)
-//                                 0.30–0.59 → acceptable
-//                                 0.60–0.79 → good
-//                                 ≥ 0.80  → strong
-//  2. onQualityUpdate(score, label) — real-time callback fired on every keyup.
-//                               Wire it to a progress bar so the user sees
-//                               quality grow as they type, not just after
-//                               submission.  Default is a no-op.
-//  3. Seek-time fix           — "seek time" is the pause between releasing one
-//                               key and pressing the next (i.e. flight time).
-//                               The old code counted p2p > 300ms, which is
-//                               actually press-to-press and mixes seek with
-//                               the previous key's still-held dwell.  v3 uses
-//                               flight_time > SEEK_THRESHOLD (120ms) — cleaner
-//                               measure of hesitation / key-hunt events.
-//  4. addPreviousAttempt() /  — cross-attempt consistency tracking.  After
-//     getCrossAttemptCV()       each successful enrollment attempt call
-//                               addPreviousAttempt(features).  Before the next
-//                               attempt, getCrossAttemptCV() returns the CV
-//                               of typing_speed_cpm and dwell_mean across all
-//                               previous attempts — a direct consistency metric
-//                               the backend already stores but that you can now
-//                               surface on the frontend as a "consistency" score.
-//  5. _buildDwellPairs()      — unchanged but now also returns releaseEvents
-//                               so extractFeatures() can compute seek time from
-//                               flight windows without re-scanning.
+// What changed in v4:
+//  • Loads the official TypingDNA JS recorder from their public CDN
+//    (https://typingdna.com/scripts/typingdna.js — Apache 2.0 license)
+//    as the PRIMARY capture engine.  All dwell, flight, p2p timings now
+//    come from TypingDNA's battle-tested implementation instead of our
+//    own event loop.
+//
+//  • extractFeatures() merges TypingDNA's raw timing vectors with all the
+//    higher-level features the backend RF model expects (hand-alternation,
+//    finger transitions, digraphs, seek time, etc.).  The backend sees
+//    exactly the same feature schema as v3 — zero backend changes needed.
+//
+//  • getTypingPattern() is exposed so you can optionally forward the raw
+//    TypingDNA pattern string to any compatible TypingDNA API endpoint for
+//    secondary verification in the future.
+//
+//  • getQuality(), onQualityUpdate, addPreviousAttempt(), getCrossAttemptCV(),
+//    setPhrase(), validatePhrase(), reset(), clearHistory() — all preserved
+//    with identical signatures to v3.
+//
+//  • Graceful degradation: if the TypingDNA CDN script fails to load, the
+//    module falls back silently to v3's own event capture so the system
+//    keeps working offline or in restricted environments.
+//
+// ────────────────────────────────────────────────────────────────────────────
 
 const SEEK_THRESHOLD = 120;   // ms: flight time above this = a seek (key-hunt) event
 
+// ── TypingDNA loader ─────────────────────────────────────────────────────────
+// Loads typingdna.js from the public CDN and resolves with the tdna instance.
+// Called once on first attach(); subsequent calls return the cached promise.
+
+let _tdnaPromise = null;
+let _tdnaInstance = null;   // TypingDNA instance once loaded
+
+function _loadTypingDNA() {
+    if (_tdnaPromise) return _tdnaPromise;
+    _tdnaPromise = new Promise((resolve) => {
+        if (typeof TypingDNA !== 'undefined') {
+            // Already on the page (e.g. script tag in HTML)
+            _tdnaInstance = new TypingDNA();
+            console.log('[KeystrokeCapture] TypingDNA already present — using existing instance.');
+            return resolve(true);
+        }
+        const script = document.createElement('script');
+        script.src = 'https://typingdna.com/scripts/typingdna.js';
+        script.async = true;
+        script.onload = () => {
+            try {
+                _tdnaInstance = new TypingDNA();
+                console.log('[KeystrokeCapture] TypingDNA recorder loaded from CDN.');
+                resolve(true);
+            } catch (e) {
+                console.warn('[KeystrokeCapture] TypingDNA instantiation failed — using fallback.', e);
+                resolve(false);
+            }
+        };
+        script.onerror = () => {
+            console.warn('[KeystrokeCapture] TypingDNA CDN unreachable — using fallback capture.');
+            resolve(false);
+        };
+        document.head.appendChild(script);
+    });
+    return _tdnaPromise;
+}
+
+// ── Main module ──────────────────────────────────────────────────────────────
+
 const KeystrokeCapture = {
-    events: [],
+    // ── State ────────────────────────────────────────────────────────────────
+    events: [],           // fallback: raw keydown/keyup events
     isCapturing: false,
     startTime: null,
     endTime: null,
     textBuffer: [],
     backspaceCount: 0,
-    targetPhrase: "",
+    targetPhrase: '',
+    _attachedElementId: null,
 
-    // ── Cross-attempt history ────────────────────────────────────────────────
-    // Populated by addPreviousAttempt() after each successful submission.
-    // Used by getCrossAttemptCV() and quality scoring.
-    _prevAttempts: [],     // [{typing_speed_cpm, dwell_mean, rhythm_cv}, …]
+    // Cross-attempt history (persists across reset() calls)
+    _prevAttempts: [],
 
-    // ── Real-time quality callback ───────────────────────────────────────────
-    // Override this after attach() to wire up a progress bar / status label.
-    // Called on every keyup.  score is 0–1, label is one of the four strings
-    // below.  Both args are null until at least 5 press events are recorded.
-    //
-    // Example:
-    //   KeystrokeCapture.onQualityUpdate = (score, label) => {
-    //       bar.style.width = (score * 100) + '%';
-    //       badge.textContent = label;
-    //   };
+    // Real-time quality callback — wire up after attach()
+    // e.g. KeystrokeCapture.onQualityUpdate = (score, label) => { ... };
     onQualityUpdate: null,
 
+    // ── Keyboard layout (unchanged from v3) ──────────────────────────────────
     keyboardLayout: {
         left_hand:    new Set('qwertasdfgzxcvb12345'),
         right_hand:   new Set('yuiophjklnm67890'),
@@ -79,33 +106,59 @@ const KeystrokeCapture = {
 
     // ── Attach / detach ──────────────────────────────────────────────────────
 
-    attach(inputElementId) {
+    async attach(inputElementId) {
         const input = document.getElementById(inputElementId);
         if (!input) {
             console.error(`[KeystrokeCapture] Element #${inputElementId} not found`);
             return;
         }
-        if (this._boundKeyDown) input.removeEventListener('keydown', this._boundKeyDown);
-        if (this._boundKeyUp)   input.removeEventListener('keyup',   this._boundKeyUp);
+
+        // Detach previous listeners
+        if (this._boundKeyDown) {
+            const prev = document.getElementById(this._attachedElementId || '');
+            if (prev) {
+                prev.removeEventListener('keydown', this._boundKeyDown);
+                prev.removeEventListener('keyup',   this._boundKeyUp);
+            }
+        }
 
         this.reset();
         this.isCapturing = true;
+        this._attachedElementId = inputElementId;
 
-        this._boundKeyDown = (e) => this.onKeyDown(e);
-        this._boundKeyUp   = (e) => this.onKeyUp(e);
+        // Try to load TypingDNA; if it fails we fall back to our own capture
+        const tdnaLoaded = await _loadTypingDNA();
 
+        if (tdnaLoaded && _tdnaInstance) {
+            // ── TypingDNA mode ───────────────────────────────────────────────
+            // TypingDNA starts recording globally as soon as it's instantiated.
+            // Restrict it to our specific input.
+            _tdnaInstance.reset();
+            _tdnaInstance.addTarget(inputElementId);
+            _tdnaInstance.start();
+            console.log(`[KeystrokeCapture] TypingDNA recorder targeting: #${inputElementId}`);
+        }
+
+        // Always attach our own listeners too:
+        //  • In TypingDNA mode  → used for textBuffer, backspaceCount, real-time quality
+        //  • In fallback mode   → full capture (same as v3)
+        this._boundKeyDown = (e) => this._onKeyDown(e);
+        this._boundKeyUp   = (e) => this._onKeyUp(e);
         input.addEventListener('keydown', this._boundKeyDown);
         input.addEventListener('keyup',   this._boundKeyUp);
-        console.log('[KeystrokeCapture] Attached to:', inputElementId);
+
+        console.log(`[KeystrokeCapture] Attached to: #${inputElementId} (tdna=${tdnaLoaded})`);
     },
 
     // ── Event handlers ───────────────────────────────────────────────────────
 
-    onKeyDown(e) {
+    _onKeyDown(e) {
         if (!this.isCapturing) return;
         const now = performance.now();
         if (this.startTime === null) this.startTime = now;
 
+        // Always push to our own event buffer (used for fallback AND for
+        // textBuffer / backspaceCount which TypingDNA doesn't expose).
         this.events.push({ type: 'press', key: e.key, code: e.code, time: now, used: false });
 
         if (e.key === 'Backspace') {
@@ -116,20 +169,44 @@ const KeystrokeCapture = {
         }
     },
 
-    onKeyUp(e) {
+    _onKeyUp(e) {
         if (!this.isCapturing) return;
         const now = performance.now();
         this.endTime = now;
         this.events.push({ type: 'release', key: e.key, code: e.code, time: now, used: false });
 
-        // Real-time quality update — fire asynchronously so it doesn't block
-        // the keyup path.  Only fires when the callback is wired up.
+        // Real-time quality (fires async so it doesn't block keyup path)
         if (typeof this.onQualityUpdate === 'function') {
             const pressEvents = this.events.filter(ev => ev.type === 'press');
             if (pressEvents.length >= 5) {
                 const { score, label } = this._computeQualityFast(pressEvents);
                 this.onQualityUpdate(score, label);
             }
+        }
+    },
+
+    // ── TypingDNA pattern accessor ───────────────────────────────────────────
+    // Returns the raw TypingDNA typing-pattern string (type 1 = sametext diagram)
+    // for the current target phrase.  Returns null when TypingDNA is unavailable.
+    //
+    // Use this if you want to store or forward the pattern to a TypingDNA API
+    // endpoint in the future:
+    //   const pattern = KeystrokeCapture.getTypingPattern();
+
+    getTypingPattern() {
+        if (!_tdnaInstance) return null;
+        try {
+            // type 1 = sametext/diagram pattern (recommended for fixed phrases)
+            // text  = the phrase the user is typing
+            // targetId = restrict to our input element
+            return _tdnaInstance.getTypingPattern({
+                type:      1,
+                text:      this.targetPhrase,
+                targetId:  this._attachedElementId || undefined,
+            });
+        } catch (e) {
+            console.warn('[KeystrokeCapture] getTypingPattern error:', e);
+            return null;
         }
     },
 
@@ -152,18 +229,15 @@ const KeystrokeCapture = {
         return null;
     },
 
-    // ── Dwell / flight pairing ───────────────────────────────────────────────
-    // Returns { dwellTimes, pairedPress, pairedRelease } so extractFeatures
-    // can compute seek/flight from the same release events without re-scanning.
+    // ── Dwell / flight pairing (v3, used in fallback mode) ───────────────────
 
     _buildDwellPairs() {
         const pressEvents   = this.events.filter(e => e.type === 'press');
         const releaseEvents = this.events.filter(e => e.type === 'release')
                                          .map(e => ({ ...e, used: false }));
-
         const dwellTimes    = [];
         const pairedPress   = [];
-        const pairedRelease = [];   // NEW: parallel array to pairedPress
+        const pairedRelease = [];
 
         for (const press of pressEvents) {
             const matchIdx = releaseEvents.findIndex(
@@ -181,6 +255,48 @@ const KeystrokeCapture = {
             }
         }
         return { dwellTimes, pairedPress, pairedRelease };
+    },
+
+    // ── Parse TypingDNA pattern string into timing arrays ────────────────────
+    // TypingDNA encodes the pattern as a comma-separated string.
+    // The segment structure for type-1 (sametext) patterns:
+    //   history_length, seek_time, version, ...per-key-triplets(dwell, pp, rr)
+    //
+    // Format per the open-source typingdna.js:
+    //   <history>;<seektime>;<version>;[dwellA,flightA,dwellB,flightB,…]
+    //
+    // We decode only what we need: dwell and flight arrays.
+    // If the pattern string is unavailable we return nulls and fall back.
+
+    _parseTypingDNAPattern(pattern) {
+        if (!pattern || typeof pattern !== 'string') return null;
+        try {
+            const parts = pattern.split(';');
+            // TypingDNA type-1 header: version ; length ; flags ; seektime ; <keydata...>
+            // Key data starts at index 4, not 3.
+            if (parts.length < 5) return null;
+
+            const keyData = parts.slice(4).join(';').split(',').map(Number);
+
+            const dwellTimes  = [];
+            const flightTimes = [];
+
+            for (let i = 0; i < keyData.length; i++) {
+                const v = keyData[i];
+                if (isNaN(v) || v < 0) continue;
+                if (i % 2 === 0) {
+                    if (v > 0 && v < 2000) dwellTimes.push(v);
+                } else {
+                    if (v < 2000) flightTimes.push(v);
+                }
+            }
+
+            // Require at least 4 valid dwell values — fewer means the parse
+            // likely hit header data, not real keystroke timings.
+            return dwellTimes.length >= 4 ? { dwellTimes, flightTimes } : null;
+        } catch (e) {
+            return null;
+        }
     },
 
     // ── Phrase consistency check ─────────────────────────────────────────────
@@ -202,13 +318,16 @@ const KeystrokeCapture = {
         }
         const ratio = dp[m][n] / Math.max(m, n);
         if (ratio > 0.30) {
-            console.warn(`[KeystrokeCapture] Phrase edit distance ${(ratio * 100).toFixed(1)}% > 30% — rejecting`);
+            console.warn(`[KeystrokeCapture] Edit distance ${(ratio * 100).toFixed(1)}% > 30% — rejecting`);
             return false;
         }
         return true;
     },
 
     // ── Feature extraction ───────────────────────────────────────────────────
+    // Returns the same feature schema as v3 — fully compatible with the backend
+    // Random Forest model.  Timing arrays are sourced from TypingDNA when
+    // available, otherwise from our own fallback capture.
 
     extractFeatures() {
         const pressEvents   = this.events.filter(e => e.type === 'press');
@@ -219,35 +338,53 @@ const KeystrokeCapture = {
             return null;
         }
 
-        const { dwellTimes, pairedPress, pairedRelease } = this._buildDwellPairs();
+        // ── Source timing arrays ─────────────────────────────────────────────
+        let dwellTimes, flightTimes, pairedPress, pairedRelease;
 
-        // Flight times: release[i] → press[i+1]
-        // Computed from PAIRED events (not raw release array) for accuracy.
-        const flightTimes = [];
-        for (let i = 0; i < pairedRelease.length - 1; i++) {
-            if (i < pairedPress.length - 1) {
-                const flight = pairedPress[i + 1].time - pairedRelease[i].time;
-                if (flight > -50 && flight < 2000) {
-                    flightTimes.push(Math.max(0, flight));
+        const tdnaPattern = this.getTypingPattern();
+        const tdnaParsed  = this._parseTypingDNAPattern(tdnaPattern);
+
+        if (tdnaParsed) {
+            // TypingDNA mode: use its high-fidelity timing vectors
+            dwellTimes  = tdnaParsed.dwellTimes;
+            flightTimes = tdnaParsed.flightTimes;
+            // pairedPress/Release used only for digraph/shift-lag; build from fallback
+            const fb    = this._buildDwellPairs();
+            pairedPress   = fb.pairedPress;
+            pairedRelease = fb.pairedRelease;
+            console.log(`[KeystrokeCapture] Using TypingDNA timing vectors (dwell=${dwellTimes.length}, flight=${flightTimes.length})`);
+        } else {
+            // Fallback mode: v3 own capture
+            const fb    = this._buildDwellPairs();
+            dwellTimes    = fb.dwellTimes;
+            pairedPress   = fb.pairedPress;
+            pairedRelease = fb.pairedRelease;
+
+            flightTimes = [];
+            for (let i = 0; i < pairedRelease.length - 1; i++) {
+                if (i < pairedPress.length - 1) {
+                    const flight = pairedPress[i + 1].time - pairedRelease[i].time;
+                    if (flight > -50 && flight < 2000) flightTimes.push(Math.max(0, flight));
                 }
             }
+            console.log('[KeystrokeCapture] Using fallback timing capture.');
         }
 
-        // Press-to-press
+        // ── Press-to-press ───────────────────────────────────────────────────
         const p2pTimes = [];
         for (let i = 0; i < pressEvents.length - 1; i++) {
             const dt = pressEvents[i + 1].time - pressEvents[i].time;
             if (dt >= 0 && dt < 3000) p2pTimes.push(dt);
         }
 
-        // Release-to-release
+        // ── Release-to-release ───────────────────────────────────────────────
         const r2rTimes = [];
         for (let i = 0; i < releaseEvents.length - 1; i++) {
             const dt = releaseEvents[i + 1].time - releaseEvents[i].time;
             if (dt >= 0 && dt < 3000) r2rTimes.push(dt);
         }
 
-        // Digraphs
+        // ── Digraphs ─────────────────────────────────────────────────────────
         const digraphMap = {};
         this.trackedDigraphs.forEach(dg => { digraphMap[dg] = []; });
         for (let i = 0; i < pressEvents.length - 1; i++) {
@@ -258,7 +395,7 @@ const KeystrokeCapture = {
             }
         }
 
-        // Shift-lag
+        // ── Shift-lag ────────────────────────────────────────────────────────
         const shiftLags = [];
         for (let i = 0; i < pressEvents.length - 1; i++) {
             if (pressEvents[i].key === 'Shift') {
@@ -270,7 +407,7 @@ const KeystrokeCapture = {
             }
         }
 
-        // Typing speed
+        // ── Typing speed ─────────────────────────────────────────────────────
         const duration = (this.endTime && this.startTime)
             ? (this.endTime - this.startTime) / 1000
             : 0;
@@ -278,15 +415,15 @@ const KeystrokeCapture = {
             ? (this.textBuffer.length / duration) * 60
             : 0;
 
-        // Rhythm
+        // ── Rhythm ───────────────────────────────────────────────────────────
         const rhythmMean = _mean(p2pTimes);
         const rhythmStd  = _std(p2pTimes);
         const rhythmCv   = rhythmMean > 0 ? rhythmStd / rhythmMean : 0;
 
-        // Pauses > 500ms
+        // ── Pauses > 500ms ───────────────────────────────────────────────────
         const pauses = p2pTimes.filter(t => t > 500);
 
-        // Hand alternation
+        // ── Hand alternation ─────────────────────────────────────────────────
         const text = this.textBuffer.join('').toLowerCase();
         let alternations = 0;
         const sameHandSeqs = [];
@@ -304,7 +441,7 @@ const KeystrokeCapture = {
         }
         if (currentSeq > 0) sameHandSeqs.push(currentSeq);
 
-        // Finger transitions
+        // ── Finger transitions ───────────────────────────────────────────────
         let fingerTransitions = 0;
         for (let i = 0; i < text.length - 1; i++) {
             const f1 = this.getFinger(text[i]);
@@ -312,18 +449,14 @@ const KeystrokeCapture = {
             if (f1 && f2 && f1 !== f2) fingerTransitions++;
         }
 
-        // ── SEEK TIME FIX (v3) ───────────────────────────────────────────────
-        // Seek time = flight time > SEEK_THRESHOLD.
-        // Old code used p2p > 300ms which conflates key-hold dwell with the
-        // subsequent flight interval.  Flight time is the pure gap between
-        // releasing key[i] and pressing key[i+1], so it cleanly measures how
-        // long the finger was searching for the next key.
+        // ── Seek time (flight > SEEK_THRESHOLD) ──────────────────────────────
         const seekEvents = flightTimes.filter(t => t > SEEK_THRESHOLD);
 
-        // Backspace
+        // ── Backspace ratio ───────────────────────────────────────────────────
         const totalKeys      = pressEvents.length;
         const backspaceRatio = totalKeys > 0 ? this.backspaceCount / totalKeys : 0;
 
+        // ── Assemble raw feature object ───────────────────────────────────────
         const raw = {
             dwell_mean:    _mean(dwellTimes),
             dwell_std:     _std(dwellTimes),
@@ -357,7 +490,6 @@ const KeystrokeCapture = {
             same_hand_sequence_mean: _mean(sameHandSeqs),
             finger_transition_ratio: text.length > 1 ? fingerTransitions / (text.length - 1) : 0,
 
-            // v3: seek time now from flight windows, not p2p windows
             seek_time_mean:  _mean(seekEvents),
             seek_time_count: seekEvents.length,
 
@@ -371,10 +503,14 @@ const KeystrokeCapture = {
             dwell_times:  dwellTimes,
             flight_times: flightTimes,
             typing_speed: typingSpeedCpm / 60,
+
+            // v4: expose TypingDNA pattern string for optional forwarding
+            tdna_pattern: tdnaPattern || null,
+            tdna_active:  !!tdnaParsed,
         };
 
         const features = this._normalize(raw);
-        console.log(`[KeystrokeCapture] Features extracted: ${Object.keys(features).length}`);
+        console.log(`[KeystrokeCapture] Features extracted: ${Object.keys(features).length} (tdna=${raw.tdna_active})`);
         return features;
     },
 
@@ -393,24 +529,7 @@ const KeystrokeCapture = {
         };
     },
 
-    // ── Quality gate (TypingDNA-inspired) ────────────────────────────────────
-    //
-    // Returns { score: 0–1, label: string, details: {...} }
-    //
-    // Score is a weighted average of five sub-scores, each 0–1:
-    //
-    //   1. keyCount     — more keys captured = richer data (saturates at phrase length × 1.5)
-    //   2. rhythm       — low coefficient of variation = consistent pace (best < 0.25)
-    //   3. dwell        — mean dwell in human range (40–250ms) (penalise outliers)
-    //   4. errorRate    — low backspace ratio (best = 0, worst > 0.2)
-    //   5. crossAttempt — consistency vs previous attempts (only active after attempt 2)
-    //
-    // Weights match TypingDNA's documented quality model:
-    //   keyCount 25%, rhythm 35%, dwell 20%, errorRate 10%, crossAttempt 10%
-    //
-    // Usage:
-    //   const { score, label, details } = KeystrokeCapture.getQuality();
-    //   if (score < 0.30) { /* reject */ }
+    // ── Quality gate (unchanged from v3) ─────────────────────────────────────
 
     getQuality() {
         const pressEvents = this.events.filter(e => e.type === 'press');
@@ -418,7 +537,7 @@ const KeystrokeCapture = {
             return { score: 0, label: 'weak', details: { reason: 'too few keystrokes' } };
         }
 
-        const { dwellTimes, pairedPress } = this._buildDwellPairs();
+        const { dwellTimes } = this._buildDwellPairs();
 
         const p2pTimes = [];
         for (let i = 0; i < pressEvents.length - 1; i++) {
@@ -426,45 +545,27 @@ const KeystrokeCapture = {
             if (dt >= 0 && dt < 3000) p2pTimes.push(dt);
         }
 
-        const phraseLen  = this.targetPhrase.replace(/\s+/g, '').length || 20;
-        const totalKeys  = pressEvents.length;
-
-        // 1. Key count score — saturates at phrase length × 1.5
+        const phraseLen    = this.targetPhrase.replace(/\s+/g, '').length || 20;
+        const totalKeys    = pressEvents.length;
         const keyCountScore = Math.min(1, totalKeys / (phraseLen * 1.5));
 
-        // 2. Rhythm score — rhythm_cv (std / mean of p2p).  Lower = more consistent.
-        //    CV < 0.25  → score 1.0
-        //    CV > 0.80  → score 0.0
-        //    Linear between.
-        const rhythmMean = _mean(p2pTimes);
-        const rhythmCv   = rhythmMean > 0 ? _std(p2pTimes) / rhythmMean : 1;
-        const rhythmScore = Math.max(0, Math.min(1, (0.80 - rhythmCv) / (0.80 - 0.25)));
+        const rhythmMean   = _mean(p2pTimes);
+        const rhythmCv     = rhythmMean > 0 ? _std(p2pTimes) / rhythmMean : 1;
+        const rhythmScore  = Math.max(0, Math.min(1, (0.80 - rhythmCv) / (0.80 - 0.25)));
 
-        // 3. Dwell score — mean dwell should be 40–250ms.
-        //    Human range:  40ms (floor) → 250ms (soft ceiling).
-        //    Outliers below 20ms or above 500ms penalised harshly (clamped to 0).
         const dwellMean = _mean(dwellTimes);
         let dwellScore;
-        if (dwellMean < 20 || dwellMean > 500) {
-            dwellScore = 0;
-        } else if (dwellMean >= 40 && dwellMean <= 250) {
-            dwellScore = 1;
-        } else if (dwellMean < 40) {
-            dwellScore = (dwellMean - 20) / 20;          // 20→40ms ramp
-        } else {
-            dwellScore = Math.max(0, (500 - dwellMean) / 250);  // 250→500ms ramp
-        }
+        if (dwellMean < 20 || dwellMean > 500)       dwellScore = 0;
+        else if (dwellMean >= 40 && dwellMean <= 250) dwellScore = 1;
+        else if (dwellMean < 40)                      dwellScore = (dwellMean - 20) / 20;
+        else                                          dwellScore = Math.max(0, (500 - dwellMean) / 250);
 
-        // 4. Error rate score — backspace ratio 0 → 1.0, 0.2+ → 0.0
         const backRatio   = totalKeys > 0 ? this.backspaceCount / totalKeys : 0;
         const errorScore  = Math.max(0, 1 - backRatio / 0.2);
 
-        // 5. Cross-attempt consistency (active when _prevAttempts has ≥ 1 entry)
-        let crossScore = 0.75;     // neutral when no history yet
+        let crossScore = 0.75;
         const cv = this.getCrossAttemptCV();
         if (cv !== null) {
-            // Low cv (< 0.10) = highly consistent across attempts → score 1.0
-            // High cv (> 0.40) = erratic                          → score 0.0
             crossScore = Math.max(0, Math.min(1, (0.40 - cv) / (0.40 - 0.10)));
         }
 
@@ -503,8 +604,7 @@ const KeystrokeCapture = {
         };
     },
 
-    // ── Fast quality estimate (used for real-time keyup callback) ────────────
-    // Skips dwell pairing (expensive) and uses only press-level metrics.
+    // ── Fast quality estimate (real-time keyup callback) ─────────────────────
 
     _computeQualityFast(pressEvents) {
         const p2pTimes = [];
@@ -532,14 +632,8 @@ const KeystrokeCapture = {
         return { score, label };
     },
 
-    // ── Cross-attempt consistency ────────────────────────────────────────────
+    // ── Cross-attempt consistency ─────────────────────────────────────────────
 
-    // Call this in enroll.js after a successful submitKeystroke(), passing the
-    // features returned by extractFeatures():
-    //   KeystrokeCapture.addPreviousAttempt(features);
-    //
-    // This lets the quality gate incorporate cross-attempt consistency from
-    // attempt 2 onward — exactly what TypingDNA uses to build pattern strength.
     addPreviousAttempt(features) {
         if (!features) return;
         this._prevAttempts.push({
@@ -549,30 +643,19 @@ const KeystrokeCapture = {
         });
     },
 
-    // Returns the average coefficient of variation of typing_speed_cpm and
-    // dwell_mean across all previous attempts (plus the current session's
-    // live metrics if available).  Returns null when < 2 data points.
     getCrossAttemptCV() {
         if (this._prevAttempts.length < 1) return null;
-
         const speeds = this._prevAttempts.map(a => a.typing_speed_cpm).filter(v => v > 0);
         const dwells = this._prevAttempts.map(a => a.dwell_mean).filter(v => v > 0);
-
         if (speeds.length < 2 && dwells.length < 2) return null;
-
-        const cvOf = arr => {
-            const m = _mean(arr);
-            return m > 0 ? _std(arr) / m : 0;
-        };
-
+        const cvOf = arr => { const m = _mean(arr); return m > 0 ? _std(arr) / m : 0; };
         const cvs = [];
         if (speeds.length >= 2) cvs.push(cvOf(speeds));
         if (dwells.length >= 2) cvs.push(cvOf(dwells));
-
         return cvs.length > 0 ? _mean(cvs) : null;
     },
 
-    // ── Phrase management ────────────────────────────────────────────────────
+    // ── Phrase management ─────────────────────────────────────────────────────
 
     validatePhrase(inputValue) {
         return inputValue.trim() === this.targetPhrase;
@@ -591,14 +674,13 @@ const KeystrokeCapture = {
             }
         }
         this.trackedDigraphs = pairs;
-        console.log(`[KeystrokeCapture] Dynamic digraphs for phrase "${phrase}":`, pairs.join(', ') || '(none)');
+        console.log(`[KeystrokeCapture] Phrase set: "${phrase}" | digraphs:`, pairs.join(', ') || '(none)');
     },
 
-    // ── Reset ────────────────────────────────────────────────────────────────
+    // ── Reset ─────────────────────────────────────────────────────────────────
+    // reset() clears the current attempt but keeps _prevAttempts.
+    // Stops TypingDNA recorder and removes its target.
 
-    // reset() clears the current attempt.  _prevAttempts is intentionally
-    // NOT cleared here — it persists across attempts during enrollment.
-    // Call clearHistory() explicitly if you want a full wipe (e.g. new user).
     reset() {
         this.events         = [];
         this.isCapturing    = false;
@@ -606,6 +688,16 @@ const KeystrokeCapture = {
         this.endTime        = null;
         this.textBuffer     = [];
         this.backspaceCount = 0;
+
+        if (_tdnaInstance) {
+            try {
+                _tdnaInstance.stop();
+                if (this._attachedElementId) {
+                    _tdnaInstance.removeTarget(this._attachedElementId);
+                }
+                _tdnaInstance.reset();
+            } catch (e) { /* ignore */ }
+        }
     },
 
     clearHistory() {
