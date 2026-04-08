@@ -207,6 +207,21 @@ function _resetKeystrokeInput() {
     KeystrokeCapture.reset();
     KeystrokeCapture.attach("keystroke-input");
 
+    // ── Real-time quality bar (v3) ───────────────────────────────────────────
+    // Fires on every keyup so the user sees quality grow as they type.
+    // The bar and badge elements are injected by _ensureQualityBar() below.
+    _ensureQualityBar();
+    KeystrokeCapture.onQualityUpdate = (score, label) => {
+        const bar   = document.getElementById("ks-quality-bar-fill");
+        const badge = document.getElementById("ks-quality-badge");
+        if (!bar || !badge) return;
+        const pct = Math.round(score * 100);
+        bar.style.width = pct + "%";
+        bar.className   = "h-full rounded-full transition-all duration-200 " + _qualityBarColor(label);
+        badge.textContent = _qualityBadgeText(label);
+        badge.className   = "text-xs font-medium px-2 py-0.5 rounded " + _qualityBadgeColor(label);
+    };
+
     _updateKeystrokeProgress();
 
     // Colour feedback on every keystroke + auto-submit on keyup when phrase matches
@@ -291,6 +306,29 @@ async function submitKeystroke() {
         return;
     }
 
+    // ── Quality gate (v3) ────────────────────────────────────────────────────
+    // Reject samples below the acceptable threshold before sending to the
+    // backend.  This mirrors TypingDNA's quality gate and prevents distracted
+    // or interrupted typing from contaminating the enrollment model.
+    const { score: qualityScore, label: qualityLabel, details: qualityDetails } =
+        KeystrokeCapture.getQuality();
+
+    if (qualityScore < 0.30) {
+        const hint = qualityDetails.rhythmCv > 0.65
+            ? "Your pace varied a lot — try to type steadily from start to finish."
+            : qualityDetails.backRatio > 0.15
+            ? "Too many corrections — type carefully but don't stop."
+            : qualityDetails.dwellMean < 25
+            ? "Typing too fast — slow down slightly."
+            : "Try again at your natural pace.";
+        status.textContent = `⚠️ Low sample quality — ${hint}`;
+        status.className = "text-center text-sm mb-2 text-yellow-400";
+        if (btn) { btn.disabled = false; btn.textContent = "Submit Attempt"; btn.classList.remove("hidden"); }
+        _resetKeystrokeInput();
+        return;
+    }
+
+    console.log(`[Enroll] Quality gate passed: ${(qualityScore * 100).toFixed(0)}% (${qualityLabel})`);
     status.textContent = `⏳ Saving…`;
     status.className = "text-center text-sm mb-2 text-yellow-400";
 
@@ -361,15 +399,22 @@ async function submitKeystroke() {
 
         // ── Quality feedback ─────────────────────────────────────────────
         attemptSpeeds.push(features.typing_speed_cpm);
+
+        // v3: feed this attempt into the cross-attempt consistency tracker
+        KeystrokeCapture.addPreviousAttempt(features);
+
         let qualityNote = "";
-        if (features.typing_speed_cpm < 80) {
-            qualityNote = "Try to type at your natural pace next time.";
-        } else if (features.typing_speed_cpm > 500) {
-            qualityNote = "Great speed! Keep it natural.";
-        } else if (attemptSpeeds.length >= 2) {
-            const avg = attemptSpeeds.reduce((a, b) => a + b) / attemptSpeeds.length;
-            const sdv = Math.sqrt(attemptSpeeds.reduce((s, v) => s + (v - avg) ** 2, 0) / attemptSpeeds.length);
-            qualityNote = sdv < 40 ? "Consistent — great!" : "Try to keep a steady pace.";
+        // Use the quality gate score we already computed for richer feedback
+        if (qualityLabel === 'strong') {
+            qualityNote = "Excellent pattern — very consistent!";
+        } else if (qualityLabel === 'good') {
+            qualityNote = qualityDetails.rhythm > qualityDetails.dwell
+                ? "Good rhythm. Stay consistent."
+                : "Good sample. Try to keep the same pace.";
+        } else {
+            qualityNote = qualityDetails.rhythmCv > 0.50
+                ? "Pace was a bit uneven — try to type more steadily."
+                : "Try to keep the same speed each time.";
         }
 
         // Update live feedback row
@@ -556,4 +601,50 @@ async function submitSecurityQuestion() {
         btn.textContent = "Complete Enrollment ✅";
         console.error(err);
     }
+}
+// ── Quality bar helpers (v3) ──────────────────────────────────────────────────
+// These inject and style the real-time quality bar that wires to
+// KeystrokeCapture.onQualityUpdate.
+
+function _ensureQualityBar() {
+    if (document.getElementById("ks-quality-bar")) return;
+
+    // Find the keystroke status element and inject bar beneath it
+    const status = document.getElementById("keystroke-status");
+    if (!status) return;
+
+    const wrapper = document.createElement("div");
+    wrapper.id        = "ks-quality-bar";
+    wrapper.className = "mt-2 px-1";
+    wrapper.innerHTML = `
+        <div class="flex items-center justify-between mb-1">
+            <span class="text-xs text-gray-500">Sample quality</span>
+            <span id="ks-quality-badge" class="text-xs font-medium px-2 py-0.5 rounded bg-gray-700 text-gray-400">—</span>
+        </div>
+        <div class="h-1.5 w-full rounded-full bg-gray-700 overflow-hidden">
+            <div id="ks-quality-bar-fill" class="h-full rounded-full transition-all duration-200 bg-gray-600" style="width:0%"></div>
+        </div>`;
+    status.insertAdjacentElement("afterend", wrapper);
+}
+
+function _qualityBarColor(label) {
+    return {
+        strong:     "bg-green-500",
+        good:       "bg-blue-500",
+        acceptable: "bg-yellow-500",
+        weak:       "bg-red-500",
+    }[label] || "bg-gray-600";
+}
+
+function _qualityBadgeText(label) {
+    return { strong: "Strong", good: "Good", acceptable: "Acceptable", weak: "Weak" }[label] || "—";
+}
+
+function _qualityBadgeColor(label) {
+    return {
+        strong:     "bg-green-900 text-green-300",
+        good:       "bg-blue-900 text-blue-300",
+        acceptable: "bg-yellow-900 text-yellow-300",
+        weak:       "bg-red-900 text-red-300",
+    }[label] || "bg-gray-700 text-gray-400";
 }
