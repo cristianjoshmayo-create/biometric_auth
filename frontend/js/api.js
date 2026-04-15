@@ -35,6 +35,8 @@ function _buildVoicePayload(username, d) {
         ecapa_embedding:        d.ecapa_embedding        || [],
         // Raw WAV audio as base64 — forwarded to Azure Speaker Recognition for auth.
         raw_audio_b64:          d.raw_audio_b64          || "",
+        // Whisper transcript — needed for phrase verification at /auth/voice.
+        transcript:             d.transcript             || "",
     };
 }
 
@@ -122,6 +124,21 @@ const Api = {
             method:  "POST",
             headers: { "Content-Type": "application/json" },
             body:    JSON.stringify({ username, answer })
+        });
+        return res.json();
+    },
+
+    async fuseScores(username, keystrokeScore, voiceScore, keystrokePassed, voicePassed) {
+        const res = await fetch(`${API_BASE}/auth/fuse`, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({
+                username,
+                keystroke_score:  keystrokeScore,
+                voice_score:      voiceScore,
+                keystroke_passed: keystrokePassed,
+                voice_passed:     voicePassed,
+            })
         });
         return res.json();
     }

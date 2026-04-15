@@ -4,16 +4,13 @@ let authUsername   = "";
 let failedAttempts = 0;
 const MAX_ATTEMPTS = 3;
 
-// ── Fusion & Decision Module (Figure 9) ──────────────────
-// Scores stored when each modality fails its individual threshold.
-// If both fail, fusion runs before escalating to security question.
-// Weights: keystroke 0.45, voice 0.55 | Threshold: 0.50
-const FUSION_WEIGHT_KS    = 0.45;
-const FUSION_WEIGHT_VOICE = 0.55;
-const FUSION_THRESHOLD    = 0.50;
-
-let _ksScore    = null;
-let _voiceScore = null;
+// ── Fusion & Decision Module ──────────────────────────────
+// Scores are sent to the backend /auth/fuse endpoint for the authoritative
+// grant/deny decision. No fusion math is done here — the server decides.
+let _ksScore      = null;
+let _ksPassed     = false;
+let _voiceScore   = null;
+let _voicePassed  = false;
 
 
 // ── Step 0: Login (email + password on one screen) ───────────────────────
@@ -121,17 +118,37 @@ async function submitKeystrokeAuth() {
     try {
         const result = await Api.verifyKeystroke(authUsername, features);
 
-        if (result.authenticated) {
-            // Keystroke passed individually → grant immediately
-            showSuccess("Keystroke Dynamics", result.confidence);
+        _ksScore  = typeof result.confidence === "number" ? result.confidence : 0.0;
+        _ksPassed = result.authenticated === true;
+
+        // ── Adaptive fusion decision ──────────────────────────────────────
+        // HIGH confidence (≥ 0.80): keystroke alone is sufficient — grant immediately.
+        //   The user did nothing extra compared to just typing a password.
+        //   This is the normal fast-path and makes the system faster than 2FA.
+        //
+        // UNCERTAIN (0.55–0.79): keystroke passed its per-user threshold but
+        //   confidence is moderate — voice confirms and backend fuses both.
+        //
+        // LOW (< 0.55): keystroke clearly failed — voice still runs but the
+        //   backend applies a stricter fusion threshold.
+        const KS_HIGH_CONF = 0.80;
+
+        if (_ksScore >= KS_HIGH_CONF) {
+            // High-confidence single-modality grant — no voice needed
+            showSuccess("Keystroke Dynamics", _ksScore);
+        } else if (_ksPassed) {
+            // Passed threshold but not high-confidence — add voice for fusion
+            status.textContent =
+                `✅ Keystroke matched (${(_ksScore * 100).toFixed(1)}%) — confirming with voice…`;
+            status.className = "text-center text-sm mb-4 text-green-400";
+            setTimeout(() => moveToVoiceAuth(), 1200);
         } else {
-            // Store score for fusion, move to voice
-            _ksScore = typeof result.confidence === "number" ? result.confidence : 0.0;
+            // Failed keystroke — voice as recovery path
             recordFailedAttempt();
             status.textContent =
-                `❌ Keystroke not matched (${(_ksScore * 100).toFixed(1)}%) — trying voice…`;
-            status.className = "text-center text-sm mb-4 text-red-400";
-            setTimeout(() => moveToVoiceAuth(), 1500);
+                `⚠️ Keystroke low (${(_ksScore * 100).toFixed(1)}%) — trying voice for fusion…`;
+            status.className = "text-center text-sm mb-4 text-yellow-400";
+            setTimeout(() => moveToVoiceAuth(), 1200);
         }
 
     } catch (err) {
@@ -194,37 +211,46 @@ async function onVoiceAuthComplete(fullFeatureDict) {
     try {
         const result = await Api.verifyVoice(authUsername, fullFeatureDict);
 
-        const voiceScore = result.fused_score != null
-            ? result.fused_score / 100.0
-            : (typeof result.confidence === "number" ? result.confidence : 0.0);
+        _voiceScore  = typeof result.confidence === "number" ? result.confidence : 0.0;
+        _voicePassed = result.authenticated === true;
 
-        // Voice always feeds fusion — no individual voice grant
-        // (keystroke already had its chance to grant individually above)
-        _voiceScore = voiceScore;
+        // Show specific phrase error if voice matched but wrong phrase was spoken
+        if (!_voicePassed && result.phrase_error) {
+            status.textContent = `❌ ${result.phrase_error}`;
+            status.className   = "text-center text-sm mb-4 text-red-400";
+            if (btn) { btn.disabled = false; btn.textContent = "🎤 Try Again"; }
+            if (tryAgain) tryAgain.disabled = false;
+            return;
+        }
 
-        // ── Fusion & Decision Module ──────────────────────────
-        const ksScore    = _ksScore !== null ? _ksScore : 0.0;
-        const fusedScore = (FUSION_WEIGHT_KS * ksScore) + (FUSION_WEIGHT_VOICE * _voiceScore);
+        status.textContent = "⏳ Running fusion decision…";
+        status.className   = "text-center text-sm mb-4 text-yellow-400";
 
-        console.log(
-            `[Fusion & Decision Module] ` +
-            `keystroke=${(ksScore * 100).toFixed(1)}%  ` +
-            `voice=${(_voiceScore * 100).toFixed(1)}%  ` +
-            `fused=${(fusedScore * 100).toFixed(1)}%  ` +
-            `threshold=${(FUSION_THRESHOLD * 100).toFixed(0)}%`
+        // ── Backend Fusion & Decision ─────────────────────────
+        // The server makes the authoritative grant/deny decision.
+        // No grant/deny logic runs in the browser.
+        const ksScore = _ksScore !== null ? _ksScore : 0.0;
+        const fuseResult = await Api.fuseScores(
+            authUsername, ksScore, _voiceScore, _ksPassed, _voicePassed
         );
 
-        if (fusedScore >= FUSION_THRESHOLD) {
-            // Fusion passed → grant access
-            showSuccess("Fusion & Decision Module", fusedScore);
+        console.log(
+            `[Fusion] keystroke=${(ksScore * 100).toFixed(1)}%  ` +
+            `voice=${(_voiceScore * 100).toFixed(1)}%  ` +
+            `fused=${(fuseResult.fused_score * 100).toFixed(1)}%  ` +
+            `→ ${fuseResult.granted ? "GRANT" : "DENY"}`
+        );
+
+        if (fuseResult.granted) {
+            showSuccess("Fusion & Decision Module", fuseResult.fused_score);
         } else {
-            // Fusion failed → security question
             recordFailedAttempt();
+            const reason = fuseResult.reason ? ` (${fuseResult.reason})` : "";
             status.textContent =
-                `❌ Voice (${(voiceScore * 100).toFixed(1)}%) — ` +
-                `fused: ${(fusedScore * 100).toFixed(1)}% — proceeding to security question…`;
+                `❌ Voice (${(_voiceScore * 100).toFixed(1)}%) — ` +
+                `fused: ${(fuseResult.fused_score * 100).toFixed(1)}%${reason} — proceeding to security question…`;
             status.className = "text-center text-sm mb-4 text-red-400";
-            setTimeout(() => moveToSecurityAuth(), 800);
+            setTimeout(() => moveToSecurityAuth(), 1000);
         }
 
     } catch (err) {
@@ -282,8 +308,10 @@ async function submitSecurityAuth() {
             status.className   = "text-center text-sm mb-4 text-green-400";
 
             // Reset biometric scores so fusion starts fresh
-            _ksScore    = null;
-            _voiceScore = null;
+            _ksScore     = null;
+            _ksPassed    = false;
+            _voiceScore  = null;
+            _voicePassed = false;
 
             // Restart from keystroke step after a short delay
             setTimeout(() => {
@@ -336,7 +364,9 @@ function resetLogin() {
     failedAttempts = 0;
     authUsername   = "";
     _ksScore       = null;
+    _ksPassed      = false;
     _voiceScore    = null;
+    _voicePassed   = false;
     KeystrokeCapture.reset();
     SpeechCapture.reset();
 

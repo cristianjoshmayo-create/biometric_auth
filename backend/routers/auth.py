@@ -14,6 +14,14 @@ import subprocess
 import bcrypt  # ← ADDED
 
 from utils.fusion import fuse_keystroke_scores, fuse_voice_scores, fuse_multimodal
+from utils.crypto import decrypt
+
+# ── Pending keystroke sample cache ────────────────────────────────────────────
+# Keystroke samples are only saved after the full multimodal login is granted.
+# This prevents polluting training data with samples from sessions where voice
+# later failed (the user would not have been authenticated).
+# Key: username (str)  Value: KeystrokeAuth payload
+_pending_ks_samples: dict = {}
 
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion, AuthLog
@@ -110,6 +118,17 @@ class KeystrokeAuth(BaseModel):
     # as extra_XX features. Without this field they were silently zeroed at
     # auth time, making the login vector look nothing like the enrolled vector.
     extra_digraphs:   Optional[dict] = {}
+    key_dwell_map:    Optional[dict] = {}
+
+    # 4-variant digraph timings + trigraphs (frontend keystroke.js v3.1+).
+    # Currently received but not used by the matcher — wire in once the
+    # trainer's extract_feature_vector accepts the new dict-based features.
+    digraph_dd_map:     Optional[dict] = {}
+    digraph_du_map:     Optional[dict] = {}
+    digraph_ud_map:     Optional[dict] = {}
+    digraph_uu_map:     Optional[dict] = {}
+    flight_per_digraph: Optional[dict] = {}
+    trigraph_map:       Optional[dict] = {}
 
 
 class VoiceAuth(VoiceFeatures):
@@ -158,15 +177,60 @@ def feature_similarity(enrolled, live, tolerance=0.30):
     return max(0.0, min(1.0, score))
 
 
-def log_attempt(db, user_id, method, confidence, result):
+def log_attempt(db, user_id, method, confidence, result,
+                template_maturity=None, effective_threshold=None):
     log = AuthLog(
         user_id=user_id,
         auth_method=method,
         confidence_score=float(confidence),
-        result=result
+        result=result,
+        template_maturity=template_maturity,
+        effective_threshold=effective_threshold,
     )
     db.add(log)
     db.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Progressive-enrollment policy
+#
+#  A freshly-enrolled template built from 5 upfront samples is noisy. Rather
+#  than reject the genuine user at a hardened threshold from day 1, we start
+#  keystroke at a relaxed threshold and harden it as the template stabilizes
+#  through real-world samples. Security is preserved because the overall login
+#  still requires password AND voice — joint FAR stays far below 10⁻⁴.
+#
+#  Maturity = count of successful multi-factor-verified logins since enroll.
+#    maturity < 3  →  soft    threshold 0.45
+#    3 ≤ m < 7    →  ramp    threshold 0.55
+#    maturity ≥ 7  →  hardened (stored threshold, typically 0.65)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SOFT_THRESHOLD = 0.45
+_RAMP_THRESHOLD = 0.55
+_SOFT_MATURITY_END = 3   # below → soft
+_RAMP_MATURITY_END = 7   # below → ramp; at/above → hardened
+
+
+def _keystroke_maturity(db, user_id: int) -> int:
+    """
+    Count completed logins that verified this user's identity end-to-end —
+    either keystroke alone granted access, or fusion (voice recovery) granted.
+    Both imply the full multi-factor pipeline accepted the user.
+    """
+    return db.query(AuthLog).filter(
+        AuthLog.user_id == user_id,
+        AuthLog.auth_method.in_(("keystroke", "fusion")),
+        AuthLog.result == "granted",
+    ).count()
+
+
+def _effective_keystroke_threshold(stored_threshold: float, maturity: int) -> float:
+    if maturity < _SOFT_MATURITY_END:
+        return _SOFT_THRESHOLD
+    if maturity < _RAMP_MATURITY_END:
+        return _RAMP_THRESHOLD
+    return float(stored_threshold)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,6 +277,153 @@ def verify_password(payload: PasswordAuth, db: Session = Depends(get_db)):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  KEYSTROKE SAMPLE SAVE HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _save_keystroke_sample(db: Session, user, ks_payload, source: str = "login"):
+    """
+    Persist a keystroke sample to the database and trigger adaptive retraining
+    if a milestone or interval is reached.  Called from two places:
+      - verify_keystroke  : when keystroke alone grants access
+      - fuse_scores       : when voice recovery + fusion grants access
+    """
+    try:
+        total_samples = db.query(KeystrokeTemplate).filter(
+            KeystrokeTemplate.user_id == user.id
+        ).count()
+
+        if total_samples >= MAX_SAMPLES:
+            oldest = db.query(KeystrokeTemplate).filter(
+                KeystrokeTemplate.user_id == user.id
+            ).order_by(KeystrokeTemplate.sample_order.asc()).first()
+            if oldest:
+                db.delete(oldest)
+                db.flush()
+
+        max_order = db.query(func.max(KeystrokeTemplate.sample_order)).filter(
+            KeystrokeTemplate.user_id == user.id
+        ).scalar() or 0
+
+        new_sample = KeystrokeTemplate(
+            user_id=user.id,
+            attempt_number=min(total_samples + 1, MAX_SAMPLES),
+            source=source,
+            sample_order=max_order + 1,
+            dwell_times=ks_payload.dwell_times,
+            flight_times=ks_payload.flight_times,
+            typing_speed=ks_payload.typing_speed,
+            dwell_mean=ks_payload.dwell_mean,
+            dwell_std=ks_payload.dwell_std,
+            dwell_median=ks_payload.dwell_median,
+            dwell_min=ks_payload.dwell_min,
+            dwell_max=ks_payload.dwell_max,
+            flight_mean=ks_payload.flight_mean,
+            flight_std=ks_payload.flight_std,
+            flight_median=ks_payload.flight_median,
+            p2p_mean=ks_payload.p2p_mean,
+            p2p_std=ks_payload.p2p_std,
+            r2r_mean=ks_payload.r2r_mean,
+            r2r_std=ks_payload.r2r_std,
+            digraph_th=ks_payload.digraph_th,
+            digraph_he=ks_payload.digraph_he,
+            digraph_bi=ks_payload.digraph_bi,
+            digraph_io=ks_payload.digraph_io,
+            digraph_om=ks_payload.digraph_om,
+            digraph_me=ks_payload.digraph_me,
+            digraph_et=ks_payload.digraph_et,
+            digraph_tr=ks_payload.digraph_tr,
+            digraph_ri=ks_payload.digraph_ri,
+            digraph_ic=ks_payload.digraph_ic,
+            digraph_vo=ks_payload.digraph_vo,
+            digraph_oi=ks_payload.digraph_oi,
+            digraph_ce=ks_payload.digraph_ce,
+            digraph_ke=ks_payload.digraph_ke,
+            digraph_ey=ks_payload.digraph_ey,
+            digraph_ys=ks_payload.digraph_ys,
+            digraph_st=ks_payload.digraph_st,
+            digraph_ro=ks_payload.digraph_ro,
+            digraph_ok=ks_payload.digraph_ok,
+            digraph_au=ks_payload.digraph_au,
+            digraph_ut=ks_payload.digraph_ut,
+            digraph_en=ks_payload.digraph_en,
+            digraph_nt=ks_payload.digraph_nt,
+            digraph_ti=ks_payload.digraph_ti,
+            digraph_ca=ks_payload.digraph_ca,
+            digraph_at=ks_payload.digraph_at,
+            digraph_on=ks_payload.digraph_on,
+            typing_speed_cpm=ks_payload.typing_speed_cpm,
+            typing_duration=ks_payload.typing_duration,
+            rhythm_mean=ks_payload.rhythm_mean,
+            rhythm_std=ks_payload.rhythm_std,
+            rhythm_cv=ks_payload.rhythm_cv,
+            pause_count=ks_payload.pause_count,
+            pause_mean=ks_payload.pause_mean,
+            backspace_ratio=ks_payload.backspace_ratio,
+            backspace_count=ks_payload.backspace_count,
+            hand_alternation_ratio=ks_payload.hand_alternation_ratio,
+            same_hand_sequence_mean=ks_payload.same_hand_sequence_mean,
+            finger_transition_ratio=ks_payload.finger_transition_ratio,
+            seek_time_mean=ks_payload.seek_time_mean,
+            seek_time_count=ks_payload.seek_time_count,
+            shift_lag_mean=ks_payload.shift_lag_mean,
+            shift_lag_std=ks_payload.shift_lag_std,
+            shift_lag_count=ks_payload.shift_lag_count,
+            dwell_mean_norm=ks_payload.dwell_mean_norm,
+            dwell_std_norm=ks_payload.dwell_std_norm,
+            flight_mean_norm=ks_payload.flight_mean_norm,
+            flight_std_norm=ks_payload.flight_std_norm,
+            p2p_std_norm=ks_payload.p2p_std_norm,
+            r2r_mean_norm=ks_payload.r2r_mean_norm,
+            shift_lag_norm=ks_payload.shift_lag_norm,
+            extra_digraphs=ks_payload.extra_digraphs or {},
+            key_dwell_map=ks_payload.key_dwell_map or {},
+        )
+        db.add(new_sample)
+        db.commit()
+
+        updated_count = db.query(KeystrokeTemplate).filter(
+            KeystrokeTemplate.user_id == user.id
+        ).count()
+        print(f"  💾 Keystroke sample saved [{source}] (total: {updated_count}/{MAX_SAMPLES})")
+
+        # Adaptive retrain
+        login_count_total = db.query(AuthLog).filter(
+            AuthLog.user_id == user.id,
+            AuthLog.auth_method == "keystroke",
+            AuthLog.result == "granted"
+        ).count()
+
+        if updated_count <= 10:
+            retrain_interval = 2
+        elif updated_count <= 30:
+            retrain_interval = 5
+        else:
+            retrain_interval = 10
+
+        should_retrain = (login_count_total % retrain_interval == 0) or (updated_count in [10, 20, 30, 40, 50])
+        if should_retrain:
+            reason = f"milestone ({updated_count})" if updated_count in [10, 20, 30, 40, 50] else f"interval ({retrain_interval})"
+            print(f"  🔄 Triggering retrain: {reason}")
+            try:
+                script_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                    'ml', 'train_keystroke_rf.py'
+                )
+                subprocess.Popen(
+                    [sys.executable, script_path, ks_payload.username],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                )
+                print(f"  ✅ Retraining started in background")
+            except Exception as e:
+                print(f"  ⚠️ Retrain failed: {e}")
+
+    except Exception as _save_err:
+        print(f"  ⚠️ Keystroke sample save failed: {_save_err}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  KEYSTROKE AUTH
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -227,295 +438,237 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
     model_path = os.path.join(_model_dir(), f"{_safe_filename(payload.username)}_keystroke_rf.pkl")
 
     if os.path.exists(model_path):
-        print(f"[keystroke] Using RF model for '{payload.username}'")
         try:
             with open(model_path, 'rb') as f:
                 model_data = pickle.load(f)
 
-            pipeline     = model_data['pipeline']
+            model_type   = model_data.get('model_type', 'rf')
             feat_names   = model_data['feature_names']
             profile_mean = model_data['profile_mean']
-            threshold    = model_data['threshold']
+            stored_threshold = model_data['threshold']
 
-            # FIX: features whose names start with "extra_" were produced by
-            # the phrase-aware digraph filter in train_keystroke_rf.py.
-            # They must be looked up from payload.extra_digraphs (a dict keyed
-            # by the 2-letter bigram), NOT via getattr which always returns 0.0.
-            # Zeroing every extra_* feature was the primary reason keystroke
-            # auth always failed for users with unique passphrases.
+            # Progressive threshold: relaxed during template stabilization.
+            maturity  = _keystroke_maturity(db, user.id)
+            threshold = _effective_keystroke_threshold(stored_threshold, maturity)
+            mode = ("SOFT" if maturity < _SOFT_MATURITY_END else
+                    "RAMP" if maturity < _RAMP_MATURITY_END else "HARD")
+            print(f"[keystroke] maturity={maturity}  mode={mode}  "
+                  f"effective_threshold={threshold:.2f}  (stored={stored_threshold:.2f})")
+
+            # Build live feature vector (handles standard, extra_ digraphs, and key_ dwells)
             extra_map = payload.extra_digraphs or {}
+            key_map   = payload.key_dwell_map  or {}
             vec = np.array([
-                float(extra_map.get(name[6:], 0.0) or 0.0)
-                if name.startswith("extra_")
-                else float(getattr(payload, name, 0.0) or 0.0)
+                float(extra_map.get(name[6:], 0.0) or 0.0) if name.startswith("extra_") else
+                float(key_map.get(name[4:],   0.0) or 0.0) if name.startswith("key_")   else
+                float(getattr(payload, name,   0.0) or 0.0)
                 for name in feat_names
-            ]).reshape(1, -1)
+            ])
 
-            rf_score = float(pipeline.predict_proba(vec)[0][1])
+            # ── Profile Matcher path (≤10 enrollment samples) ─────────────────
+            if model_type == 'profile':
+                print(f"[keystroke] Using Profile Matcher for '{payload.username}'")
+                # Profile path lacks Mahalanobis — clamp effective threshold to
+                # ≥ 0.55 so SOFT mode can't drop it to 0.45 without hard gates.
+                if threshold < 0.55:
+                    print(f"  ⚠  Profile-path threshold floor: {threshold:.2f} → 0.55")
+                    threshold = 0.55
+                _project_root = os.path.normpath(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), '..', '..'
+                ))
+                if _project_root not in sys.path:
+                    sys.path.insert(0, _project_root)
+                from ml.keystroke_profile_matcher import compute_profile_score
+                profile_std = model_data['profile_std']
+                result = compute_profile_score(vec, feat_names, profile_mean, profile_std)
+                profile_score = result['score']
+                speed_ratio   = result['speed_ratio']
+                group_scores  = result['group_scores']
 
-            profile_std = model_data.get('profile_std', None)
-            if profile_std is not None and len(profile_std) == len(profile_mean):
-                var       = profile_std ** 2
-                safe_var  = np.where(var < 1e-10, 1e-10, var)
-                diff      = vec[0] - profile_mean
-                d_sq      = float(np.sum(diff ** 2 / safe_var))
-                d_sq_norm = d_sq / max(len(vec[0]), 1)
-                # Clamp exponent to prevent overflow (np.exp overflows at ~710)
-                exponent  = float(np.clip(2.5 * (d_sq_norm - 1.0), -500, 500))
-                mah_score = float(1.0 / (1.0 + np.exp(exponent)))
+                # ── Hard sanity gates (mirror RF path) ──────────────────────
+                hard_reject   = False
+                reject_reason = ""
+                fn_list = list(feat_names)
+                def _fv(name):
+                    try:
+                        return float(vec[fn_list.index(name)])
+                    except (ValueError, IndexError):
+                        return None
+
+                if 'dwell_mean' in fn_list:
+                    e_dwell     = float(profile_mean[fn_list.index('dwell_mean')])
+                    e_dwell_std = float(profile_std[fn_list.index('dwell_mean')]) + 1e-9
+                    e_dwell_std = max(e_dwell_std, e_dwell * 0.10, 20.0)
+                    l_dwell     = _fv('dwell_mean')
+                    if l_dwell is not None:
+                        dwell_z = abs(l_dwell - e_dwell) / e_dwell_std
+                        if dwell_z > 3.0:
+                            hard_reject   = True
+                            reject_reason = (f"dwell_mean z={dwell_z:.1f} "
+                                             f"(live={l_dwell:.0f}ms enrolled={e_dwell:.0f}ms)")
+
+                if not hard_reject and 'typing_speed_cpm' in fn_list:
+                    e_cpm     = float(profile_mean[fn_list.index('typing_speed_cpm')])
+                    e_cpm_std = float(profile_std[fn_list.index('typing_speed_cpm')]) + 1e-9
+                    e_cpm_std = max(e_cpm_std, e_cpm * 0.20)
+                    l_cpm     = _fv('typing_speed_cpm')
+                    if l_cpm is not None:
+                        cpm_z = abs(l_cpm - e_cpm) / e_cpm_std
+                        if cpm_z > 5.0:
+                            hard_reject   = True
+                            reject_reason = (f"typing_speed_cpm z={cpm_z:.1f} "
+                                             f"(live={l_cpm:.0f} enrolled={e_cpm:.0f})")
+
+                if hard_reject:
+                    confidence    = 0.0
+                    authenticated = False
+                    print(f"  ⛔ Hard reject: {reject_reason}")
+                else:
+                    confidence    = profile_score
+                    authenticated = confidence >= threshold
+
+                breach = group_scores.get('floor_breach')
+                if breach and not hard_reject:
+                    print(f"  ⛔ {breach}")
+                print(f"  Profile score={profile_score:.3f}  speed_ratio={speed_ratio:.2f}  "
+                      f"Threshold={threshold:.2f}  "
+                      f"dig_dist={group_scores['digraph_dist']:.2f} "
+                      f"dig_rank={group_scores['digraph_rank']:.2f} "
+                      f"df={group_scores['dwell_flight']:.2f} "
+                      f"rhy={group_scores['rhythm']:.2f}  "
+                      f"→ {'PASS' if authenticated else 'FAIL'}")
+
+            # ── RF / GBM path (>10 enrollment samples) ────────────────────────
             else:
-                diff      = np.linalg.norm(vec[0] - profile_mean)
-                scale     = np.linalg.norm(profile_mean) + 1e-9
-                mah_score = float(max(0, 1 - diff / scale))
+                print(f"[keystroke] Using RF model for '{payload.username}'")
+                pipeline  = model_data['pipeline']
+                vec_2d    = vec.reshape(1, -1)
+                rf_score  = float(pipeline.predict_proba(vec_2d)[0][1])
 
-            # ── Hard sanity gates ─────────────────────────────────────────────
-            # These catch cases where the RF is overconfident but raw timing
-            # numbers are obviously wrong for this user.  Gates fire BEFORE the
-            # fused score so RF=1.0 cannot override clearly anomalous typing.
-            hard_reject   = False
-            reject_reason = ""
+                profile_std = model_data.get('profile_std', None)
+                if profile_std is not None and len(profile_std) == len(profile_mean):
+                    var       = profile_std ** 2
+                    safe_var  = np.where(var < 1e-10, 1e-10, var)
+                    diff      = vec - profile_mean
+                    d_sq      = float(np.sum(diff ** 2 / safe_var))
+                    d_sq_norm = d_sq / max(len(vec), 1)
+                    exponent  = float(np.clip(2.5 * (d_sq_norm - 1.0), -500, 500))
+                    mah_score = float(1.0 / (1.0 + np.exp(exponent)))
+                else:
+                    diff      = np.linalg.norm(vec - profile_mean)
+                    scale     = np.linalg.norm(profile_mean) + 1e-9
+                    mah_score = float(max(0, 1 - diff / scale))
 
-            fn_list = list(feat_names)
-            def _fv(name):
-                try:
-                    return float(vec[0][fn_list.index(name)])
-                except (ValueError, IndexError):
-                    return None
+                # ── Hard sanity gates ─────────────────────────────────────────
+                hard_reject   = False
+                reject_reason = ""
 
-            # Gate 1: dwell_mean z-score (how long keys are held)
-            if not hard_reject and profile_std is not None and 'dwell_mean' in fn_list:
-                e_dwell     = float(profile_mean[fn_list.index('dwell_mean')])
-                e_dwell_std = float(profile_std[fn_list.index('dwell_mean')]) + 1e-9
-                e_dwell_std = max(e_dwell_std, e_dwell * 0.10, 20.0)
-                l_dwell     = _fv('dwell_mean')
-                if l_dwell is not None:
-                    dwell_z = abs(l_dwell - e_dwell) / e_dwell_std
-                    # FIX: tightened from 4.5 → 3.0 z-score.
-                    # 4.5 std is extreme — only fires if the impostor types
-                    # nearly 5x slower/faster than the genuine user. At 3.0,
-                    # groupmates who differ by 3 standard deviations (a clearly
-                    # different typing rhythm) are hard-rejected immediately.
-                    if dwell_z > 3.0:
-                        hard_reject   = True
-                        reject_reason = (f"dwell_mean z={dwell_z:.1f} "
-                                         f"(live={l_dwell:.0f}ms enrolled={e_dwell:.0f}ms)")
+                fn_list = list(feat_names)
+                def _fv(name):
+                    try:
+                        return float(vec[fn_list.index(name)])
+                    except (ValueError, IndexError):
+                        return None
 
-            # Gate 2: typing_speed_cpm z-score
-            if not hard_reject and profile_std is not None and 'typing_speed_cpm' in fn_list:
-                e_cpm     = float(profile_mean[fn_list.index('typing_speed_cpm')])
-                e_cpm_std = float(profile_std[fn_list.index('typing_speed_cpm')]) + 1e-9
-                e_cpm_std = max(e_cpm_std, e_cpm * 0.20)
-                l_cpm     = _fv('typing_speed_cpm')
-                if l_cpm is not None:
-                    cpm_z = abs(l_cpm - e_cpm) / e_cpm_std
-                    if cpm_z > 5.0:
-                        hard_reject   = True
-                        reject_reason = (f"typing_speed_cpm z={cpm_z:.1f} "
-                                         f"(live={l_cpm:.0f} enrolled={e_cpm:.0f})")
+                # Gate 1: dwell_mean z-score
+                if not hard_reject and profile_std is not None and 'dwell_mean' in fn_list:
+                    e_dwell     = float(profile_mean[fn_list.index('dwell_mean')])
+                    e_dwell_std = float(profile_std[fn_list.index('dwell_mean')]) + 1e-9
+                    e_dwell_std = max(e_dwell_std, e_dwell * 0.10, 20.0)
+                    l_dwell     = _fv('dwell_mean')
+                    if l_dwell is not None:
+                        dwell_z = abs(l_dwell - e_dwell) / e_dwell_std
+                        if dwell_z > 3.0:
+                            hard_reject   = True
+                            reject_reason = (f"dwell_mean z={dwell_z:.1f} "
+                                             f"(live={l_dwell:.0f}ms enrolled={e_dwell:.0f}ms)")
 
-            # Gate 3: Mahalanobis hard floor.
-            # FIX: raised from 0.05 → 0.15. mah_score < 0.05 only fired for
-            # extreme outliers (d_sq_norm >> 3). Groupmates who type similarly
-            # land at mah_score ~0.10–0.30; raising the floor catches them
-            # before the RF score can override.
-            if not hard_reject and mah_score < 0.15:
-                hard_reject   = True
-                reject_reason = (f"Mahalanobis floor breach "
-                                 f"(mah={mah_score:.4f}, d_sq_norm={d_sq_norm:.2f})")
+                # Gate 2: typing_speed_cpm z-score
+                if not hard_reject and profile_std is not None and 'typing_speed_cpm' in fn_list:
+                    e_cpm     = float(profile_mean[fn_list.index('typing_speed_cpm')])
+                    e_cpm_std = float(profile_std[fn_list.index('typing_speed_cpm')]) + 1e-9
+                    e_cpm_std = max(e_cpm_std, e_cpm * 0.20)
+                    l_cpm     = _fv('typing_speed_cpm')
+                    if l_cpm is not None:
+                        cpm_z = abs(l_cpm - e_cpm) / e_cpm_std
+                        if cpm_z > 5.0:
+                            hard_reject   = True
+                            reject_reason = (f"typing_speed_cpm z={cpm_z:.1f} "
+                                             f"(live={l_cpm:.0f} enrolled={e_cpm:.0f})")
 
-            if hard_reject:
-                confidence    = 0.0   # low but non-zero — lets strong voice save via fusion
-                authenticated = False
-                print(f"  ⛔ Hard reject: {reject_reason}")
-            else:
-                # Intra-modal fusion: RF (75%) + Mahalanobis (25%).
-                # Weights are defined in utils/fusion.py — single source of truth.
-                confidence    = fuse_keystroke_scores(rf_score, mah_score)
-                authenticated = confidence >= threshold
+                # Gate 3: Mahalanobis hard floor
+                if not hard_reject and mah_score < 0.15:
+                    hard_reject   = True
+                    reject_reason = (f"Mahalanobis floor breach "
+                                     f"(mah={mah_score:.4f}, d_sq_norm={d_sq_norm:.2f})")
 
-            print(f"  RF={rf_score:.3f}  Mah={mah_score:.3f}  "
-                  f"Fused={confidence:.3f}  Threshold={threshold:.3f}"
-                  f"  \u2192 {'PASS' if authenticated else 'FAIL'}")
+                if hard_reject:
+                    confidence    = 0.0
+                    authenticated = False
+                    print(f"  ⛔ Hard reject: {reject_reason}")
+                else:
+                    confidence    = fuse_keystroke_scores(rf_score, mah_score)
+                    authenticated = confidence >= threshold
+
+                print(f"  RF={rf_score:.3f}  Mah={mah_score:.3f}  "
+                      f"Fused={confidence:.3f}  Threshold={threshold:.3f}"
+                      f"  \u2192 {'PASS' if authenticated else 'FAIL'}")
 
         except Exception as e:
-            print(f"[keystroke] RF model error: {e}")
+            print(f"[keystroke] model error: {e}")
             import traceback; traceback.print_exc()
             confidence    = 0.0
             authenticated = False
 
     else:
-        # No trained model — hard reject.
-        # The old dwell-time similarity fallback (threshold 0.40) was too
-        # loose and granted access to anyone with a vaguely similar typing
-        # speed.  Until the RF model is trained, deny all keystroke attempts
-        # so the user falls through to voice → security question.
-        print(f"[keystroke] No RF model for '{payload.username}' — hard reject until model is trained")
+        # No trained model — hard reject until enrollment is complete.
+        print(f"[keystroke] No model for '{payload.username}' — hard reject until model is trained")
         confidence    = 0.0
         authenticated = False
 
     print(f"[keystroke] user={payload.username}  "
           f"confidence={confidence:.3f}  result={'PASS' if authenticated else 'FAIL'}")
 
+    # `threshold` / `maturity` only exist when a model was loaded; for the
+    # no-model hard-reject path below, fall back to nulls.
+    _log_mat = locals().get('maturity')
+    _log_thr = locals().get('threshold')
     log_attempt(db, user.id, "keystroke", confidence,
-                "granted" if authenticated else "denied")
+                "granted" if authenticated else "denied",
+                template_maturity=_log_mat,
+                effective_threshold=_log_thr)
 
     # ═════════════════════════════════════════════════════════════════
-    # ADAPTIVE LEARNING: Save login sample + Auto-retrain
-    # Only save high-confidence matches — borderline passes risk saving
-    # an impostor's sample as genuine data, corrupting the model.
+    # ADAPTIVE LEARNING
+    #
+    # Case A — Keystroke alone granted access:
+    #   Save the sample immediately.  No need to wait for voice/fusion
+    #   because the user is already authenticated by keystroke alone.
+    #
+    # Case B — Keystroke failed, voice recovery will be tried:
+    #   Cache the sample.  /auth/fuse will save it only if the full
+    #   multimodal fusion grants access.  This prevents polluting the
+    #   training data with samples from sessions the user ultimately
+    #   failed to authenticate.
+    #
+    # Hard reject (confidence == 0): don't cache at all — the sample
+    #   carries no useful signal.
     # ═════════════════════════════════════════════════════════════════
-    SAVE_CONFIDENCE_MINIMUM = 0.70
-
-    if authenticated and confidence >= SAVE_CONFIDENCE_MINIMUM:
-        # Get current sample count
-        total_samples = db.query(KeystrokeTemplate).filter(
-            KeystrokeTemplate.user_id == user.id
-        ).count()
-
-        # Delete oldest if at limit (rolling window)
-        if total_samples >= MAX_SAMPLES:
-            oldest = db.query(KeystrokeTemplate).filter(
-                KeystrokeTemplate.user_id == user.id
-            ).order_by(KeystrokeTemplate.sample_order.asc()).first()
-            if oldest:
-                print(f"  🗑️ Deleting oldest sample (order={oldest.sample_order})")
-                db.delete(oldest)
-                db.flush()
-
-        # Get next order number
-        max_order = db.query(func.max(KeystrokeTemplate.sample_order)).filter(
-            KeystrokeTemplate.user_id == user.id
-        ).scalar() or 0
-
-        # Save new login sample with all features
-        new_sample = KeystrokeTemplate(
-            user_id=user.id,
-            attempt_number=min(total_samples + 1, MAX_SAMPLES),
-            source="login",
-            sample_order=max_order + 1,
-            dwell_times=payload.dwell_times,
-            flight_times=payload.flight_times,
-            typing_speed=payload.typing_speed,
-            dwell_mean=payload.dwell_mean,
-            dwell_std=payload.dwell_std,
-            dwell_median=payload.dwell_median,
-            dwell_min=payload.dwell_min,
-            dwell_max=payload.dwell_max,
-            flight_mean=payload.flight_mean,
-            flight_std=payload.flight_std,
-            flight_median=payload.flight_median,
-            p2p_mean=payload.p2p_mean,
-            p2p_std=payload.p2p_std,
-            r2r_mean=payload.r2r_mean,
-            r2r_std=payload.r2r_std,
-            digraph_th=payload.digraph_th,
-            digraph_he=payload.digraph_he,
-            digraph_bi=payload.digraph_bi,
-            digraph_io=payload.digraph_io,
-            digraph_om=payload.digraph_om,
-            digraph_me=payload.digraph_me,
-            digraph_et=payload.digraph_et,
-            digraph_tr=payload.digraph_tr,
-            digraph_ri=payload.digraph_ri,
-            digraph_ic=payload.digraph_ic,
-            digraph_vo=payload.digraph_vo,
-            digraph_oi=payload.digraph_oi,
-            digraph_ce=payload.digraph_ce,
-            digraph_ke=payload.digraph_ke,
-            digraph_ey=payload.digraph_ey,
-            digraph_ys=payload.digraph_ys,
-            digraph_st=payload.digraph_st,
-            digraph_ro=payload.digraph_ro,
-            digraph_ok=payload.digraph_ok,
-            digraph_au=payload.digraph_au,
-            digraph_ut=payload.digraph_ut,
-            digraph_en=payload.digraph_en,
-            digraph_nt=payload.digraph_nt,
-            digraph_ti=payload.digraph_ti,
-            digraph_ca=payload.digraph_ca,
-            digraph_at=payload.digraph_at,
-            digraph_on=payload.digraph_on,
-            typing_speed_cpm=payload.typing_speed_cpm,
-            typing_duration=payload.typing_duration,
-            rhythm_mean=payload.rhythm_mean,
-            rhythm_std=payload.rhythm_std,
-            rhythm_cv=payload.rhythm_cv,
-            pause_count=payload.pause_count,
-            pause_mean=payload.pause_mean,
-            backspace_ratio=payload.backspace_ratio,
-            backspace_count=payload.backspace_count,
-            hand_alternation_ratio=payload.hand_alternation_ratio,
-            same_hand_sequence_mean=payload.same_hand_sequence_mean,
-            finger_transition_ratio=payload.finger_transition_ratio,
-            seek_time_mean=payload.seek_time_mean,
-            seek_time_count=payload.seek_time_count,
-            shift_lag_mean=payload.shift_lag_mean,
-            shift_lag_std=payload.shift_lag_std,
-            shift_lag_count=payload.shift_lag_count,
-            dwell_mean_norm=payload.dwell_mean_norm,
-            dwell_std_norm=payload.dwell_std_norm,
-            flight_mean_norm=payload.flight_mean_norm,
-            flight_std_norm=payload.flight_std_norm,
-            p2p_std_norm=payload.p2p_std_norm,
-            r2r_mean_norm=payload.r2r_mean_norm,
-            shift_lag_norm=payload.shift_lag_norm,
-            # FIX: persist phrase-specific bigram timings so adaptive
-            # retraining can load them via extract_feature_vector(extra_keys=...)
-            extra_digraphs=payload.extra_digraphs or {},
-        )
-        db.add(new_sample)
-        db.commit()
-
-        updated_count = db.query(KeystrokeTemplate).filter(
-            KeystrokeTemplate.user_id == user.id
-        ).count()
-
-        print(f"  💾 Saved login sample (total: {updated_count}/{MAX_SAMPLES})")
-
-        # Determine adaptive retrain interval
-        login_count_total = db.query(AuthLog).filter(
-            AuthLog.user_id == user.id,
-            AuthLog.auth_method == "keystroke",
-            AuthLog.result == "granted"
-        ).count()
-
-        if updated_count <= 10:
-            retrain_interval = 2   # Every 2 logins (fast bootstrap)
-        elif updated_count <= 30:
-            retrain_interval = 5   # Every 5 logins (learning phase)
-        else:
-            retrain_interval = 10  # Every 10 logins (mature phase)
-
-        should_retrain = False
-        retrain_reason = ""
-
-        # Check interval-based retraining
-        if login_count_total % retrain_interval == 0:
-            should_retrain = True
-            retrain_reason = f"interval ({retrain_interval} logins)"
-
-        # Also retrain at key milestones
-        milestones = [10, 20, 30, 40, 50]
-        if updated_count in milestones:
-            should_retrain = True
-            retrain_reason = f"milestone ({updated_count} samples)"
-
-        if should_retrain:
-            print(f"  🔄 Triggering retrain: {retrain_reason}")
-            try:
-                script_path = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                    'ml', 'train_keystroke_rf.py'
-                )
-                subprocess.Popen(
-                    [sys.executable, script_path, payload.username],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-                )
-                print(f"  ✅ Retraining started in background")
-            except Exception as e:
-                print(f"  ⚠️ Retrain failed: {e}")
+    # Continuous enrollment policy.
+    #
+    # Case A (keystroke alone passed): the effective threshold already reflects
+    # the template's maturity stage — a pass at the soft threshold is safe to
+    # feed back because the soft regime assumes multi-factor backup, and a
+    # user reaching Case A also cleared password. Save the sample.
+    #
+    # Case B (keystroke failed, voice recovery will run): defer to /fuse —
+    # it only saves if the *full* multi-factor pipeline grants access.
+    if authenticated:
+        _save_keystroke_sample(db, user, payload, source="login_ks")
+    elif confidence > 0:
+        # Case B: low confidence, voice recovery path — hold for fusion
+        _pending_ks_samples[payload.username] = payload
+        print(f"  ⏳ Keystroke sample cached — will save only if fusion grants access")
 
     # Handle failed attempts — count keystroke method only
     if not authenticated:
@@ -579,6 +732,69 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
         authenticated = False
 
 
+    # ── PHRASE VERIFICATION: confirm the correct passphrase was spoken ────
+    # Two-signal matching to handle accents and minor ASR errors:
+    #
+    #   Signal 1 — Character ratio (difflib):
+    #     Compares the full strings character by character.
+    #     Good for: clean pronunciation, exact matches.
+    #     Weak for: strong accents that shift vowel sounds.
+    #
+    #   Signal 2 — Word overlap ratio:
+    #     Counts how many expected words appear anywhere in the transcript.
+    #     Good for: accents, word reordering, one dropped/mispronounced word.
+    #     For a 4-word phrase, 3/4 correct words = 0.75 overlap ratio.
+    #
+    #   Final score = max(char_ratio, word_overlap) so either signal can pass.
+    #   Threshold = 0.70 — lenient enough for accents, strict enough to block
+    #   completely different phrases.
+    #
+    # If Whisper was unavailable (empty transcript), check is skipped so the
+    # system degrades gracefully rather than locking everyone out.
+    import difflib, re
+
+    transcript      = (getattr(payload, 'transcript', '') or '').strip()
+    expected_phrase = decrypt(user.phrase).strip() if user.phrase else ""
+    phrase_error    = ""
+
+    if transcript and expected_phrase:
+        def _norm(s):
+            s = s.lower()
+            s = re.sub(r"[^a-z0-9\s]", "", s)
+            return re.sub(r"\s+", " ", s).strip()
+
+        norm_expected   = _norm(expected_phrase)
+        norm_transcript = _norm(transcript)
+
+        # Signal 1: character-level similarity
+        char_ratio = difflib.SequenceMatcher(None, norm_expected, norm_transcript).ratio()
+
+        # Signal 2: word-level overlap
+        expected_words    = set(norm_expected.split())
+        transcript_words  = set(norm_transcript.split())
+        matched_words     = expected_words & transcript_words
+        word_overlap      = len(matched_words) / len(expected_words) if expected_words else 0.0
+
+        final_score  = max(char_ratio, word_overlap)
+        phrase_match = final_score >= 0.70
+
+        print(f"  [PHRASE] transcript='{transcript}'  expected='{expected_phrase}'")
+        print(f"  [PHRASE] char_ratio={char_ratio:.2f}  word_overlap={word_overlap:.2f}  "
+              f"final={final_score:.2f}  → {'PASS' if phrase_match else 'FAIL'}")
+
+        if authenticated and not phrase_match:
+            authenticated = False
+            confidence    = 0.0
+            phrase_error  = (
+                f"Wrong phrase spoken — heard: \"{transcript}\". "
+                f"Please say your assigned phrase and try again."
+            )
+            print("  [VOICE] ECAPA passed but wrong phrase spoken — access denied")
+    elif not transcript:
+        print("  ⚠  [PHRASE] No transcript — Whisper unavailable, skipping phrase check")
+    elif not expected_phrase:
+        print("  ⚠  [PHRASE] No phrase assigned to user — skipping phrase check")
+
     print(f"[voice] user={payload.username}  "
           f"confidence={confidence:.3f}  result={'PASS' if authenticated else 'FAIL'}")
 
@@ -610,7 +826,11 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
         except Exception as _e:
             print(f"  ⚠️ ECAPA profile update skipped: {_e}")
 
-    return {"authenticated": bool(authenticated), "confidence": float(confidence)}
+    return {
+        "authenticated": bool(authenticated),
+        "confidence":    float(confidence),
+        "phrase_error":  phrase_error,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -627,7 +847,7 @@ def get_phrase(email: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="User not found")
     if not user.phrase:
         raise HTTPException(status_code=404, detail="No phrase assigned to this user")
-    return {"phrase": user.phrase}
+    return {"phrase": decrypt(user.phrase)}
 
 @router.get("/security-question/{username}")
 def get_security_question(username: str, db: Session = Depends(get_db)):
@@ -637,7 +857,7 @@ def get_security_question(username: str, db: Session = Depends(get_db)):
     sq = db.query(SecurityQuestion).filter(SecurityQuestion.user_id == user.id).first()
     if not sq:
         raise HTTPException(status_code=404, detail="No security question found")
-    return {"question": sq.question}
+    return {"question": decrypt(sq.question)}
 
 
 @router.post("/security")
@@ -650,8 +870,10 @@ def verify_security(payload: SecurityAuth, db: Session = Depends(get_db)):
     if not sq:
         raise HTTPException(status_code=404, detail="No security question found")
 
-    answer_hash   = hashlib.sha256(payload.answer.strip().lower().encode()).hexdigest()
-    authenticated = answer_hash == sq.answer_hash
+    authenticated = bcrypt.checkpw(
+        payload.answer.strip().lower().encode(),
+        sq.answer_hash.encode('utf-8')
+    )
 
     print(f"[security] '{payload.username}' → {'PASS' if authenticated else 'FAIL'}")
 
@@ -674,4 +896,109 @@ def verify_security(payload: SecurityAuth, db: Session = Depends(get_db)):
     return {
         "authenticated": authenticated,
         "confidence":    1.0 if authenticated else 0.0
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MULTIMODAL FUSION  (server-side, authoritative)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FusionRequest(BaseModel):
+    username:          str
+    keystroke_score:   float   # intra-modal keystroke confidence [0, 1]
+    voice_score:       float   # intra-modal voice confidence [0, 1]
+    keystroke_passed:  bool    # whether keystroke individually exceeded its threshold
+    voice_passed:      bool    # whether voice individually exceeded its threshold
+
+
+@router.post("/fuse")
+def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
+    """
+    Authoritative multimodal fusion endpoint — adaptive threshold.
+
+    Only reached when keystroke score is in the uncertain range (0.55–0.79).
+    High-confidence keystroke (≥ 0.80) grants immediately without calling this.
+
+    Two cases handled:
+
+    Case A — keystroke_passed=True (scored ≥ per-user threshold but < 0.80):
+        The user is plausibly genuine but keystroke isn't certain enough alone.
+        Voice confirms. Fused threshold: 0.58 (lenient — we already passed KS).
+        Weights: 0.45 keystroke + 0.55 voice (voice carries more weight as
+        the confirming modality).
+
+    Case B — keystroke_passed=False (scored < per-user threshold):
+        Keystroke failed. Voice is the recovery path.
+        Fused threshold: 0.65 (stricter — need strong voice to compensate).
+        Weights: 0.35 keystroke + 0.65 voice (voice dominates since KS failed).
+
+    Both cases require voice >= 0.40 floor — ensures the system is genuinely
+    bimodal and a completely failed voice can't be rescued by keystroke alone.
+    """
+    ks    = float(np.clip(payload.keystroke_score, 0.0, 1.0))
+    voice = float(np.clip(payload.voice_score,     0.0, 1.0))
+
+    VOICE_FLOOR = 0.40
+
+    if payload.keystroke_passed:
+        # Case A: KS passed but uncertain — voice confirms
+        ks_w, voice_w      = 0.45, 0.55
+        FUSED_THRESHOLD    = 0.58
+        case_label         = "A (ks-passed, voice-confirms)"
+    else:
+        # Case B: KS failed — voice is recovery, stricter threshold
+        ks_w, voice_w      = 0.35, 0.65
+        FUSED_THRESHOLD    = 0.65
+        case_label         = "B (ks-failed, voice-recovery)"
+
+    fused          = ks_w * ks + voice_w * voice
+    voice_floor_ok = voice >= VOICE_FLOOR
+    granted        = (fused >= FUSED_THRESHOLD) and voice_floor_ok
+
+    reason = ""
+    if not granted:
+        if not voice_floor_ok:
+            reason = f"voice {voice:.2f} below floor {VOICE_FLOOR}"
+        else:
+            reason = f"fused {fused:.2f} below threshold {FUSED_THRESHOLD}"
+
+    print(
+        f"[fuse] '{payload.username}'  case={case_label}  "
+        f"ks={ks:.3f}  voice={voice:.3f}  "
+        f"fused={fused:.3f}  floor={'ok' if voice_floor_ok else 'FAIL'}  "
+        f"→ {'GRANT' if granted else f'DENY ({reason})'}"
+    )
+
+    user = db.query(User).filter(User.username == payload.username).first()
+    if user:
+        # Record maturity at the time of this attempt so the audit trail shows
+        # which progressive-enrollment regime this fusion grant belongs to.
+        fuse_maturity = _keystroke_maturity(db, user.id)
+        log_attempt(db, user.id, "fusion", fused,
+                    "granted" if granted else "denied",
+                    template_maturity=fuse_maturity)
+
+    # ── Save pending keystroke sample (Case B: voice recovery path) ───────────
+    # Case A samples (keystroke granted directly) were already saved in
+    # verify_keystroke.  Here we only handle Case B: keystroke failed but
+    # voice recovery succeeded and fusion granted access.
+    if granted:
+        ks_payload = _pending_ks_samples.pop(payload.username, None)
+        if ks_payload and user:
+            _save_keystroke_sample(db, user, ks_payload, source="login_fusion")
+    else:
+        # Login denied — discard the cached sample, do not save
+        discarded = _pending_ks_samples.pop(payload.username, None)
+        if discarded:
+            print(f"  🗑️ Cached keystroke sample discarded (login denied)")
+
+    return {
+        "granted":         granted,
+        "fused_score":     float(fused),
+        "keystroke_score": ks,
+        "voice_score":     voice,
+        "voice_floor_ok":  voice_floor_ok,
+        "threshold":       FUSED_THRESHOLD,
+        "case":            case_label,
+        "reason":          reason,
     }

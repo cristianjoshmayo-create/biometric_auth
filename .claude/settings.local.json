@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python ml/keystroke_profile_matcher.py)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)"
+    ]
+  }
+}

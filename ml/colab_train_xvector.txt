@@ -1,0 +1,673 @@
+================================================================
+TDNN X-VECTOR SPEAKER VERIFICATION - GOOGLE COLAB TRAINING
+Biometric Authentication System - Voice Module
+================================================================
+
+INSTRUCTIONS:
+1. Open Google Colab (colab.research.google.com)
+2. Go to Runtime > Change runtime type > GPU (T4)
+3. Create a new notebook
+4. Copy each CELL block below into separate code/text cells
+5. Run cells one by one in order
+
+================================================================
+CELL 1 - MARKDOWN (Text cell)
+================================================================
+
+# TDNN X-Vector Speaker Verification Training
+**Biometric Authentication System — Voice Module**
+
+Architecture: 5-layer TDNN + Statistics Pooling (Snyder et al. 2018)
+Dataset: LibriSpeech train-clean-100 (251 speakers)
+Output: 512-dim speaker embedding for cosine similarity verification
+
+Steps: GPU check → Install → Drive → Dataset → Features → Train → Eval → Export
+
+> Before running: Runtime → Change runtime type → GPU (T4)
+
+================================================================
+CELL 2 - CODE: Check GPU
+================================================================
+
+import subprocess
+result = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
+print(result.stdout if result.returncode == 0 else '❌ No GPU! Go to Runtime > Change runtime type > GPU')
+
+import torch
+print(f'PyTorch  : {torch.__version__}')
+print(f'CUDA     : {torch.cuda.is_available()}')
+if torch.cuda.is_available():
+    print(f'GPU      : {torch.cuda.get_device_name(0)}')
+    print(f'VRAM     : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f'Using    : {DEVICE}')
+
+================================================================
+CELL 3 - CODE: Install Dependencies
+================================================================
+
+%pip install -q torchaudio matplotlib scikit-learn
+print('Done')
+
+================================================================
+CELL 4 - CODE: Mount Google Drive
+================================================================
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+
+DRIVE_DIR   = '/content/drive/MyDrive/biometric_auth_voice'
+DATA_DIR    = os.path.join(DRIVE_DIR, 'librispeech')
+MODEL_DIR   = os.path.join(DRIVE_DIR, 'models')
+
+os.makedirs(DATA_DIR,  exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+print(f'Data   -> {DATA_DIR}')
+print(f'Models -> {MODEL_DIR}')
+
+================================================================
+CELL 5 - CODE: Download LibriSpeech
+(~6 GB, takes 10-15 minutes, saved to Drive so you never re-download)
+================================================================
+
+import torchaudio
+
+print('Downloading LibriSpeech train-clean-100 (~6 GB)...')
+print('This saves to your Google Drive - only downloads once.')
+
+train_dataset_raw = torchaudio.datasets.LIBRISPEECH(
+    root=DATA_DIR,
+    url='train-clean-100',
+    download=True
+)
+
+waveform, sample_rate, transcript, speaker_id, chapter_id, utterance_id = train_dataset_raw[0]
+print(f'Total utterances : {len(train_dataset_raw)}')
+print(f'Sample rate      : {sample_rate} Hz')
+print(f'Sample shape     : {waveform.shape}')
+print(f'Speaker ID       : {speaker_id}')
+print('Done')
+
+================================================================
+CELL 6 - CODE: Build Speaker Map
+================================================================
+
+from collections import Counter
+import pickle
+
+speaker_utterances = Counter()
+for i in range(len(train_dataset_raw)):
+    _, _, _, speaker_id, _, _ = train_dataset_raw[i]
+    speaker_utterances[speaker_id] += 1
+
+all_speakers     = sorted(speaker_utterances.keys())
+speaker_to_label = {spk: idx for idx, spk in enumerate(all_speakers)}
+N_SPEAKERS       = len(all_speakers)
+
+print(f'Unique speakers  : {N_SPEAKERS}')
+print(f'Total utterances : {sum(speaker_utterances.values())}')
+print(f'Avg utt/speaker  : {sum(speaker_utterances.values()) / N_SPEAKERS:.0f}')
+
+speaker_map_path = os.path.join(MODEL_DIR, 'speaker_to_label.pkl')
+with open(speaker_map_path, 'wb') as f:
+    pickle.dump({
+        'speaker_to_label': speaker_to_label,
+        'label_to_speaker': {v: k for k, v in speaker_to_label.items()},
+        'n_speakers': N_SPEAKERS
+    }, f)
+print(f'Speaker map saved -> {speaker_map_path}')
+
+================================================================
+CELL 7 - CODE: Feature Extraction (40-dim MFCC)
+================================================================
+
+import torch
+import torchaudio.transforms as T
+from torch.utils.data import Dataset, DataLoader
+
+N_MFCC      = 40
+SAMPLE_RATE = 16000
+T_MAX       = 300    # 300 frames = ~3 seconds
+HOP_MS      = 10
+
+mfcc_transform = T.MFCC(
+    sample_rate=SAMPLE_RATE,
+    n_mfcc=N_MFCC,
+    melkwargs={
+        'n_fft':      512,
+        'hop_length': int(SAMPLE_RATE * HOP_MS / 1000),
+        'n_mels':     80,
+        'f_min':      20,
+        'f_max':      8000,
+    }
+)
+
+resampler_cache = {}
+
+def extract_mfcc(waveform, sample_rate):
+    # Resample to 16kHz
+    if sample_rate != SAMPLE_RATE:
+        if sample_rate not in resampler_cache:
+            resampler_cache[sample_rate] = T.Resample(sample_rate, SAMPLE_RATE)
+        waveform = resampler_cache[sample_rate](waveform)
+
+    # Stereo to mono
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+
+    # Normalize amplitude
+    max_amp = waveform.abs().max()
+    if max_amp > 1e-6:
+        waveform = waveform / max_amp
+
+    # Extract MFCC
+    mfcc = mfcc_transform(waveform).squeeze(0)  # (40, T)
+
+    # Per-coefficient normalization
+    mean = mfcc.mean(dim=1, keepdim=True)
+    std  = mfcc.std(dim=1,  keepdim=True) + 1e-8
+    mfcc = (mfcc - mean) / std
+
+    # Pad or random crop to T_MAX
+    T = mfcc.shape[1]
+    if T < T_MAX:
+        mfcc = torch.nn.functional.pad(mfcc, (0, T_MAX - T))
+    else:
+        start = torch.randint(0, T - T_MAX + 1, (1,)).item()
+        mfcc  = mfcc[:, start:start + T_MAX]
+
+    return mfcc  # (40, 300)
+
+# Test
+waveform, sr, *_ = train_dataset_raw[0]
+feat = extract_mfcc(waveform, sr)
+print(f'Feature shape: {feat.shape}  (expected [40, 300])')
+print('Feature extraction OK')
+
+================================================================
+CELL 8 - CODE: Dataset Class
+================================================================
+
+import torch
+from torch.utils.data import random_split
+
+class LibriSpeechMFCC(Dataset):
+    def __init__(self, dataset, speaker_to_label, augment=True):
+        self.dataset          = dataset
+        self.speaker_to_label = speaker_to_label
+        self.augment          = augment
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        waveform, sr, _, speaker_id, _, _ = self.dataset[idx]
+        label = self.speaker_to_label[speaker_id]
+        mfcc  = extract_mfcc(waveform, sr)
+        if self.augment:
+            mfcc = self._augment(mfcc)
+        return mfcc, label
+
+    def _augment(self, mfcc):
+        mfcc = mfcc.clone()
+        # Time masking
+        if torch.rand(1) < 0.5:
+            t = torch.randint(0, 30, (1,)).item()
+            s = torch.randint(0, T_MAX - t, (1,)).item()
+            mfcc[:, s:s + t] = 0.0
+        # Frequency masking
+        if torch.rand(1) < 0.5:
+            f = torch.randint(0, 8, (1,)).item()
+            s = torch.randint(0, N_MFCC - f, (1,)).item()
+            mfcc[s:s + f, :] = 0.0
+        # Gaussian noise
+        if torch.rand(1) < 0.3:
+            mfcc = mfcc + torch.randn_like(mfcc) * 0.05
+        return mfcc
+
+full_ds = LibriSpeechMFCC(train_dataset_raw, speaker_to_label, augment=True)
+n_val   = int(len(full_ds) * 0.1)
+n_train = len(full_ds) - n_val
+
+train_ds, val_ds = random_split(full_ds, [n_train, n_val],
+                                generator=torch.Generator().manual_seed(42))
+val_ds.dataset.augment = False
+
+print(f'Train : {len(train_ds):,} utterances')
+print(f'Val   : {len(val_ds):,} utterances')
+print(f'Speakers: {N_SPEAKERS}')
+
+================================================================
+CELL 9 - CODE: TDNN X-Vector Model Architecture
+================================================================
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TDNNLayer(nn.Module):
+    """
+    Single TDNN layer = dilated Conv1d + BatchNorm + ReLU.
+    Dilation sets the temporal context window.
+    """
+    def __init__(self, in_channels, out_channels, context_size, dilation=1):
+        super().__init__()
+        padding    = (context_size - 1) * dilation // 2
+        self.conv  = nn.Conv1d(in_channels, out_channels,
+                               kernel_size=context_size,
+                               dilation=dilation, padding=padding)
+        self.bn    = nn.BatchNorm1d(out_channels)
+
+    def forward(self, x):
+        return F.relu(self.bn(self.conv(x)))
+
+
+class StatisticsPooling(nn.Module):
+    """
+    Collapses time dimension by computing [mean; std].
+    Makes the model handle any utterance length.
+    Input : (batch, C, T)
+    Output: (batch, 2C)
+    """
+    def forward(self, x):
+        mean = x.mean(dim=2)
+        std  = x.std(dim=2) + 1e-9
+        return torch.cat([mean, std], dim=1)
+
+
+class XVectorTDNN(nn.Module):
+    """
+    TDNN X-Vector — Snyder et al. 2018 (INTERSPEECH).
+
+    Training : outputs logits over N speakers (CrossEntropy).
+    Inference: use get_embedding() to get 512-dim L2-normalized x-vector.
+    """
+    def __init__(self, n_mfcc=40, n_speakers=251, embed_dim=512, dropout=0.2):
+        super().__init__()
+
+        # Frame-level layers (dilated convolutions with temporal context)
+        self.tdnn1 = TDNNLayer(n_mfcc, 512, context_size=5, dilation=1)  # context [-2..+2]
+        self.tdnn2 = TDNNLayer(512,    512, context_size=3, dilation=2)  # context [-2, 0, +2]
+        self.tdnn3 = TDNNLayer(512,    512, context_size=3, dilation=3)  # context [-3, 0, +3]
+        self.tdnn4 = TDNNLayer(512,    512, context_size=1, dilation=1)  # context {0}
+        self.tdnn5 = TDNNLayer(512,   1500, context_size=1, dilation=1)  # context {0}
+
+        # Statistics pooling: 1500 -> 3000 (mean + std)
+        self.stats_pool = StatisticsPooling()
+
+        # Segment-level FC layers
+        self.fc6 = nn.Linear(3000, embed_dim)   # <-- X-VECTOR extracted here
+        self.bn6 = nn.BatchNorm1d(embed_dim)
+
+        self.fc7 = nn.Linear(embed_dim, embed_dim)
+        self.bn7 = nn.BatchNorm1d(embed_dim)
+
+        self.dropout    = nn.Dropout(dropout)
+        self.classifier = nn.Linear(embed_dim, n_speakers)
+
+        # Weight initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def get_embedding(self, x):
+        """
+        Extract 512-dim L2-normalized x-vector.
+        Use this at inference for enrollment and verification.
+        x: (batch, 40, T)
+        returns: (batch, 512)
+        """
+        x = self.tdnn1(x)
+        x = self.tdnn2(x)
+        x = self.tdnn3(x)
+        x = self.tdnn4(x)
+        x = self.tdnn5(x)
+        x = self.stats_pool(x)
+        x = F.relu(self.bn6(self.fc6(x)))
+        return F.normalize(x, p=2, dim=1)   # L2 normalize
+
+    def forward(self, x):
+        x = self.tdnn1(x)
+        x = self.tdnn2(x)
+        x = self.tdnn3(x)
+        x = self.tdnn4(x)
+        x = self.tdnn5(x)
+        x = self.stats_pool(x)
+        x = F.relu(self.bn6(self.fc6(x)))
+        x = self.dropout(x)
+        x = F.relu(self.bn7(self.fc7(x)))
+        x = self.dropout(x)
+        return self.classifier(x)
+
+
+# Test
+model  = XVectorTDNN(n_mfcc=N_MFCC, n_speakers=N_SPEAKERS, embed_dim=512).to(DEVICE)
+dummy  = torch.randn(4, N_MFCC, T_MAX).to(DEVICE)
+logits = model(dummy)
+emb    = model.get_embedding(dummy)
+params = sum(p.numel() for p in model.parameters())
+
+print(f'Logits shape   : {logits.shape}')
+print(f'Embedding shape: {emb.shape}')
+print(f'Parameters     : {params:,}  (~{params/1e6:.1f}M)')
+print(f'Embedding norm : {emb.norm(dim=1).mean().item():.4f}  (should be ~1.0)')
+print('Model OK')
+
+================================================================
+CELL 10 - CODE: Training Setup
+================================================================
+
+import torch.optim as optim
+
+BATCH_SIZE    = 64
+NUM_EPOCHS    = 20     # ~1.5 hours on T4. Increase to 30 for better accuracy.
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY  = 1e-4
+NUM_WORKERS   = 2
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                          num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
+                          num_workers=NUM_WORKERS, pin_memory=True)
+
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+
+print(f'Batch size     : {BATCH_SIZE}')
+print(f'Epochs         : {NUM_EPOCHS}')
+print(f'Train batches  : {len(train_loader)}')
+print(f'Val batches    : {len(val_loader)}')
+print(f'Est. time      : ~{len(train_loader) * NUM_EPOCHS * 0.15 / 60:.0f} min on T4')
+
+================================================================
+CELL 11 - CODE: Train + Validate Functions
+================================================================
+
+import time
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss, total_correct, total_samples = 0.0, 0, 0
+
+    for batch_idx, (mfcc, labels) in enumerate(loader):
+        mfcc   = mfcc.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+        logits = model(mfcc)
+        loss   = criterion(logits, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+
+        preds          = logits.argmax(dim=1)
+        total_correct += (preds == labels).sum().item()
+        total_loss    += loss.item() * mfcc.size(0)
+        total_samples += mfcc.size(0)
+
+        if (batch_idx + 1) % 100 == 0:
+            print(f'  Batch {batch_idx+1}/{len(loader)}  '
+                  f'loss={loss.item():.4f}  '
+                  f'acc={total_correct/total_samples*100:.1f}%', end='\r')
+
+    return total_loss / total_samples, total_correct / total_samples * 100
+
+
+@torch.no_grad()
+def validate(model, loader, criterion, device):
+    model.eval()
+    total_loss, total_correct, total_samples = 0.0, 0, 0
+
+    for mfcc, labels in loader:
+        mfcc   = mfcc.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        logits = model(mfcc)
+        loss   = criterion(logits, labels)
+        preds          = logits.argmax(dim=1)
+        total_correct += (preds == labels).sum().item()
+        total_loss    += loss.item() * mfcc.size(0)
+        total_samples += mfcc.size(0)
+
+    return total_loss / total_samples, total_correct / total_samples * 100
+
+print('Functions defined')
+
+================================================================
+CELL 12 - CODE: Run Training
+(Saves best model to Drive after each improvement)
+================================================================
+
+import json
+
+history         = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+best_val_acc    = 0.0
+best_model_path = os.path.join(MODEL_DIR, 'xvector_tdnn_best.pt')
+
+print(f'Training TDNN X-Vector  |  {NUM_EPOCHS} epochs  |  {DEVICE}')
+print('=' * 65)
+
+for epoch in range(1, NUM_EPOCHS + 1):
+    t0 = time.time()
+
+    train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, DEVICE)
+    val_loss,   val_acc   = validate(model, val_loader, criterion, DEVICE)
+    scheduler.step()
+
+    elapsed = time.time() - t0
+    lr_now  = scheduler.get_last_lr()[0]
+
+    history['train_loss'].append(train_loss)
+    history['train_acc'].append(train_acc)
+    history['val_loss'].append(val_loss)
+    history['val_acc'].append(val_acc)
+
+    star = 'NEW BEST' if val_acc > best_val_acc else ''
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save({
+            'epoch':       epoch,
+            'model_state': model.state_dict(),
+            'val_acc':     val_acc,
+            'n_mfcc':      N_MFCC,
+            'n_speakers':  N_SPEAKERS,
+            'embed_dim':   512,
+        }, best_model_path)
+
+    print(f'Epoch {epoch:02d}/{NUM_EPOCHS}  '
+          f'train_loss={train_loss:.4f}  train_acc={train_acc:.1f}%  '
+          f'val_loss={val_loss:.4f}  val_acc={val_acc:.1f}%  '
+          f'lr={lr_now:.2e}  {elapsed:.0f}s  {star}')
+
+with open(os.path.join(MODEL_DIR, 'training_history.json'), 'w') as f:
+    json.dump(history, f)
+
+print('=' * 65)
+print(f'Training complete')
+print(f'Best val accuracy : {best_val_acc:.2f}%')
+print(f'Model saved       : {best_model_path}')
+
+================================================================
+CELL 13 - CODE: Plot Training Curves
+================================================================
+
+import matplotlib.pyplot as plt
+
+epochs_range = range(1, len(history['train_acc']) + 1)
+fig, axes    = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle('TDNN X-Vector Training Results', fontsize=13, fontweight='bold')
+
+axes[0].plot(epochs_range, history['train_acc'], 'b-o', label='Train', markersize=4)
+axes[0].plot(epochs_range, history['val_acc'],   'r-o', label='Val',   markersize=4)
+axes[0].set_title('Accuracy')
+axes[0].set_xlabel('Epoch')
+axes[0].set_ylabel('Accuracy (%)')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+axes[1].plot(epochs_range, history['train_loss'], 'b-o', label='Train', markersize=4)
+axes[1].plot(epochs_range, history['val_loss'],   'r-o', label='Val',   markersize=4)
+axes[1].set_title('Loss')
+axes[1].set_xlabel('Epoch')
+axes[1].set_ylabel('Cross-Entropy Loss')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(os.path.join(MODEL_DIR, 'training_curves.png'), dpi=120)
+plt.show()
+
+================================================================
+CELL 14 - CODE: Evaluate EER (Equal Error Rate)
+================================================================
+
+from sklearn.metrics import roc_curve
+import numpy as np
+from collections import defaultdict
+
+checkpoint = torch.load(best_model_path, map_location=DEVICE)
+model.load_state_dict(checkpoint['model_state'])
+model.eval()
+print(f'Loaded best model from epoch {checkpoint["epoch"]}  val_acc={checkpoint["val_acc"]:.2f}%')
+
+
+@torch.no_grad()
+def compute_eer(model, dataset, n_trials=2000, device='cuda'):
+    model.eval()
+
+    # Group by speaker
+    speaker_indices = defaultdict(list)
+    for idx in range(len(dataset)):
+        _, label = dataset[idx]
+        speaker_indices[label].append(idx)
+
+    valid_speakers = [s for s, idxs in speaker_indices.items() if len(idxs) >= 2]
+    print(f'Speakers with >=2 utterances: {len(valid_speakers)}')
+
+    scores, labels = [], []
+    n_half = n_trials // 2
+
+    # Genuine pairs (same speaker)
+    for _ in range(n_half):
+        spk  = valid_speakers[torch.randint(len(valid_speakers), (1,)).item()]
+        idxs = speaker_indices[spk]
+        i, j = torch.randperm(len(idxs))[:2].tolist()
+        m1, _ = dataset[idxs[i]]
+        m2, _ = dataset[idxs[j]]
+        e1 = model.get_embedding(m1.unsqueeze(0).to(device))
+        e2 = model.get_embedding(m2.unsqueeze(0).to(device))
+        scores.append(F.cosine_similarity(e1, e2).item())
+        labels.append(1)
+
+    # Impostor pairs (different speakers)
+    for _ in range(n_half):
+        two  = torch.randperm(len(valid_speakers))[:2].tolist()
+        s1   = valid_speakers[two[0]]
+        s2   = valid_speakers[two[1]]
+        idx1 = speaker_indices[s1][torch.randint(len(speaker_indices[s1]), (1,)).item()]
+        idx2 = speaker_indices[s2][torch.randint(len(speaker_indices[s2]), (1,)).item()]
+        m1, _ = dataset[idx1]
+        m2, _ = dataset[idx2]
+        e1 = model.get_embedding(m1.unsqueeze(0).to(device))
+        e2 = model.get_embedding(m2.unsqueeze(0).to(device))
+        scores.append(F.cosine_similarity(e1, e2).item())
+        labels.append(0)
+
+    scores = np.array(scores)
+    labels = np.array(labels)
+
+    fpr, tpr, thresholds = roc_curve(labels, scores)
+    fnr     = 1 - tpr
+    idx     = np.nanargmin(np.abs(fpr - fnr))
+    eer     = (fpr[idx] + fnr[idx]) / 2 * 100
+    thresh  = thresholds[idx]
+
+    return eer, thresh, fpr, tpr
+
+
+print('Computing EER on 2000 trials...')
+eer, threshold, fpr, tpr = compute_eer(model, val_ds, n_trials=2000, device=DEVICE)
+
+print(f'\n===== RESULTS =====')
+print(f'EER               : {eer:.2f}%')
+print(f'Optimal threshold : {threshold:.4f}')
+print(f'Best val accuracy : {best_val_acc:.2f}%')
+
+results = {'eer_percent': float(eer), 'optimal_threshold': float(threshold),
+           'best_val_acc': float(best_val_acc)}
+with open(os.path.join(MODEL_DIR, 'eval_results.json'), 'w') as f:
+    json.dump(results, f, indent=2)
+print(f'Results saved -> {MODEL_DIR}/eval_results.json')
+
+================================================================
+CELL 15 - CODE: Export Model
+================================================================
+
+checkpoint = torch.load(best_model_path, map_location='cpu')
+model.load_state_dict(checkpoint['model_state'])
+model.eval()
+
+with open(speaker_map_path, 'rb') as f:
+    speaker_map = pickle.load(f)
+
+export_path = os.path.join(MODEL_DIR, 'xvector_tdnn_export.pt')
+torch.save({
+    'model_state': model.state_dict(),
+    'architecture': {
+        'n_mfcc':     N_MFCC,
+        'n_speakers': N_SPEAKERS,
+        'embed_dim':  512,
+        'dropout':    0.2,
+    },
+    'feature_config': {
+        'n_mfcc':      N_MFCC,
+        'sample_rate': SAMPLE_RATE,
+        't_max':       T_MAX,
+        'hop_ms':      HOP_MS,
+        'n_fft':       512,
+        'n_mels':      80,
+    },
+    'eval': {
+        'eer_percent':       float(eer),
+        'optimal_threshold': float(threshold),
+        'best_val_accuracy': float(best_val_acc),
+        'training_epochs':   NUM_EPOCHS,
+        'dataset':           'LibriSpeech train-clean-100',
+        'n_speakers':        N_SPEAKERS,
+    },
+    'speaker_to_label': speaker_map['speaker_to_label'],
+}, export_path)
+
+size_mb = os.path.getsize(export_path) / 1e6
+print(f'Model exported')
+print(f'  Path      : {export_path}')
+print(f'  File size : {size_mb:.1f} MB')
+print(f'  EER       : {eer:.2f}%')
+print(f'  Threshold : {threshold:.4f}')
+print()
+print('NEXT STEP: Download this file and place it in:')
+print('  biometric_auth/ml/models/xvector_tdnn_export.pt')
+
+================================================================
+CELL 16 - CODE: Download Files to Your Computer
+================================================================
+
+from google.colab import files
+
+files.download(export_path)
+files.download(os.path.join(MODEL_DIR, 'training_curves.png'))
+files.download(os.path.join(MODEL_DIR, 'eval_results.json'))
+print('Check your browser downloads folder')
+
+================================================================
+DONE - After downloading:
+1. Copy xvector_tdnn_export.pt -> biometric_auth/ml/models/
+2. Tell me and I will write voice_xvector.py to plug it
+   into the biometric auth system replacing ECAPA-TDNN
+================================================================

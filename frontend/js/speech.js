@@ -109,8 +109,10 @@ const SpeechCapture = {
 
     _autoGain(samples) {
         const rms = Math.sqrt(samples.reduce((s, x) => s + x * x, 0) / samples.length);
-        if (rms < 0.001 || rms >= 0.08) return samples;
-        const gain = Math.min(0.08 / rms, 10.0);
+        // Target RMS 0.08 — enough for backend SNR check (≥0.005) with headroom.
+        // Skip if already loud enough or if signal is essentially silent (mic error).
+        if (rms < 0.0005 || rms >= 0.15) return samples;
+        const gain = Math.min(0.08 / rms, 8.0);
         console.log(`[SpeechCapture] Auto-gain x${gain.toFixed(2)}`);
         const out = new Float32Array(samples.length);
         for (let i = 0; i < samples.length; i++) out[i] = Math.max(-1, Math.min(1, samples[i] * gain));
@@ -188,7 +190,14 @@ const SpeechCapture = {
             this._silenceMs = 0;
 
             this.stream = await navigator.mediaDevices.getUserMedia({
-                audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+                audio: {
+                    channelCount:      1,
+                    echoCancellation:  true,   // remove mic echo from room reflections
+                    noiseSuppression:  true,   // browser-level denoising (free, hardware-accelerated)
+                    autoGainControl:   true,   // normalize mic volume across devices
+                    sampleRate:        { ideal: 16000 },
+                    sampleSize:        16,
+                }
             });
 
             this.audioCtx  = new (window.AudioContext || window.webkitAudioContext)();
@@ -341,6 +350,7 @@ const SpeechCapture = {
                 voiced_fraction:        result.voiced_fraction        || 0,
                 snr_db:                 result.snr_db                 || 0,
                 ecapa_embedding:        result.ecapa_embedding        || [],
+                transcript:             result.transcript             || "",
                 raw_audio_b64:          base64Audio,
             };
 

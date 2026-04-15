@@ -3,6 +3,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from typing import List, Optional
 from sqlalchemy import func
@@ -18,6 +19,7 @@ import random
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion
 from schemas import VoiceFeatures
+from utils.crypto import encrypt
 import threading
 import sys
 
@@ -243,6 +245,15 @@ class KeystrokeEnroll(BaseModel):
     r2r_mean_norm:    float = 0
     shift_lag_norm:   float = 0
     extra_digraphs:   Optional[dict] = {}
+    key_dwell_map:    Optional[dict] = {}
+
+    # 4-variant digraph timings + trigraphs (frontend keystroke.js v3.1+)
+    digraph_dd_map:     Optional[dict] = {}
+    digraph_du_map:     Optional[dict] = {}
+    digraph_ud_map:     Optional[dict] = {}
+    digraph_uu_map:     Optional[dict] = {}
+    flight_per_digraph: Optional[dict] = {}
+    trigraph_map:       Optional[dict] = {}
 
 
 class VoiceEnroll(VoiceFeatures):
@@ -290,11 +301,21 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
         bcrypt.gensalt()
     ).decode('utf-8')
 
-    new_user = User(username=email, password_hash=hashed, phrase=_generate_phrase(db))
+    plain_phrase     = _generate_phrase(db)
+    encrypted_phrase = encrypt(plain_phrase)
+
+    new_user = User(username=email, password_hash=hashed, phrase=encrypted_phrase)
     db.add(new_user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="An account with this email already exists. Please log in instead.")
     db.refresh(new_user)
-    return {"success": True, "message": "User created", "user_id": new_user.id, "phrase": new_user.phrase}
+
+    # Return plaintext phrase to the frontend (shown to user during enrollment).
+    # Only the encrypted version is stored in the database.
+    return {"success": True, "message": "User created", "user_id": new_user.id, "phrase": plain_phrase}
 
 
 @router.post("/keystroke")
@@ -403,6 +424,13 @@ def enroll_keystroke(payload: KeystrokeEnroll, db: Session = Depends(get_db)):
         r2r_mean_norm           = payload.r2r_mean_norm,
         shift_lag_norm          = payload.shift_lag_norm,
         extra_digraphs          = payload.extra_digraphs or {},
+        key_dwell_map           = payload.key_dwell_map or {},
+        digraph_dd_map          = payload.digraph_dd_map or {},
+        digraph_du_map          = payload.digraph_du_map or {},
+        digraph_ud_map          = payload.digraph_ud_map or {},
+        digraph_uu_map          = payload.digraph_uu_map or {},
+        flight_per_digraph      = payload.flight_per_digraph or {},
+        trigraph_map            = payload.trigraph_map or {},
     )
     db.add(template)
     db.commit()
@@ -537,10 +565,7 @@ def enroll_voice(payload: VoiceEnroll, db: Session = Depends(get_db)):
         except Exception as _ecapa_err:
             print(f"  ⚠  ECAPA profile save failed: {_ecapa_err}")
     else:
-        print(f"  ⚠  ECAPA: no valid embedding in payload (len={len(ecapa_emb)}) — profile not updated")
-        print(f"  ⚠  Root cause: SpeechBrain/ECAPA failed during /extract-mfcc for '{payload.username}'.")
-        print(f"  ⚠  Check the server logs from the /extract-mfcc call above for the real error.")
-        print(f"  ⚠  This user will FAIL voice auth. They must re-enroll after fixing ECAPA.")
+        print(f"  ⚠  ECAPA: no valid embedding in payload (len={len(ecapa_emb)}) — voice model not updated")
 
 
     return {
@@ -560,9 +585,12 @@ def enroll_security(payload: SecurityEnroll, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    answer_hash = hashlib.sha256(
-        payload.answer.strip().lower().encode()
-    ).hexdigest()
+    # bcrypt the answer — salted and slow, resistant to brute-force and
+    # rainbow table attacks. Replaces the old unsalted SHA-256 approach.
+    answer_hash = bcrypt.hashpw(
+        payload.answer.strip().lower().encode(),
+        bcrypt.gensalt()
+    ).decode('utf-8')
 
     existing = db.query(SecurityQuestion).filter(
         SecurityQuestion.user_id == user.id
@@ -573,7 +601,7 @@ def enroll_security(payload: SecurityEnroll, db: Session = Depends(get_db)):
 
     sq = SecurityQuestion(
         user_id     = user.id,
-        question    = payload.question,
+        question    = encrypt(payload.question),   # encrypted — reveals personal info if exposed
         answer_hash = answer_hash,
     )
     db.add(sq)
@@ -739,45 +767,51 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
                 "snr_db": snr_db,
             }
 
-        # ── Noise reduction (noisereduce — non-stationary Wiener filter) ──────
-        # noisereduce is far more effective than the old spectral subtraction
-        # for real-world noise: fans, AC, ambient chatter, keyboard noise.
-        # stationary=False handles non-stationary noise sources.
-        # prop_decrease=0.75 — partial suppression to avoid over-cleaning
-        # (over-cleaning introduces musical noise artefacts that distort MFCCs).
-        # Applied whenever SNR < 30dB — covers almost every laptop mic scenario.
+        # ── Noise reduction ────────────────────────────────────────────────
+        # Strategy: use the quietest 10% of frames as the noise reference,
+        # NOT the first 300ms (which may contain speech if the user starts
+        # immediately). This prevents accidentally subtracting speech as noise.
         if snr_db < 30.0:
             try:
                 import noisereduce as nr
                 print(f"  Applying noisereduce (SNR={snr_db:.1f}dB)")
-                noise_sample = audio[:int(sr * 0.3)]
+                # Build noise reference from the quietest portion of the signal.
+                # Split into 50ms chunks and pick the quietest 20%.
+                chunk_len    = int(sr * 0.05)
+                chunks       = [audio[i:i+chunk_len] for i in range(0, len(audio)-chunk_len, chunk_len)]
+                chunk_rms    = [float(np.sqrt(np.mean(c**2))) for c in chunks]
+                n_noise      = max(1, int(len(chunks) * 0.20))
+                quiet_idxs   = np.argsort(chunk_rms)[:n_noise]
+                noise_sample = np.concatenate([chunks[i] for i in sorted(quiet_idxs)])
                 audio_clean = nr.reduce_noise(
                     y=audio,
                     y_noise=noise_sample,
                     sr=sr,
                     stationary=True,
-                    prop_decrease=0.90,
+                    prop_decrease=0.75,   # partial suppression — avoid over-cleaning artefacts
                 ).astype(np.float32)
+                print(f"  Noise reference: {len(noise_sample)/sr:.2f}s from {n_noise} quiet chunks")
             except (ImportError, OSError) as _nr_err:
-                # OSError catches WinError 1114 — torch DLL failed to load.
-                # Fall back to built-in spectral subtraction so enrollment still works.
                 print(f"  noisereduce unavailable ({type(_nr_err).__name__}) — falling back to spectral subtraction")
                 audio_clean = _spectral_subtraction(audio, sr)
         else:
             audio_clean = audio
             print(f"  Skipping noise reduction (SNR={snr_db:.1f}dB ≥ 30dB)")
 
-        # ── WebRTC VAD ─────────────────────────────────────────────────────
+        # ── WebRTC VAD — run on the CLEANED audio, not the original ──────
+        # FIX: previously read wav_data from disk (the pre-cleaned file).
+        # Now we convert audio_clean back to PCM bytes so VAD sees the same
+        # signal that will be used for MFCC extraction.
         import webrtcvad
-        # Mode 1 (was 3) — less aggressive, works better on compressed
-        # audio (webm/opus from browser) and laptop mic recordings
-        vad = webrtcvad.Vad(1)
+        import struct
+        vad = webrtcvad.Vad(1)   # mode 1: less aggressive, works on laptop mics
 
-        with open(wav_path, 'rb') as f:
-            wav_data = f.read()
+        # Convert float32 cleaned audio → int16 PCM bytes for VAD
+        audio_int16   = np.clip(audio_clean, -1.0, 1.0)
+        audio_int16   = (audio_int16 * 32767).astype(np.int16)
+        audio_pcm     = audio_int16.tobytes()
 
-        audio_pcm  = wav_data[44:]
-        frame_size = int(sr * 30 / 1000) * 2   # 30ms frames, 16-bit PCM
+        frame_size    = int(sr * 30 / 1000) * 2   # 30ms frames, 16-bit PCM = 2 bytes/sample
         voiced = total = 0
         voiced_frame_indices = []
 
@@ -794,16 +828,13 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         speech_duration = (voiced * 30) / 1000
         voiced_fraction = voice_ratio
 
-        print(f"VAD: {voice_ratio:.0%} voiced  ({speech_duration:.1f}s speech)")
+        print(f"VAD (on cleaned audio): {voice_ratio:.0%} voiced  ({speech_duration:.1f}s speech)")
 
-        # 45% threshold — balances music rejection vs legitimate speech acceptance.
-        # Browser WebM/Opus compression and laptop mics cause some voiced frames
-        # to be misclassified as unvoiced. Real speech hits 45–80%, music rarely does.
-        if voice_ratio < 0.45:
+        if voice_ratio < 0.40:
             return {
                 "success": False,
                 "detail":  (
-                    f"Not enough speech detected ({voice_ratio:.0%} voiced, need ≥45%). "
+                    f"Not enough speech detected ({voice_ratio:.0%} voiced, need ≥40%). "
                     f"Speak your assigned phrase clearly and directly into the microphone."
                 ),
                 "snr_db": snr_db,
@@ -814,17 +845,14 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
                 "detail":  f"Recording too short ({speech_duration:.1f}s of speech). Speak the full phrase.",
             }
 
-        # ── Spectral flatness check — rejects music and noise ─────────────
-        # Speech has a strongly peaked spectrum (low flatness).
-        # Music and broadband noise are spectrally flat (high flatness).
-        # librosa.feature.spectral_flatness returns values 0–1:
-        #   speech:  typically 0.001–0.05 (very peaked)
-        #   music:   typically 0.05–0.30  (flatter)
-        #   noise:   typically 0.20–0.80  (very flat)
+        # ── Spectral flatness check ────────────────────────────────────────
+        # Speech: 0.001–0.06 | music/noise: 0.06–0.80
+        # Raised from 0.08 → 0.12 — some voices with more breathiness or
+        # light reverb from laptop mics legitimately score 0.08–0.11.
         flatness      = librosa.feature.spectral_flatness(y=audio_clean)
         mean_flatness = float(np.mean(flatness))
-        print(f"Spectral flatness: {mean_flatness:.4f} (speech should be <0.08)")
-        if mean_flatness > 0.08:
+        print(f"Spectral flatness: {mean_flatness:.4f} (speech <0.12)")
+        if mean_flatness > 0.12:
             return {
                 "success": False,
                 "detail":  (
@@ -987,8 +1015,26 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
             print(f"  ⚠  ECAPA extraction FAILED: {type(_ecapa_err).__name__}: {_ecapa_err}")
             _tb.print_exc()
 
+        # ── Whisper phrase transcription ──────────────────────────────────
+        # Runs on the cleaned 16kHz WAV file already on disk.
+        # Uses the tiny model (~39 MB) — fast enough for a 4-word passphrase.
+        # If Whisper is not installed, transcript is empty and phrase check
+        # is skipped at auth time (graceful degradation).
+        transcript = ""
+        try:
+            import whisper as _whisper
+            _wmodel = _whisper.load_model("tiny")
+            _wresult = _wmodel.transcribe(wav_path, language="en", fp16=False)
+            transcript = (_wresult.get("text") or "").strip()
+            print(f"  Whisper transcript: '{transcript}'")
+        except ImportError:
+            print("  ⚠  Whisper not installed — run: pip install openai-whisper")
+        except Exception as _wh_err:
+            print(f"  ⚠  Whisper transcription failed: {_wh_err}")
+
         return {
             "success":              True,
+            "transcript":           transcript,
             "ecapa_embedding":      ecapa_embedding,
             "mfcc_features":        mfcc_mean.tolist(),
             "delta_mfcc_mean":      delta_mfcc_mean.tolist(),   # NEW

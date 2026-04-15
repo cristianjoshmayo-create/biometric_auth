@@ -62,3 +62,8 @@ class VoiceFeatures(BaseModel):
     # Base64-encoded WAV bytes from the browser recording.
     # Only used during authentication (not stored).
     raw_audio_b64:          str = ""
+
+    # Whisper ASR transcript of what the user spoke.
+    # Used at auth time to verify the correct passphrase was spoken.
+    # Empty string = Whisper unavailable (phrase check skipped gracefully).
+    transcript:             str = ""

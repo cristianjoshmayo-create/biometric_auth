@@ -83,6 +83,26 @@ class KeystrokeTemplate(Base):
     digraph_on = Column(Float, default=0)
 
     extra_digraphs = Column(JSON, default=dict)
+    key_dwell_map  = Column(JSON, default=dict)   # { 's': avg_ms, 'p': avg_ms, ... }
+
+    # ── 4-variant digraph timings (Killourhy–Maxion convention) ──────────────
+    # extra_digraphs above is DD (press→press) for backward compat.
+    # The four maps below let the trainer use any combination.
+    #
+    # MIGRATION (run once, e.g. via psql):
+    #   ALTER TABLE keystroke_templates
+    #     ADD COLUMN IF NOT EXISTS digraph_dd_map     JSON DEFAULT '{}',
+    #     ADD COLUMN IF NOT EXISTS digraph_du_map     JSON DEFAULT '{}',
+    #     ADD COLUMN IF NOT EXISTS digraph_ud_map     JSON DEFAULT '{}',
+    #     ADD COLUMN IF NOT EXISTS digraph_uu_map     JSON DEFAULT '{}',
+    #     ADD COLUMN IF NOT EXISTS flight_per_digraph JSON DEFAULT '{}',
+    #     ADD COLUMN IF NOT EXISTS trigraph_map       JSON DEFAULT '{}';
+    digraph_dd_map     = Column(JSON, default=dict)   # press[i] → press[i+1]
+    digraph_du_map     = Column(JSON, default=dict)   # press[i] → release[i]
+    digraph_ud_map     = Column(JSON, default=dict)   # release[i] → press[i+1]  (per-pair flight)
+    digraph_uu_map     = Column(JSON, default=dict)   # release[i] → release[i+1]
+    flight_per_digraph = Column(JSON, default=dict)   # alias of UD; convenient for ML
+    trigraph_map       = Column(JSON, default=dict)   # press[i] → press[i+2] per trigraph
 
     typing_speed_cpm        = Column(Float, default=0)
     typing_duration         = Column(Float, default=0)
@@ -178,5 +198,10 @@ class AuthLog(Base):
     result           = Column(String(20))
     failed_attempts  = Column(Integer, default=0)
     attempted_at     = Column(DateTime, default=func.now())
+    # Progressive-enrollment audit trail: which threshold this attempt was
+    # judged against, and how many successful logins had shaped the template
+    # at the time. Populated for keystroke/fusion rows; null elsewhere.
+    template_maturity    = Column(Integer, nullable=True)
+    effective_threshold  = Column(Float,   nullable=True)
 
     user = relationship("User", back_populates="auth_logs")

@@ -130,13 +130,20 @@ DIGRAPH_RANGE = (20, 300)
 #  DATA EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_feature_vector(template, extra_keys: list = None) -> np.ndarray:
+def extract_feature_vector(template, extra_keys: list = None, key_keys: list = None,
+                           flight_pair_keys: list = None, trigraph_keys: list = None) -> np.ndarray:
     """
     Build the feature vector for a template.
-    If extra_keys is provided (a list of digraph pair strings like ['pe','ea',...]),
-    those timings are appended from template.extra_digraphs after the standard
-    FEATURE_NAMES features.  This is the dynamic-digraph path for users enrolled
-    with unique passphrases.
+
+    extra_keys       : digraph DD pairs (press→press) — read from extra_digraphs
+    key_keys         : single letters — read from key_dwell_map
+    flight_pair_keys : digraph pairs ['th','qu',...] — per-pair UD/flight time,
+                       read from template.flight_per_digraph
+    trigraph_keys    : 3-letter sequences ['the','qui',...] — press[i]→press[i+2],
+                       read from template.trigraph_map
+
+    Tail order matters — must match `active_feat_names` construction in
+    train_random_forest() and the n_tail count in _strip_inactive/_patch_impostor.
     """
     vals = []
     for name in FEATURE_NAMES:
@@ -149,13 +156,20 @@ def extract_feature_vector(template, extra_keys: list = None) -> np.ndarray:
             except (TypeError, ValueError):
                 vals.append(0.0)
 
-    if extra_keys:
-        extra_map = getattr(template, 'extra_digraphs', None) or {}
-        for pair in extra_keys:
+    def _append_from_map(map_name, keys):
+        if not keys:
+            return
+        m = getattr(template, map_name, None) or {}
+        for k in keys:
             try:
-                vals.append(float(extra_map.get(pair, 0.0) or 0.0))
+                vals.append(float(m.get(k, 0.0) or 0.0))
             except (TypeError, ValueError):
                 vals.append(0.0)
+
+    _append_from_map('extra_digraphs',     extra_keys)
+    _append_from_map('key_dwell_map',      key_keys)
+    _append_from_map('flight_per_digraph', flight_pair_keys)
+    _append_from_map('trigraph_map',       trigraph_keys)
 
     return np.array(vals, dtype=np.float64)
 
@@ -182,7 +196,8 @@ def _is_quality_sample(vec: np.ndarray, feat_names: list = None) -> tuple:
     return True, "ok"
 
 
-def load_enrollment_samples(db, user_id: int, extra_keys: list = None):
+def load_enrollment_samples(db, user_id: int, extra_keys: list = None, key_keys: list = None,
+                            flight_pair_keys: list = None, trigraph_keys: list = None):
     templates = (
         db.query(KeystrokeTemplate)
         .filter(KeystrokeTemplate.user_id == user_id)
@@ -191,7 +206,13 @@ def load_enrollment_samples(db, user_id: int, extra_keys: list = None):
     )
     vectors = []
     for t in templates:
-        vec = extract_feature_vector(t, extra_keys=extra_keys)
+        vec = extract_feature_vector(
+            t,
+            extra_keys=extra_keys,
+            key_keys=key_keys,
+            flight_pair_keys=flight_pair_keys,
+            trigraph_keys=trigraph_keys,
+        )
         ok, reason = _is_quality_sample(vec)
         if not ok:
             print(f"  ⚠  Skipping sample id={t.id}: {reason}")
@@ -568,6 +589,47 @@ def get_active_digraphs(phrase: str) -> tuple:
     return standard_active, extra_pairs
 
 
+def get_active_key_dwells(phrase: str) -> list:
+    """
+    Return sorted list of unique letter characters in the phrase.
+    These become per-key dwell features: key_a, key_e, key_k, ...
+    Each one captures how long the user holds that specific key — more
+    person-specific than the aggregate dwell_mean.
+    """
+    return sorted(set(c for c in phrase.lower() if c.isalpha()))
+
+
+def get_phrase_digraph_pairs(phrase: str) -> list:
+    """
+    Every unique [a-z]{2} window in the phrase, regardless of whether the pair
+    is one of the hardcoded FEATURE_NAMES digraphs. Used for `flight_<pair>`
+    feature columns (per-pair UD/flight time).
+    """
+    clean = phrase.lower().replace(" ", "")
+    seen, pairs = set(), []
+    for i in range(len(clean) - 1):
+        p = clean[i] + clean[i + 1]
+        if p.isalpha() and p not in seen:
+            seen.add(p)
+            pairs.append(p)
+    return pairs
+
+
+def get_active_trigraphs(phrase: str) -> list:
+    """
+    Every unique [a-z]{3} window in the phrase. Each becomes a `trigraph_<tri>`
+    feature: press[i] → press[i+2] elapsed time, captures sequence muscle memory.
+    """
+    clean = phrase.lower().replace(" ", "")
+    seen, trigs = set(), []
+    for i in range(len(clean) - 2):
+        t = clean[i] + clean[i + 1] + clean[i + 2]
+        if t.isalpha() and t not in seen:
+            seen.add(t)
+            trigs.append(t)
+    return trigs
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  TRAINING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -605,18 +667,28 @@ def train_random_forest(username: str):
     #   standard_active : subset of the 27 hardcoded FEATURE_NAMES digraphs
     #   extra_pairs     : all other bigrams in the phrase (stored in extra_digraphs JSON)
     standard_active, extra_pairs = get_active_digraphs(user_phrase)
+    key_keys          = get_active_key_dwells(user_phrase)
+    flight_pair_keys  = get_phrase_digraph_pairs(user_phrase)   # ALL phrase pairs (UD)
+    trigraph_keys     = get_active_trigraphs(user_phrase)
     all_digraph_feats = {f for f in FEATURE_NAMES if f.startswith("digraph_")}
     inactive_digraphs = all_digraph_feats - standard_active
     drop_indices      = [i for i, n in enumerate(FEATURE_NAMES) if n in inactive_digraphs]
     active_feat_names = (
         [n for n in FEATURE_NAMES if n not in inactive_digraphs]
-        + [f"extra_{p}" for p in extra_pairs]
+        + [f"extra_{p}"    for p in extra_pairs]
+        + [f"key_{k}"      for k in key_keys]
+        + [f"flight_{p}"   for p in flight_pair_keys]
+        + [f"trigraph_{t}" for t in trigraph_keys]
     )
 
-    # Reload genuine samples WITH extra_keys so extra_digraphs are appended
+    # Reload genuine samples WITH all four phrase-specific dict expansions.
     db2 = SessionLocal()
     try:
-        genuine_vectors = load_enrollment_samples(db2, user_id, extra_keys=extra_pairs)
+        genuine_vectors = load_enrollment_samples(
+            db2, user_id,
+            extra_keys=extra_pairs, key_keys=key_keys,
+            flight_pair_keys=flight_pair_keys, trigraph_keys=trigraph_keys,
+        )
         if not genuine_vectors:
             print("❌ No valid enrollment samples found.")
             return None
@@ -630,6 +702,9 @@ def train_random_forest(username: str):
     print(f"\n  Enrollment samples loaded: {n_genuine_real}")
         # ── Outlier trimming ──────────────────────────────────────────────────────
     if len(genuine_vectors) >= 4:
+        dropped_total = 0
+
+        # Trim by dwell_mean
         dwell_idx = (active_feat_names.index('dwell_mean')
                      if 'dwell_mean' in active_feat_names else None)
         if dwell_idx is not None:
@@ -640,11 +715,32 @@ def train_random_forest(username: str):
                             if abs(v[dwell_idx] - median_dwell) <= 2.5 * std_dwell]
             dropped = len(genuine_vectors) - len(trimmed)
             if dropped and len(trimmed) >= 3:
-                print(f"  ⚠  Dropped {dropped} outlier enrollment sample(s) "
-                      f"(dwell_mean > 2.5σ from median={median_dwell:.0f}ms)")
+                print(f"  ⚠  Dropped {dropped} outlier(s) by dwell_mean "
+                      f"(> 2.5σ from median={median_dwell:.0f}ms)")
                 genuine_vectors = trimmed
-            elif dropped:
-                print(f"  ⚠  Outlier trimming skipped — would leave < 3 samples")
+                dropped_total += dropped
+
+        # Trim by typing_speed_cpm — catches samples where the user typed
+        # at a very different speed (e.g. 188 vs 341 cpm) that dwell trimming misses.
+        cpm_idx = (active_feat_names.index('typing_speed_cpm')
+                   if 'typing_speed_cpm' in active_feat_names else None)
+        if cpm_idx is not None and len(genuine_vectors) >= 4:
+            cpms       = np.array([v[cpm_idx] for v in genuine_vectors])
+            median_cpm = np.median(cpms)
+            std_cpm    = max(np.std(cpms), median_cpm * 0.10)
+            trimmed    = [v for v in genuine_vectors
+                          if abs(v[cpm_idx] - median_cpm) <= 2.0 * std_cpm]
+            dropped = len(genuine_vectors) - len(trimmed)
+            if dropped and len(trimmed) >= 3:
+                print(f"  ⚠  Dropped {dropped} outlier(s) by typing_speed_cpm "
+                      f"(> 2.0σ from median={median_cpm:.0f} cpm)")
+                genuine_vectors = trimmed
+                dropped_total += dropped
+
+        if dropped_total == 0:
+            print(f"  ✅ All {len(genuine_vectors)} enrollment samples passed outlier check")
+        elif len(genuine_vectors) < 3:
+            print(f"  ⚠  Outlier trimming skipped — would leave < 3 samples")
     # Pre-compute extra-digraph stats from genuine enrollment so we can generate
     # realistic (non-zero) values for real impostors who typed a different phrase.
     # We do this BEFORE _strip_inactive is called so profile_mean/std are available.
@@ -670,38 +766,39 @@ def train_random_forest(username: str):
         for v in vecs:
             base = np.delete(v[:len(FEATURE_NAMES)], drop_indices)
             if not is_impostor and len(v) > len(FEATURE_NAMES):
-                # Genuine vector — real extra digraph timings already appended
-                extra = v[len(FEATURE_NAMES):]
+                # Genuine vector — real extra digraph + key_dwell timings already appended
+                tail = v[len(FEATURE_NAMES):]
             else:
-                # Impostor vector — generate realistic but distinct digraph timings.
-                # We don't have profile_mean yet at definition time, so we use a
-                # closure-safe approach: sample from DIGRAPH_RANGE with a bias
-                # toward the genuine mean (computed later and patched in).
-                # The actual patching happens in _patch_impostor_digraphs() below.
-                extra = np.zeros(len(extra_pairs))
-            stripped.append(np.concatenate([base, extra]))
+                # Impostor vector — zero out phrase-specific columns; they get
+                # patched with realistic-but-distinct values by _patch_impostor_digraphs.
+                tail = np.zeros(
+                    len(extra_pairs) + len(key_keys)
+                    + len(flight_pair_keys) + len(trigraph_keys)
+                )
+            stripped.append(np.concatenate([base, tail]))
         return stripped
 
     def _patch_impostor_digraphs(vecs, p_mean, p_std, rng_inst):
         """
-        After profile_mean/std are known, replace the zero extra_ columns on
-        impostor vectors with phrase-plausible but genuinely-distinct timings.
+        After profile_mean/std are known, replace the zero phrase-specific columns
+        (extra_ digraphs and key_ dwell times) on impostor vectors with
+        phrase-plausible but genuinely-distinct timings.
 
-        Strategy: for each extra_ column, draw from N(genuine_mean, 2.5*genuine_std)
-        and reject samples that fall within 1.5*std of the genuine mean (too close
-        to be a useful impostor example).  Clamp to DIGRAPH_RANGE.
+        This forces the model to distinguish on TIMING, not on zero vs non-zero.
         """
-        if not extra_pairs:
+        n_tail = (len(extra_pairs) + len(key_keys)
+                  + len(flight_pair_keys) + len(trigraph_keys))
+        if n_tail == 0:
             return vecs
-        extra_col_start = len(p_mean) - len(extra_pairs)
+        tail_col_start = len(p_mean) - n_tail
         patched = []
         for v in vecs:
             v = v.copy()
-            for j, _ in enumerate(extra_pairs):
-                col = extra_col_start + j
+            for j in range(n_tail):
+                col    = tail_col_start + j
                 g_mean = p_mean[col]
                 g_std  = p_std[col]
-                min_sep = max(g_std * 1.5, g_mean * 0.20, 8.0)
+                min_sep = max(g_std * 1.5, g_mean * 0.15, 5.0)
                 for _ in range(20):
                     val = rng_inst.normal(g_mean, g_std * 2.5 + 15.0)
                     val = float(np.clip(val, DIGRAPH_RANGE[0], DIGRAPH_RANGE[1]))
@@ -717,6 +814,7 @@ def train_random_forest(username: str):
     print(f"  User phrase      : '{user_phrase}'")
     print(f"  Standard active  : {len(standard_active)}  ({', '.join(sorted(standard_active)) or 'none'})")
     print(f"  Extra pairs      : {len(extra_pairs)}  ({', '.join(extra_pairs) or 'none'})")
+    print(f"  Key dwell keys   : {len(key_keys)}  ({', '.join(key_keys) or 'none'})")
     print(f"  Dropped digraphs : {len(inactive_digraphs)}")
     print(f"  Active features  : {len(active_feat_names)} (was {len(FEATURE_NAMES)})")
 
@@ -745,6 +843,51 @@ def train_random_forest(username: str):
     ]:
         if feat in fn:
             print(f"    {label:20s}: {profile_mean[fn.index(feat)]:.3f}")
+
+    # ── Hybrid model selection ────────────────────────────────────────────────
+    # With ≤ 10 real enrollment samples, a GBM/RF trained on synthetic augmentation
+    # is unreliable: the augmented genuine cluster doesn't reflect real within-session
+    # variance and the decision boundary lands inside the genuine distribution.
+    #
+    # For small sets we use a TypingDNA-style profile matcher instead:
+    #   - Direct comparison against enrollment profile (mean ± std per feature)
+    #   - Speed normalization: scale all ms-timings by live/enrolled p2p ratio
+    #   - Tiered Z-tolerance: digraphs 1.8 | dwell/flight 2.2 | rhythm 2.8
+    #   - Weighted group score: 40% digraphs | 40% dwell/flight | 20% rhythm
+    #
+    # RF/GBM kicks in automatically once the user has built up ≥ 11 samples through
+    # adaptive learning (successful logins are saved back to the database).
+    PROFILE_MATCHER_THRESHOLD = 10   # switch to RF after this many real samples
+
+    if n_genuine_real <= PROFILE_MATCHER_THRESHOLD:
+        # Ensure ml/ is on sys.path so this import works whether train_keystroke_rf
+        # is called standalone (already in ml/) or as a module from the backend.
+        _ml_dir = os.path.dirname(os.path.abspath(__file__))
+        if _ml_dir not in sys.path:
+            sys.path.insert(0, _ml_dir)
+        from keystroke_profile_matcher import build_profile_model
+
+        model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+        os.makedirs(model_dir, exist_ok=True)
+
+        model_data = build_profile_model(
+            genuine_vectors  = genuine_vectors,
+            active_feat_names= active_feat_names,
+            username         = username,
+            user_id          = user_id,
+            user_phrase      = user_phrase,
+            threshold        = 0.65,
+        )
+
+        model_path = os.path.join(model_dir, f"{_safe_filename(username)}_keystroke_rf.pkl")
+        with open(model_path, 'wb') as f:
+            pickle.dump(model_data, f)
+
+        size_kb = os.path.getsize(model_path) / 1024
+        print(f"\n  ✅ PROFILE MODEL SAVED: {model_path}  ({size_kb:.1f} KB)")
+        print(f"  Mode: Profile Matcher (n={n_genuine_real} ≤ {PROFILE_MATCHER_THRESHOLD})")
+        print(f"  Will upgrade to RF/GBM after {PROFILE_MATCHER_THRESHOLD + 1}+ enrollment samples\n")
+        return model_path
 
     n_aug     = max(600, n_genuine_real * 120)
     n_imp_syn = max(1200, n_aug * 2)
@@ -884,20 +1027,26 @@ def train_random_forest(username: str):
     os.makedirs(model_dir, exist_ok=True)
 
     model_data = {
-        'pipeline':       pipeline,
-        'feature_names':  active_feat_names,
-        'username':       username,
-        'user_id':        user_id,
-        'n_enrollment':   n_genuine_real,
-        'profile_mean':   profile_mean,
-        'profile_std':    profile_std,
-        'profile_var':    profile_var,
-        'threshold':      final_thresh,
-        'consistency_cv': float(consistency_cv),
-        'far':            float(far_f),
-        'frr':            float(frr_f),
-        'eer':            float(best_eer),
-        'phrase':         user_phrase,
+        'pipeline':         pipeline,
+        'feature_names':    active_feat_names,
+        'username':         username,
+        'user_id':          user_id,
+        'n_enrollment':     n_genuine_real,
+        'profile_mean':     profile_mean,
+        'profile_std':      profile_std,
+        'profile_var':      profile_var,
+        'threshold':        final_thresh,
+        'consistency_cv':   float(consistency_cv),
+        'far':              float(far_f),
+        'frr':              float(frr_f),
+        'eer':              float(best_eer),
+        'phrase':           user_phrase,
+        # Phrase-specific dict-expansion key lists — required so predict_keystroke
+        # can rebuild the same vector from the auth payload.
+        'extra_keys':       list(extra_pairs),
+        'key_keys':         list(key_keys),
+        'flight_pair_keys': list(flight_pair_keys),
+        'trigraph_keys':    list(trigraph_keys),
     }
 
     model_path = os.path.join(model_dir, f"{_safe_filename(username)}_keystroke_rf.pkl")
@@ -933,13 +1082,21 @@ def predict_keystroke(username: str, feature_dict: dict) -> dict:
     profile_std  = model_data['profile_std']
     threshold    = model_data['threshold']
 
-    # extra_digraphs from the login payload (dict of pair → mean_ms)
-    extra_map = feature_dict.get('extra_digraphs') or {}
+    # Dict-expansion features arrive as nested dicts on the login payload.
+    extra_map    = feature_dict.get('extra_digraphs')     or {}
+    key_map      = feature_dict.get('key_dwell_map')      or {}
+    flight_map   = feature_dict.get('flight_per_digraph') or {}
+    trigraph_map = feature_dict.get('trigraph_map')       or {}
 
     def _get_val(name):
         if name.startswith('extra_'):
-            pair = name[len('extra_'):]
-            return float(extra_map.get(pair, 0.0) or 0.0)
+            return float(extra_map.get(name[len('extra_'):], 0.0) or 0.0)
+        if name.startswith('key_'):
+            return float(key_map.get(name[len('key_'):], 0.0) or 0.0)
+        if name.startswith('flight_'):
+            return float(flight_map.get(name[len('flight_'):], 0.0) or 0.0)
+        if name.startswith('trigraph_'):
+            return float(trigraph_map.get(name[len('trigraph_'):], 0.0) or 0.0)
         return float(feature_dict.get(name, 0.0) or 0.0)
 
     vec = np.array([_get_val(n) for n in feat_names])
