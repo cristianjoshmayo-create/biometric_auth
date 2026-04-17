@@ -194,7 +194,9 @@ const SpeechCapture = {
                     channelCount:      1,
                     echoCancellation:  true,   // remove mic echo from room reflections
                     noiseSuppression:  true,   // browser-level denoising (free, hardware-accelerated)
-                    autoGainControl:   true,   // normalize mic volume across devices
+                    autoGainControl:   false,  // DISABLED — AGC introduces session-varying compression
+                                               // that degrades ECAPA speaker-embedding consistency.
+                                               // Backend CMVN + _autoGain handle level normalization.
                     sampleRate:        { ideal: 16000 },
                     sampleSize:        16,
                 }
@@ -287,11 +289,18 @@ const SpeechCapture = {
         let offset = 0;
         for (const chunk of this.allSamples) { raw.set(chunk, offset); offset += chunk.length; }
 
-        // Trim leading/trailing silence with 200ms padding
+        // Trim leading/trailing silence with 200ms padding.
+        // Adaptive threshold: 3× the clip's noise floor (estimated as the
+        // 10th-percentile |sample|). Prevents clipping quiet speakers and
+        // under-trimming noisy environments — the fixed 0.005 threshold
+        // failed in both directions.
         const padFrames = Math.round(this._nativeSr * 0.2);
+        const absSorted = Array.from(raw, Math.abs).sort((a, b) => a - b);
+        const noiseFloor = absSorted[Math.floor(absSorted.length * 0.10)] || 0;
+        const trimThresh = Math.max(noiseFloor * 3.0, 0.002);
         let start = 0, end = raw.length - 1;
-        for (let i = 0; i < raw.length; i++)      { if (Math.abs(raw[i]) > this.SPEECH_THRESH * 0.5) { start = Math.max(0, i - padFrames); break; } }
-        for (let i = raw.length - 1; i >= 0; i--) { if (Math.abs(raw[i]) > this.SPEECH_THRESH * 0.5) { end = Math.min(raw.length - 1, i + padFrames); break; } }
+        for (let i = 0; i < raw.length; i++)      { if (Math.abs(raw[i]) > trimThresh) { start = Math.max(0, i - padFrames); break; } }
+        for (let i = raw.length - 1; i >= 0; i--) { if (Math.abs(raw[i]) > trimThresh) { end = Math.min(raw.length - 1, i + padFrames); break; } }
 
         const trimmed    = raw.slice(start, end + 1);
         const resampled  = this._resample(trimmed, this._nativeSr, this.TARGET_SR);

@@ -6,7 +6,12 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(pip show:*)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Bash(/c/Users/John Lorenz/Desktop/biometric_auth/venv310/Scripts/python.exe *)",
+      "Bash(venv310/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('ml/train_keystroke_rf.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python ml/train_keystroke_rf.py \"josh@gmail.com,\")",
+      "Bash(venv/Scripts/pip.exe list *)",
+      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python ml/keystroke_profile_matcher.py)"
     ]
   }
 }

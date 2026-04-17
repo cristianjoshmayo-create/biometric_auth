@@ -377,6 +377,15 @@ def _save_keystroke_sample(db: Session, user, ks_payload, source: str = "login")
             shift_lag_norm=ks_payload.shift_lag_norm,
             extra_digraphs=ks_payload.extra_digraphs or {},
             key_dwell_map=ks_payload.key_dwell_map or {},
+            # 4-variant digraph timings + per-pair flight + trigraph maps.
+            # Required for RF retraining to reproduce the enrollment feature
+            # vector once the user crosses the profile→RF sample threshold.
+            digraph_dd_map=ks_payload.digraph_dd_map or {},
+            digraph_du_map=ks_payload.digraph_du_map or {},
+            digraph_ud_map=ks_payload.digraph_ud_map or {},
+            digraph_uu_map=ks_payload.digraph_uu_map or {},
+            flight_per_digraph=ks_payload.flight_per_digraph or {},
+            trigraph_map=ks_payload.trigraph_map or {},
         )
         db.add(new_sample)
         db.commit()
@@ -455,13 +464,31 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             print(f"[keystroke] maturity={maturity}  mode={mode}  "
                   f"effective_threshold={threshold:.2f}  (stored={stored_threshold:.2f})")
 
-            # Build live feature vector (handles standard, extra_ digraphs, and key_ dwells)
-            extra_map = payload.extra_digraphs or {}
-            key_map   = payload.key_dwell_map  or {}
+            # Build live feature vector. Must route prefixed feature names to the
+            # correct source dict. Previously only extra_* and key_* were handled,
+            # silently zeroing every flight_*-per-digraph and trigraph_* feature at
+            # auth time — so the live vector looked nothing like what enrollment
+            # trained on. Disambiguation: flight_mean / flight_std / flight_median
+            # (+ _norm variants) are hardcoded scalar payload attributes that also
+            # start with "flight_", so they must NOT be routed to the per-digraph dict.
+            _SCALAR_FLIGHT = {
+                'flight_mean', 'flight_std', 'flight_median',
+                'flight_mean_norm', 'flight_std_norm',
+            }
+            extra_map    = payload.extra_digraphs    or {}
+            key_map      = payload.key_dwell_map     or {}
+            flight_map   = payload.flight_per_digraph or {}
+            trigraph_map = payload.trigraph_map      or {}
             vec = np.array([
-                float(extra_map.get(name[6:], 0.0) or 0.0) if name.startswith("extra_") else
-                float(key_map.get(name[4:],   0.0) or 0.0) if name.startswith("key_")   else
-                float(getattr(payload, name,   0.0) or 0.0)
+                float(extra_map.get(name[6:], 0.0) or 0.0)
+                    if name.startswith("extra_") else
+                float(key_map.get(name[4:], 0.0) or 0.0)
+                    if name.startswith("key_") else
+                float(trigraph_map.get(name[9:], 0.0) or 0.0)
+                    if name.startswith("trigraph_") else
+                float(flight_map.get(name[7:], 0.0) or 0.0)
+                    if name.startswith("flight_") and name not in _SCALAR_FLIGHT else
+                float(getattr(payload, name, 0.0) or 0.0)
                 for name in feat_names
             ])
 
@@ -532,11 +559,32 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                     print(f"  ⛔ {breach}")
                 print(f"  Profile score={profile_score:.3f}  speed_ratio={speed_ratio:.2f}  "
                       f"Threshold={threshold:.2f}  "
+                      f"mean_z={group_scores.get('digraph_mean_z', -1):.2f}  "
                       f"dig_dist={group_scores['digraph_dist']:.2f} "
                       f"dig_rank={group_scores['digraph_rank']:.2f} "
                       f"df={group_scores['dwell_flight']:.2f} "
                       f"rhy={group_scores['rhythm']:.2f}  "
                       f"→ {'PASS' if authenticated else 'FAIL'}")
+
+                # Diagnostic: on fail, dump top-10 highest-z digraph-group
+                # features with live/enrolled values so we can tell whether the
+                # miss is a handful of misaligned keys (cliff) or uniform
+                # cross-session drift (carpet).
+                if not authenticated and not hard_reject:
+                    details = result.get('details', [])
+                    dg_rows = [
+                        (nm, z, grp) for (nm, z, grp) in details if grp == 'digraph'
+                    ]
+                    dg_rows.sort(key=lambda r: r[1], reverse=True)
+                    print(f"  [diag] top digraph-group z's (of {len(dg_rows)}):")
+                    for nm, z, _ in dg_rows[:10]:
+                        idx_f = fn_list.index(nm) if nm in fn_list else -1
+                        if idx_f >= 0:
+                            enr = float(profile_mean[idx_f])
+                            std = float(profile_std[idx_f])
+                            live_raw = float(vec[idx_f])
+                            print(f"    {nm:24s} live={live_raw:7.1f}  "
+                                  f"enr={enr:7.1f} ±{std:5.1f}  z={z:.2f}")
 
             # ── RF / GBM path (>10 enrollment samples) ────────────────────────
             else:
@@ -733,7 +781,7 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
 
 
     # ── PHRASE VERIFICATION: confirm the correct passphrase was spoken ────
-    # Two-signal matching to handle accents and minor ASR errors:
+    # Three-signal matching to handle accents and ASR errors:
     #
     #   Signal 1 — Character ratio (difflib):
     #     Compares the full strings character by character.
@@ -745,13 +793,53 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
     #     Good for: accents, word reordering, one dropped/mispronounced word.
     #     For a 4-word phrase, 3/4 correct words = 0.75 overlap ratio.
     #
-    #   Final score = max(char_ratio, word_overlap) so either signal can pass.
-    #   Threshold = 0.70 — lenient enough for accents, strict enough to block
-    #   completely different phrases.
+    #   Signal 3 — Phonetic ratio (Metaphone-lite):
+    #     Each expected word is reduced to a phonetic code (th→0, vowels
+    #     dropped, duplicate consonants collapsed) and fuzzy-matched against
+    #     the phonetic codes of transcript words. Catches cases where Whisper
+    #     shifts vowels or drops a letter — e.g. "think"↔"thank" (both 0NK),
+    #     "new"↔"nu", "stiled"↔"style". Standard string comparison misses
+    #     these because the character edits look large, but the sounds are
+    #     nearly identical.
+    #
+    #   Final score = max(char_ratio, word_overlap, phonetic_ratio)
+    #   so any single strong signal can pass. Threshold = 0.70 — lenient
+    #   enough for accents, strict enough to block completely different
+    #   phrases.
+    #
+    # Deliberately NOT biasing Whisper with initial_prompt=expected_phrase:
+    # that would make Whisper "hear" the expected phrase even when garbage
+    # was spoken — a security hole on a biometric system.
     #
     # If Whisper was unavailable (empty transcript), check is skipped so the
     # system degrades gracefully rather than locking everyone out.
     import difflib, re
+
+    def _phonetic(word: str) -> str:
+        """
+        Tiny Metaphone-style encoder: reduces a word to the consonant sounds
+        an English ASR would most likely share across mishearings.
+        Not a full Metaphone — just enough for the common confusions we see
+        (think/thank/link/drink, new/renew, stiled/style, etc.).
+        """
+        w = word.lower()
+        # Order matters: digraphs before single-char replacements.
+        for old, new in (
+            ("tch", "x"), ("sch", "x"), ("sh", "x"), ("ch", "x"),
+            ("th", "0"),  ("ph", "f"),  ("ck", "k"), ("kn", "n"),
+            ("gn", "n"),  ("wr", "r"),  ("qu", "kw"), ("wh", "w"),
+            ("gh", ""),   ("x",  "ks"), ("z",  "s"),  ("v",  "f"),
+        ):
+            w = w.replace(old, new)
+        if not w:
+            return ""
+        # Keep leading char (even if vowel); drop vowels elsewhere.
+        first, rest = w[0], re.sub(r"[aeiouy]", "", w[1:])
+        out = [first]
+        for ch in rest:
+            if ch != out[-1]:        # collapse consecutive duplicates
+                out.append(ch)
+        return "".join(out)
 
     transcript      = (getattr(payload, 'transcript', '') or '').strip()
     expected_phrase = decrypt(user.phrase).strip() if user.phrase else ""
@@ -775,12 +863,32 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
         matched_words     = expected_words & transcript_words
         word_overlap      = len(matched_words) / len(expected_words) if expected_words else 0.0
 
-        final_score  = max(char_ratio, word_overlap)
+        # Signal 3: phonetic fuzzy match, word-by-word.
+        # For each expected word, check whether any transcript word has a
+        # phonetic code with ≥0.75 SequenceMatcher ratio. Threshold chosen
+        # so that "think"↔"thank" (identical codes) and "style"↔"stiled"
+        # (one-char diff on 3-char code) pass, while "think"↔"link" does not.
+        expected_phon   = [_phonetic(w) for w in norm_expected.split()   if w]
+        transcript_phon = [_phonetic(w) for w in norm_transcript.split() if w]
+        phon_hits = 0
+        for pe in expected_phon:
+            if not pe:
+                continue
+            for pt in transcript_phon:
+                if not pt:
+                    continue
+                if difflib.SequenceMatcher(None, pe, pt).ratio() >= 0.75:
+                    phon_hits += 1
+                    break
+        phonetic_ratio = phon_hits / len(expected_phon) if expected_phon else 0.0
+
+        final_score  = max(char_ratio, word_overlap, phonetic_ratio)
         phrase_match = final_score >= 0.70
 
         print(f"  [PHRASE] transcript='{transcript}'  expected='{expected_phrase}'")
         print(f"  [PHRASE] char_ratio={char_ratio:.2f}  word_overlap={word_overlap:.2f}  "
-              f"final={final_score:.2f}  → {'PASS' if phrase_match else 'FAIL'}")
+              f"phonetic={phonetic_ratio:.2f}  final={final_score:.2f}  "
+              f"→ {'PASS' if phrase_match else 'FAIL'}")
 
         if authenticated and not phrase_match:
             authenticated = False
@@ -849,11 +957,21 @@ def get_phrase(email: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="No phrase assigned to this user")
     return {"phrase": decrypt(user.phrase)}
 
-@router.get("/security-question/{username}")
-def get_security_question(username: str, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == username).first()
+@router.post("/security-question")
+def get_security_question(payload: PasswordAuth, db: Session = Depends(get_db)):
+    # Gated behind password re-verification so a raw email can't leak the
+    # (decrypted) security prompt — which would otherwise expose a
+    # recovery-path question for any registered address. Using POST + JSON
+    # keeps the password out of URLs, logs, and browser history.
+    email = payload.username.strip().lower()
+    user = db.query(User).filter(User.username == email).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    if not user.password_hash or not bcrypt.checkpw(
+        payload.password.encode('utf-8'),
+        user.password_hash.encode('utf-8')
+    ):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     sq = db.query(SecurityQuestion).filter(SecurityQuestion.user_id == user.id).first()
     if not sq:
         raise HTTPException(status_code=404, detail="No security question found")
@@ -940,16 +1058,36 @@ def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
 
     VOICE_FLOOR = 0.40
 
+    # ── Adaptive keystroke reliability ────────────────────────────────────────
+    # Load per-user reliability from the trained model. Inconsistent typists
+    # (high enrollment FRR) get a lower reliability → keystroke weight is
+    # scaled down proportionally and voice carries more of the decision.
+    # Missing / unreadable model → treat as fully reliable (1.0).
+    ks_reliability = 1.0
+    try:
+        _mpath = os.path.join(_model_dir(),
+                              f"{_safe_filename(payload.username)}_keystroke_rf.pkl")
+        if os.path.exists(_mpath):
+            with open(_mpath, 'rb') as _f:
+                _md = pickle.load(_f)
+            ks_reliability = float(_md.get('ks_reliability', 1.0))
+    except Exception:
+        ks_reliability = 1.0
+
     if payload.keystroke_passed:
         # Case A: KS passed but uncertain — voice confirms
-        ks_w, voice_w      = 0.45, 0.55
-        FUSED_THRESHOLD    = 0.58
-        case_label         = "A (ks-passed, voice-confirms)"
+        base_ks_w, base_voice_w = 0.45, 0.55
+        FUSED_THRESHOLD         = 0.58
+        case_label              = "A (ks-passed, voice-confirms)"
     else:
         # Case B: KS failed — voice is recovery, stricter threshold
-        ks_w, voice_w      = 0.35, 0.65
-        FUSED_THRESHOLD    = 0.65
-        case_label         = "B (ks-failed, voice-recovery)"
+        base_ks_w, base_voice_w = 0.35, 0.65
+        FUSED_THRESHOLD         = 0.65
+        case_label              = "B (ks-failed, voice-recovery)"
+
+    # Scale keystroke weight by measured reliability; voice absorbs the rest.
+    ks_w    = base_ks_w * ks_reliability
+    voice_w = 1.0 - ks_w
 
     fused          = ks_w * ks + voice_w * voice
     voice_floor_ok = voice >= VOICE_FLOOR
@@ -964,6 +1102,7 @@ def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
 
     print(
         f"[fuse] '{payload.username}'  case={case_label}  "
+        f"ks_rel={ks_reliability:.2f}  weights=({ks_w:.2f}/{voice_w:.2f})  "
         f"ks={ks:.3f}  voice={voice:.3f}  "
         f"fused={fused:.3f}  floor={'ok' if voice_floor_ok else 'FAIL'}  "
         f"→ {'GRANT' if granted else f'DENY ({reason})'}"

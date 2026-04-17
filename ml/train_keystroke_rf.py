@@ -63,6 +63,7 @@ from sklearn.pipeline import Pipeline
 
 from database.db import SessionLocal
 from database.models import User, KeystrokeTemplate
+from utils.crypto import decrypt
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  FEATURE NAMES
@@ -650,7 +651,12 @@ def train_random_forest(username: str):
         cmu_impostors  = load_cmu_impostors()
         real_impostors = load_real_impostors(db, user.id, n_genuine=len(genuine_vectors))
         user_id        = user.id
-        user_phrase    = user.phrase or ""
+        # user.phrase is stored as a Fernet ciphertext in the DB.  If we pass
+        # the ciphertext to get_active_digraphs() we get spurious bigrams from
+        # the base64 token (e.g. 'ga','aa','ab','bp' from 'gAAAAABp...') instead
+        # of the real phrase's bigrams.  decrypt() falls back to returning the
+        # raw value if the stored value is already plaintext.
+        user_phrase    = decrypt(user.phrase or "")
 
     finally:
         try:

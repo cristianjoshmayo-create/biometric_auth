@@ -114,8 +114,12 @@ const Api = {
         return res.json();
     },
 
-    async getSecurityQuestion(username) {
-        const res = await fetch(`${API_BASE}/auth/security-question/${username}`);
+    async getSecurityQuestion(username, password) {
+        const res = await fetch(`${API_BASE}/auth/security-question`, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({ username, password })
+        });
         return res.json();
     },
 

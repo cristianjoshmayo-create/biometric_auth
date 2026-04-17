@@ -624,6 +624,38 @@ def enroll_security(payload: SecurityEnroll, db: Session = Depends(get_db)):
 #  7. Stricter VAD: mode 3 + minimum 60% voiced ratio (was 40%)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Module-level Whisper model cache ──────────────────────────────────────────
+# Using faster-whisper (CTranslate2 backend) with the "small" model.
+#
+# Why this combination:
+#   • "tiny" (39 MB) repeatedly misrecognised passphrases for high-pitched
+#     voices — e.g. "think" heard as link/drink/thank, plus occasional
+#     non-English hallucinations. "small" (~244 MB) is ~2× more accurate.
+#   • faster-whisper is ~4× faster than vanilla openai-whisper on CPU with
+#     int8 quantisation, so "small" here is actually faster than "tiny" was.
+#   • Stays fully local — no network round-trip, no third-party exposure of
+#     user voice samples (important for a voice-auth system).
+#
+# First run downloads the model from Hugging Face (~244 MB) and caches it
+# under %USERPROFILE%\.cache\huggingface\hub. Subsequent loads are instant.
+_WHISPER_MODEL = None
+_WHISPER_TRIED = False
+
+def _get_whisper_model():
+    """Lazy-load faster-whisper once; return None if not installed."""
+    global _WHISPER_MODEL, _WHISPER_TRIED
+    if _WHISPER_MODEL is not None or _WHISPER_TRIED:
+        return _WHISPER_MODEL
+    _WHISPER_TRIED = True
+    try:
+        from faster_whisper import WhisperModel
+        _WHISPER_MODEL = WhisperModel("small", device="cpu", compute_type="int8")
+        print("[whisper] faster-whisper 'small' model loaded and cached (CPU int8)")
+    except ImportError:
+        _WHISPER_MODEL = None
+    return _WHISPER_MODEL
+
+
 def _estimate_snr(audio: np.ndarray, sr: int) -> float:
     """
     Estimate SNR in dB using a simple noise floor from the quietest 10% of frames.
@@ -723,6 +755,9 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         audio_segment.export(wav_path, format="wav")
 
         audio, sr     = librosa.load(wav_path, sr=16000, mono=True)
+        # DC offset removal — some mics add a constant bias that contaminates
+        # low-frequency features (RMS, energy, pitch f0) if not stripped.
+        audio = audio - float(np.mean(audio))
         total_duration = len(audio) / sr
         print(f"Duration: {total_duration:.2f}s")
 
@@ -798,16 +833,18 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
             audio_clean = audio
             print(f"  Skipping noise reduction (SNR={snr_db:.1f}dB ≥ 30dB)")
 
-        # ── WebRTC VAD — run on the CLEANED audio, not the original ──────
-        # FIX: previously read wav_data from disk (the pre-cleaned file).
-        # Now we convert audio_clean back to PCM bytes so VAD sees the same
-        # signal that will be used for MFCC extraction.
+        # ── WebRTC VAD on ORIGINAL audio (mask applied to cleaned audio) ──
+        # Rationale: noisereduce / spectral subtraction can leave "musical
+        # noise" artefacts that fool VAD into either over- or under-counting
+        # voiced frames. Voice activity is a property of the SOURCE signal,
+        # not the denoised one — so detect on the original, then apply the
+        # resulting mask when extracting voiced segments from audio_clean.
         import webrtcvad
         import struct
         vad = webrtcvad.Vad(1)   # mode 1: less aggressive, works on laptop mics
 
-        # Convert float32 cleaned audio → int16 PCM bytes for VAD
-        audio_int16   = np.clip(audio_clean, -1.0, 1.0)
+        # Convert ORIGINAL float32 audio → int16 PCM bytes for VAD
+        audio_int16   = np.clip(audio, -1.0, 1.0)
         audio_int16   = (audio_int16 * 32767).astype(np.int16)
         audio_pcm     = audio_int16.tobytes()
 
@@ -828,7 +865,7 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         speech_duration = (voiced * 30) / 1000
         voiced_fraction = voice_ratio
 
-        print(f"VAD (on cleaned audio): {voice_ratio:.0%} voiced  ({speech_duration:.1f}s speech)")
+        print(f"VAD (on original audio): {voice_ratio:.0%} voiced  ({speech_duration:.1f}s speech)")
 
         if voice_ratio < 0.40:
             return {
@@ -913,10 +950,15 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         else:
             audio_voiced = audio_clean
 
-        # ── MFCC extraction with CMVN ──────────────────────────────────────
+        # ── Pre-emphasis + MFCC extraction with CMVN ──────────────────────
+        # Pre-emphasis: first-order high-pass y[n] = x[n] - 0.97·x[n-1] boosts
+        # the high frequencies attenuated by the human vocal tract. Standard
+        # step in ASR/speaker-ID pipelines; librosa.feature.mfcc does NOT
+        # apply it by default, so we do it manually before extraction.
+        audio_emph = np.append(audio_voiced[0], audio_voiced[1:] - 0.97 * audio_voiced[:-1])
         # CMVN (cepstral mean-variance normalisation) removes channel effects
         # and adapts for different microphones/environments.
-        mfccs     = librosa.feature.mfcc(y=audio_voiced, sr=sr, n_mfcc=13,
+        mfccs     = librosa.feature.mfcc(y=audio_emph, sr=sr, n_mfcc=13,
                                           n_fft=frame_len, hop_length=hop_length)
         # Apply CMVN
         mfcc_cmvn = (mfccs - mfccs.mean(axis=1, keepdims=True)) / (mfccs.std(axis=1, keepdims=True) + 1e-8)
@@ -1017,18 +1059,25 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
 
         # ── Whisper phrase transcription ──────────────────────────────────
         # Runs on the cleaned 16kHz WAV file already on disk.
-        # Uses the tiny model (~39 MB) — fast enough for a 4-word passphrase.
-        # If Whisper is not installed, transcript is empty and phrase check
-        # is skipped at auth time (graceful degradation).
+        # Uses faster-whisper 'small' (~244 MB) — accurate enough to survive
+        # accented speech without hallucinating, fast enough on CPU int8 for
+        # the 4-word passphrase. If faster-whisper is not installed, transcript
+        # is empty and the phrase check is skipped at auth time (graceful
+        # degradation).
+        #
+        # beam_size=5 gives slightly better accuracy than greedy decoding
+        # at negligible cost on this short audio.
         transcript = ""
         try:
-            import whisper as _whisper
-            _wmodel = _whisper.load_model("tiny")
-            _wresult = _wmodel.transcribe(wav_path, language="en", fp16=False)
-            transcript = (_wresult.get("text") or "").strip()
-            print(f"  Whisper transcript: '{transcript}'")
-        except ImportError:
-            print("  ⚠  Whisper not installed — run: pip install openai-whisper")
+            _wmodel = _get_whisper_model()
+            if _wmodel is None:
+                print("  ⚠  faster-whisper not installed — run: pip install faster-whisper")
+            else:
+                _segments, _info = _wmodel.transcribe(
+                    wav_path, language="en", beam_size=5
+                )
+                transcript = " ".join(seg.text for seg in _segments).strip()
+                print(f"  Whisper transcript: '{transcript}'")
         except Exception as _wh_err:
             print(f"  ⚠  Whisper transcription failed: {_wh_err}")
 

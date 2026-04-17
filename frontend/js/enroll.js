@@ -386,6 +386,13 @@ async function submitKeystroke() {
             r2r_mean_norm:           features.r2r_mean_norm    || 0,
             shift_lag_norm:          features.shift_lag_norm   || 0,
             extra_digraphs:          features.extra_digraphs   || {},
+            key_dwell_map:           features.key_dwell_map       || {},
+            digraph_dd_map:          features.digraph_dd_map      || {},
+            digraph_du_map:          features.digraph_du_map      || {},
+            digraph_ud_map:          features.digraph_ud_map      || {},
+            digraph_uu_map:          features.digraph_uu_map      || {},
+            flight_per_digraph:      features.flight_per_digraph  || {},
+            trigraph_map:            features.trigraph_map        || {},
         });
 
         if (!result.success) {

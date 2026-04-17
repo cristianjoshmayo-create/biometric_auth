@@ -7,8 +7,15 @@
 import os
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 os.environ["HUGGINGFACE_HUB_VERBOSITY"] = "warning"
+
+# Forgives duplicate OpenMP runtimes. CTranslate2 (faster-whisper) and torch
+# (SpeechBrain) each ship their own libiomp5md.dll; co-loading aborts the
+# Python process on Windows without a traceback. This env var makes the second
+# loader reuse the first's runtime instead of crashing.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 # ─────────────────────────────────────────────────────────────────────────────
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -16,10 +23,26 @@ from fastapi.responses import RedirectResponse, HTMLResponse
 from routers import enroll, auth
 import os
 
+
+# Pre-load faster-whisper at startup, BEFORE any request can trigger torch/
+# SpeechBrain imports. Load order matters on Windows: whichever of CTranslate2
+# vs torch loads its native MKL/OpenMP runtime first wins; loading torch first
+# has been observed to silently kill the process when faster-whisper initialises
+# later. Warming Whisper here flips the order so ECAPA loads second.
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        enroll._get_whisper_model()
+    except Exception as e:
+        print(f"[startup] Whisper preload skipped: {type(e).__name__}: {e}")
+    yield
+
+
 app = FastAPI(
     title="Multimodal Biometric Authentication System",
     description="Keystroke Dynamics + Speech Biometrics",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # CORS — allow localhost and any ngrok tunnel URL

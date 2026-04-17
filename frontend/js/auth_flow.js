@@ -1,6 +1,10 @@
 // frontend/js/auth_flow.js
 
 let authUsername   = "";
+// Kept in memory for the single request to /auth/security-question, which
+// requires password re-verification to avoid leaking the question for any
+// email. Cleared on resetLogin().
+let authPassword   = "";
 let failedAttempts = 0;
 const MAX_ATTEMPTS = 3;
 
@@ -40,6 +44,7 @@ async function submitLogin() {
 
         if (result.authenticated) {
             authUsername = email;
+            authPassword = password;
             status.textContent = "✅ Credentials verified!";
             status.className   = "text-center text-sm mb-4 text-green-400";
 
@@ -278,7 +283,7 @@ async function moveToSecurityAuth() {
     document.getElementById("line-2").style.width = "100%";
 
     try {
-        const result = await Api.getSecurityQuestion(authUsername);
+        const result = await Api.getSecurityQuestion(authUsername, authPassword);
         document.getElementById("security-question-text").textContent =
             result.question || "Security question not found.";
     } catch (err) {
@@ -363,6 +368,7 @@ function hideAllSections() {
 function resetLogin() {
     failedAttempts = 0;
     authUsername   = "";
+    authPassword   = "";
     _ksScore       = null;
     _ksPassed      = false;
     _voiceScore    = null;

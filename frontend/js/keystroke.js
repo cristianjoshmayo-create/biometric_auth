@@ -182,6 +182,9 @@ const KeystrokeCapture = {
 
     onKeyDown(e) {
         if (!this.isCapturing) return;
+        // Reject synthetic events (dispatchEvent, DevTools, automation tools).
+        // Only real user keystrokes have isTrusted === true.
+        if (!e.isTrusted) return;
         // Ignore OS-level auto-repeat: a held key fires repeated keydowns that
         // corrupt dwell and flood p2p/flight with ~0ms intervals.
         if (e.repeat) return;
@@ -200,6 +203,7 @@ const KeystrokeCapture = {
 
     onKeyUp(e) {
         if (!this.isCapturing) return;
+        if (!e.isTrusted) return;
         const now = performance.now();
         this.endTime = now;
         this.events.push({ type: 'release', key: e.key, code: e.code, time: now, used: false });
