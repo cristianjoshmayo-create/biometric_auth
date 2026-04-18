@@ -58,49 +58,46 @@ _NO_NORMALIZE = {
 }
 
 # Binary Z-tolerance still used for aggregate dwell/flight + rhythm.
-_Z_TOL = {
-    'dwell_flight': 1.8,
-    'rhythm':       2.2,
+_STAGE_CFG = {
+    # Cold start — TypingDNA-style: lean on digraph A-measure (dist) + R-measure (rank).
+    # Aggregate dwell/rhythm are demoted to supporting signals because their std estimate
+    # from 5-7 samples is too noisy to discriminate similar-speed impostors. Rank is
+    # scale-invariant by construction so it works well with small enrollments.
+    'early': {
+        'z_tol': {'dwell_flight': 2.2, 'rhythm': 2.6},
+        'weights': {'digraph_dist': 0.40, 'digraph_rank': 0.30, 'dwell_flight': 0.20, 'rhythm': 0.10},
+        'dist_mean_z_max': 3.6,
+        'z_cap': 6.0,
+        'digraph_dist_floor': 0.15,
+        'digraph_rank_floor': 0.15,
+        'std_cap': {'digraph': 0.30, 'dwell_flight': 0.28, 'rhythm': 0.40},
+    },
+    # Mid stage: bring phrase-specific timing back in, but keep rank modest.
+    'mid': {
+        'z_tol': {'dwell_flight': 2.0, 'rhythm': 2.4},
+        'weights': {'digraph_dist': 0.45, 'digraph_rank': 0.05, 'dwell_flight': 0.35, 'rhythm': 0.15},
+        'dist_mean_z_max': 3.2,
+        'z_cap': 5.0,
+        'digraph_dist_floor': 0.20,
+        'digraph_rank_floor': 0.20,
+        'std_cap': {'digraph': 0.27, 'dwell_flight': 0.26, 'rhythm': 0.37},
+    },
+    # Mature profile matcher stage, just before the learned model takes over.
+    'late': {
+        'z_tol': {'dwell_flight': 1.8, 'rhythm': 2.2},
+        'weights': {'digraph_dist': 0.55, 'digraph_rank': 0.10, 'dwell_flight': 0.25, 'rhythm': 0.10},
+        'dist_mean_z_max': 3.0,
+        'z_cap': 5.0,
+        'digraph_dist_floor': 0.25,
+        'digraph_rank_floor': 0.30,
+        'std_cap': {'digraph': 0.25, 'dwell_flight': 0.25, 'rhythm': 0.35},
+    },
 }
 
-# Digraph group uses two continuous sub-scores:
-#   digraph_dist : scaled Manhattan distance (mean |live-μ|/σ) — THE discriminator
-#   digraph_rank : fraction of digraph pairs whose live ordering matches
-#                  enrollment. On SHORT FIXED phrases, rank barely discriminates
-#                  because phrase mechanics force similar orderings across
-#                  typists — both genuine and impostors land near 1.0. Kept at
-#                  low weight as a minor consistency check, not a discriminator.
-_WEIGHTS = {
-    'digraph_dist': 0.55,
-    'digraph_rank': 0.10,
-    'dwell_flight': 0.25,
-    'rhythm':       0.10,
-}
 
-# mean_z → distance_score: linear, 0 at MEAN_Z_MAX or above. Widened to 3.0
-# so inconsistent typists (CoV ~20%+ on flight/cpm) still score above 0.3 on
-# self-check. Impostors with unfamiliar digraphs land well beyond Z=3 so the
-# widening doesn't meaningfully raise FAR.
-_DIST_MEAN_Z_MAX = 3.0
-
-# Per-feature z winsorization cap. One or two slow/fast keys in a genuine
-# login (e.g., a 60% longer 'r' dwell on a 5-sample tight-enrollment profile)
-# produce z of 6–30 that drag mean_z above 2.0 and collapse digraph_dist even
-# though the rest of the profile matches. Capping individual z at 5.0 before
-# averaging prevents one-key spikes from torching the score. Impostors fail
-# on the *whole* digraph set, so clipping individual outliers doesn't rescue
-# them — mean_z stays high. Set to np.inf to disable.
-_Z_CAP = 5.0
-
-# Soft penalty threshold for digraph_dist (score × 0.5 when below).
-_DIGRAPH_DIST_FLOOR = 0.25
-# Rank floor is a SOFT multiplicative penalty, not a hard zero. Previously the
-# hard-zero produced min=0.000 on self-check for users whose enrollment
-# attempts had natural pairwise-ordering flips across digraphs — genuine
-# rejection at FRR=100%. The 0.10 weight in _WEIGHTS already captures the
-# anti-impostor signal; this floor just amplifies the penalty when rank
-# collapses below coin-flip.
-_DIGRAPH_RANK_FLOOR = 0.30
+def _get_stage_cfg(model_stage: Optional[str]) -> dict:
+    stage = (model_stage or 'mid').lower()
+    return _STAGE_CFG.get(stage, _STAGE_CFG['mid'])
 
 
 def _classify_feature(name: str) -> str:
@@ -167,6 +164,7 @@ def compute_profile_score(
     feat_names:   List[str],
     profile_mean: np.ndarray,
     profile_std:  np.ndarray,
+    model_stage:  Optional[str] = None,
 ) -> dict:
     """
     Score a login attempt against the user's enrollment profile.
@@ -190,6 +188,13 @@ def compute_profile_score(
     live = np.asarray(live_vec, dtype=np.float64)
     pmean = np.asarray(profile_mean, dtype=np.float64)
     pstd  = np.asarray(profile_std,  dtype=np.float64)
+    cfg = _get_stage_cfg(model_stage)
+    z_tol = cfg['z_tol']
+    weights = cfg['weights']
+    dist_mean_z_max = float(cfg['dist_mean_z_max'])
+    z_cap = float(cfg['z_cap'])
+    digraph_dist_floor = float(cfg['digraph_dist_floor'])
+    digraph_rank_floor = float(cfg['digraph_rank_floor'])
 
     # ── Speed normalization ────────────────────────────────────────────────────
     p2p_idx = fn.index('p2p_mean') if 'p2p_mean' in fn else None
@@ -198,17 +203,7 @@ def compute_profile_score(
     else:
         speed_ratio = 1.0
 
-    # Per-group std caps. Relaxed further from 0.15 → 0.25 for digraph because
-    # PoC enrollment (5 samples, unconstrained speed) can exhibit 20%+ CoV on
-    # individual digraphs; a 15% cap floors z-scores artificially high and
-    # rejects the genuine user on self-check. Rank + dist together still
-    # discriminate impostors (who fail both sub-scores), so loosening the
-    # per-feature band doesn't meaningfully raise FAR.
-    _STD_CAP = {
-        'digraph':      0.25,
-        'dwell_flight': 0.25,
-        'rhythm':       0.35,
-    }
+    _STD_CAP = cfg['std_cap']
 
     # ── Per-feature Z-scores ───────────────────────────────────────────────────
     digraph_z = []                                # |live-μ|/σ for digraph features
@@ -241,16 +236,16 @@ def compute_profile_score(
                 digraph_live_norm.append(norm_val)
                 digraph_mean_ref.append(enr_mean)
         else:
-            group_hits[grp].append(z <= _Z_TOL[grp])
+            group_hits[grp].append(z <= z_tol[grp])
 
         details.append((name, float(z), grp))
 
     # ── Digraph distance sub-score (scaled Manhattan) ─────────────────────────
     if digraph_z:
         # Winsorize per-feature z to stop single-key spikes from torching mean_z.
-        z_arr = np.minimum(np.asarray(digraph_z), _Z_CAP)
+        z_arr = np.minimum(np.asarray(digraph_z), z_cap)
         mean_z = float(z_arr.mean())
-        digraph_dist = float(np.clip(1.0 - mean_z / _DIST_MEAN_Z_MAX, 0.0, 1.0))
+        digraph_dist = float(np.clip(1.0 - mean_z / dist_mean_z_max, 0.0, 1.0))
     else:
         mean_z = 0.0
         digraph_dist = 1.0
@@ -281,10 +276,10 @@ def compute_profile_score(
     }
 
     total_score = (
-        _WEIGHTS['digraph_dist'] * digraph_dist
-        + _WEIGHTS['digraph_rank'] * digraph_rank
-        + _WEIGHTS['dwell_flight'] * dwell_flight_score
-        + _WEIGHTS['rhythm']       * rhythm_score
+        weights['digraph_dist'] * digraph_dist
+        + weights['digraph_rank'] * digraph_rank
+        + weights['dwell_flight'] * dwell_flight_score
+        + weights['rhythm']       * rhythm_score
     )
 
     # ── Soft penalties on digraph sub-scores ───────────────────────────────────
@@ -295,14 +290,15 @@ def compute_profile_score(
     # sample size is 5, so a rank dip below 0.3 is common. Impostors still get
     # heavily penalised by the compound of both penalties + the base weights.
     floor_breach = None
-    if len(digraph_live_norm) >= 2 and digraph_rank < _DIGRAPH_RANK_FLOOR:
-        floor_breach = f"digraph_rank={digraph_rank:.2f} < {_DIGRAPH_RANK_FLOOR} (soft ×0.6)"
+    if len(digraph_live_norm) >= 2 and digraph_rank_floor > 0 and digraph_rank < digraph_rank_floor:
+        floor_breach = f"digraph_rank={digraph_rank:.2f} < {digraph_rank_floor:.2f} (soft ×0.6)"
         total_score *= 0.6
-    if digraph_z and digraph_dist < _DIGRAPH_DIST_FLOOR:
-        note = f"digraph_dist={digraph_dist:.2f} < {_DIGRAPH_DIST_FLOOR} (soft ×0.5)"
+    if digraph_z and digraph_dist < digraph_dist_floor:
+        note = f"digraph_dist={digraph_dist:.2f} < {digraph_dist_floor:.2f} (soft ×0.5)"
         floor_breach = f"{floor_breach}; {note}" if floor_breach else note
         total_score *= 0.5
     group_scores['floor_breach'] = floor_breach
+    group_scores['stage'] = (model_stage or 'mid')
 
     return {
         'score':        float(np.clip(total_score, 0.0, 1.0)),
@@ -322,6 +318,7 @@ def build_profile_model(
     username: str,
     user_id: int,
     user_phrase: str,
+    model_stage: Optional[str] = None,
     threshold: float = 0.65,
 ) -> dict:
     """
@@ -340,6 +337,7 @@ def build_profile_model(
     print(f"  KEYSTROKE PROFILE MATCHER  —  user: {username}")
     print(f"{'='*70}")
     print(f"  Enrollment samples : {n_in}")
+    print(f"  Stage              : {(model_stage or 'mid').upper()}")
     print(f"  Feature dimensions : {len(active_feat_names)}")
 
     # ── LOO-based outlier rejection ────────────────────────────────────────────
@@ -352,7 +350,7 @@ def build_profile_model(
             others = np.delete(vecs, i, axis=0)
             m = others.mean(axis=0)
             s = others.std(axis=0) + 1e-9
-            r = compute_profile_score(vecs[i], active_feat_names, m, s)
+            r = compute_profile_score(vecs[i], active_feat_names, m, s, model_stage=model_stage)
             loo_scores.append(r['score'])
         loo_arr = np.array(loo_scores)
         med     = float(np.median(loo_arr))
@@ -392,7 +390,7 @@ def build_profile_model(
     # Quick self-check: score each enrollment sample against the profile
     self_scores = []
     for v in genuine_vectors:
-        r = compute_profile_score(v, active_feat_names, profile_mean, profile_std)
+        r = compute_profile_score(v, active_feat_names, profile_mean, profile_std, model_stage=model_stage)
         self_scores.append(r['score'])
     s_mean = float(np.mean(self_scores))
     s_std  = float(np.std(self_scores))
@@ -433,6 +431,7 @@ def build_profile_model(
 
     return {
         'model_type':    'profile',
+        'model_stage':   (model_stage or 'mid'),
         'feature_names': active_feat_names,
         'username':      username,
         'user_id':       user_id,

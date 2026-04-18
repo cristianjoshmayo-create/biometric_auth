@@ -21,7 +21,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse, HTMLResponse
 from routers import enroll, auth
+from utils.debug_logger import init_logging, get_logger, request_logging_middleware, log_error
 import os
+
+init_logging()
+_startup_logger = get_logger("startup")
 
 
 # Pre-load faster-whisper at startup, BEFORE any request can trigger torch/
@@ -33,8 +37,10 @@ import os
 async def lifespan(_: FastAPI):
     try:
         enroll._get_whisper_model()
+        _startup_logger.info("Whisper preloaded", extra={"stage": "startup", "user": "-"})
     except Exception as e:
         print(f"[startup] Whisper preload skipped: {type(e).__name__}: {e}")
+        log_error("startup", "-", e, extra={"phase": "whisper_preload"})
     yield
 
 
@@ -44,6 +50,18 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# HTTP request logger — writes one line per request to logs/debug.log
+app.middleware("http")(request_logging_middleware)
+
+# Global exception catch — any unhandled error gets a full stack trace logged
+from fastapi.requests import Request as _Req
+from fastapi.responses import JSONResponse as _JSON
+
+@app.exception_handler(Exception)
+async def _log_unhandled(request: _Req, exc: Exception):
+    log_error("unhandled", "-", exc, extra={"path": request.url.path, "method": request.method})
+    return _JSON(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
 
 # CORS — allow localhost and any ngrok tunnel URL
 app.add_middleware(

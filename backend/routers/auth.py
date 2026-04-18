@@ -13,8 +13,9 @@ import sys
 import subprocess
 import bcrypt  # ← ADDED
 
-from utils.fusion import fuse_keystroke_scores, fuse_voice_scores, fuse_multimodal
+from utils.fusion import fuse_keystroke_scores
 from utils.crypto import decrypt
+from utils.debug_logger import log_auth_stage, log_error
 
 # ── Pending keystroke sample cache ────────────────────────────────────────────
 # Keystroke samples are only saved after the full multimodal login is granted.
@@ -30,6 +31,11 @@ from schemas import VoiceFeatures
 router = APIRouter()
 
 MAX_SAMPLES = 50
+# Adaptive pool cap (TypingDNA-style). Enrollment rows are pinned and do NOT
+# count against this — only source in ('login_ks','login_fusion') are adaptive.
+# When the cap is hit, the lowest-scoring adaptive row is evicted so the pool
+# self-cleans toward the user's strongest patterns instead of drifting with age.
+MAX_ADAPTIVE = 15
 
 def _safe_filename(username: str) -> str:
     """Sanitize email for use as filename. user@gmail.com → user_at_gmail_com"""
@@ -230,7 +236,35 @@ def _effective_keystroke_threshold(stored_threshold: float, maturity: int) -> fl
         return _SOFT_THRESHOLD
     if maturity < _RAMP_MATURITY_END:
         return _RAMP_THRESHOLD
-    return float(stored_threshold)
+    # Gradual hardening from RAMP → stored threshold over maturity 7..15.
+    # Avoids the sudden FRR cliff that rejected genuine users whose typing
+    # sits in the 0.55–0.70 band. Template keeps absorbing adaptive samples
+    # while the threshold tightens slowly toward the calibrated value.
+    HARDEN_SPAN = 8
+    progress = min(1.0, (maturity - _RAMP_MATURITY_END) / HARDEN_SPAN)
+    return _RAMP_THRESHOLD + progress * (float(stored_threshold) - _RAMP_THRESHOLD)
+
+
+def _consecutive_denials(db: Session, user_id: int, method: str) -> int:
+    # Count denials since the user's last granted attempt for this method.
+    # Why: the old all-time count permanently flagged accounts once lifetime
+    # typos hit the limit. Consecutive-since-last-success resets on every win.
+    last_grant = (
+        db.query(AuthLog.attempted_at)
+          .filter(AuthLog.user_id == user_id,
+                  AuthLog.auth_method == method,
+                  AuthLog.result == "granted")
+          .order_by(AuthLog.attempted_at.desc())
+          .first()
+    )
+    q = db.query(AuthLog).filter(
+        AuthLog.user_id == user_id,
+        AuthLog.auth_method == method,
+        AuthLog.result == "denied",
+    )
+    if last_grant is not None:
+        q = q.filter(AuthLog.attempted_at > last_grant[0])
+    return q.count()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,14 +295,18 @@ def verify_password(payload: PasswordAuth, db: Session = Depends(get_db)):
                 "granted" if authenticated else "denied")
 
     if not authenticated:
-        pw_denials = db.query(AuthLog).filter(
-            AuthLog.user_id == user.id,
-            AuthLog.auth_method == "password",
-            AuthLog.result == "denied"
-        ).count()
+        pw_denials = _consecutive_denials(db, user.id, "password")
         if pw_denials >= 5:
             user.is_flagged = True
             db.commit()
+
+    log_auth_stage(
+        "password", email,
+        "granted" if authenticated else "denied",
+        score=1.0 if authenticated else 0.0,
+        threshold=1.0,
+        extra={"flagged_now": bool(user.is_flagged)},
+    )
 
     return {
         "authenticated": bool(authenticated),
@@ -280,24 +318,64 @@ def verify_password(payload: PasswordAuth, db: Session = Depends(get_db)):
 #  KEYSTROKE SAMPLE SAVE HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _save_keystroke_sample(db: Session, user, ks_payload, source: str = "login"):
+def _save_keystroke_sample(
+    db: Session,
+    user,
+    ks_payload,
+    source: str = "login",
+    ks_score: float | None = None,
+    effective_threshold: float | None = None,
+):
     """
     Persist a keystroke sample to the database and trigger adaptive retraining
     if a milestone or interval is reached.  Called from two places:
       - verify_keystroke  : when keystroke alone grants access
       - fuse_scores       : when voice recovery + fusion grants access
     """
+    # Quality gate: borderline samples drifted the profile centroid on multiple
+    # users (Jessica, Albaniathea) — after ~7 adaptive absorbs, genuine typing
+    # was scoring 0.15–0.48. Only feed back samples the template already fits
+    # well, so retraining tightens rather than widens the cluster.
+    if ks_score is not None:
+        if source == "login_ks":
+            thr = float(effective_threshold) if effective_threshold is not None else 0.55
+            quality_bar = max(thr + 0.05, 0.62)
+        elif source == "login_fusion":
+            quality_bar = 0.55
+        else:
+            quality_bar = 0.0
+        if ks_score < quality_bar:
+            print(f"  🚫 Keystroke sample not saved [{source}] — score {ks_score:.3f} < quality bar {quality_bar:.3f}")
+            return
+
     try:
         total_samples = db.query(KeystrokeTemplate).filter(
             KeystrokeTemplate.user_id == user.id
         ).count()
 
-        if total_samples >= MAX_SAMPLES:
-            oldest = db.query(KeystrokeTemplate).filter(
-                KeystrokeTemplate.user_id == user.id
-            ).order_by(KeystrokeTemplate.sample_order.asc()).first()
-            if oldest:
-                db.delete(oldest)
+        # Quality-weighted eviction over the ADAPTIVE pool only. Enrollment rows
+        # are pinned (never deleted) so the anchor patterns survive indefinitely.
+        # When the adaptive cap is hit, drop the weakest-scoring adaptive row —
+        # NOT the oldest — so the pool trends toward the user's best samples.
+        adaptive_q = db.query(KeystrokeTemplate).filter(
+            KeystrokeTemplate.user_id == user.id,
+            KeystrokeTemplate.source.in_(["login_ks", "login_fusion"]),
+        )
+        adaptive_count = adaptive_q.count()
+        if adaptive_count >= MAX_ADAPTIVE:
+            weakest = adaptive_q.order_by(
+                KeystrokeTemplate.saved_score.asc().nullsfirst(),
+                KeystrokeTemplate.sample_order.asc(),
+            ).first()
+            if weakest:
+                # Refuse to absorb a new sample that is worse than the weakest
+                # one already in the pool — otherwise the pool only degrades.
+                incoming = float(ks_score) if ks_score is not None else 0.0
+                existing = float(weakest.saved_score) if weakest.saved_score is not None else 0.0
+                if incoming <= existing:
+                    print(f"  🚫 Keystroke sample not saved — incoming {incoming:.3f} ≤ weakest in pool {existing:.3f}")
+                    return
+                db.delete(weakest)
                 db.flush()
 
         max_order = db.query(func.max(KeystrokeTemplate.sample_order)).filter(
@@ -386,6 +464,7 @@ def _save_keystroke_sample(db: Session, user, ks_payload, source: str = "login")
             digraph_uu_map=ks_payload.digraph_uu_map or {},
             flight_per_digraph=ks_payload.flight_per_digraph or {},
             trigraph_map=ks_payload.trigraph_map or {},
+            saved_score=float(ks_score) if ks_score is not None else None,
         )
         db.add(new_sample)
         db.commit()
@@ -403,7 +482,7 @@ def _save_keystroke_sample(db: Session, user, ks_payload, source: str = "login")
         ).count()
 
         if updated_count <= 10:
-            retrain_interval = 2
+            retrain_interval = 3
         elif updated_count <= 30:
             retrain_interval = 5
         else:
@@ -452,6 +531,7 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                 model_data = pickle.load(f)
 
             model_type   = model_data.get('model_type', 'rf')
+            model_stage  = model_data.get('model_stage', 'late' if model_type != 'profile' else 'early')
             feat_names   = model_data['feature_names']
             profile_mean = model_data['profile_mean']
             stored_threshold = model_data['threshold']
@@ -461,7 +541,7 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             threshold = _effective_keystroke_threshold(stored_threshold, maturity)
             mode = ("SOFT" if maturity < _SOFT_MATURITY_END else
                     "RAMP" if maturity < _RAMP_MATURITY_END else "HARD")
-            print(f"[keystroke] maturity={maturity}  mode={mode}  "
+            print(f"[keystroke] stage={model_stage}  maturity={maturity}  mode={mode}  "
                   f"effective_threshold={threshold:.2f}  (stored={stored_threshold:.2f})")
 
             # Build live feature vector. Must route prefixed feature names to the
@@ -495,11 +575,12 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             # ── Profile Matcher path (≤10 enrollment samples) ─────────────────
             if model_type == 'profile':
                 print(f"[keystroke] Using Profile Matcher for '{payload.username}'")
-                # Profile path lacks Mahalanobis — clamp effective threshold to
-                # ≥ 0.55 so SOFT mode can't drop it to 0.45 without hard gates.
-                if threshold < 0.55:
-                    print(f"  ⚠  Profile-path threshold floor: {threshold:.2f} → 0.55")
-                    threshold = 0.55
+                # Profile path lacks Mahalanobis — keep an absolute safety
+                # floor of 0.50 so SOFT mode can't drop below it, but do NOT
+                # override a higher per-user calibrated threshold.
+                if threshold < 0.50:
+                    print(f"  ⚠  Profile-path threshold floor: {threshold:.2f} → 0.50")
+                    threshold = 0.50
                 _project_root = os.path.normpath(os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), '..', '..'
                 ))
@@ -507,7 +588,9 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                     sys.path.insert(0, _project_root)
                 from ml.keystroke_profile_matcher import compute_profile_score
                 profile_std = model_data['profile_std']
-                result = compute_profile_score(vec, feat_names, profile_mean, profile_std)
+                result = compute_profile_score(
+                    vec, feat_names, profile_mean, profile_std, model_stage=model_stage
+                )
                 profile_score = result['score']
                 speed_ratio   = result['speed_ratio']
                 group_scores  = result['group_scores']
@@ -527,7 +610,10 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                     e_dwell_std = float(profile_std[fn_list.index('dwell_mean')]) + 1e-9
                     e_dwell_std = max(e_dwell_std, e_dwell * 0.10, 20.0)
                     l_dwell     = _fv('dwell_mean')
-                    if l_dwell is not None:
+                    # Skip gate if enrolled profile is zeroed (sentinel for a
+                    # broken/untrained pickle) — otherwise z-score divides by
+                    # ~1e-9 and hard-rejects every login.
+                    if l_dwell is not None and e_dwell >= 20.0:
                         dwell_z = abs(l_dwell - e_dwell) / e_dwell_std
                         if dwell_z > 3.0:
                             hard_reject   = True
@@ -539,7 +625,7 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                     e_cpm_std = float(profile_std[fn_list.index('typing_speed_cpm')]) + 1e-9
                     e_cpm_std = max(e_cpm_std, e_cpm * 0.20)
                     l_cpm     = _fv('typing_speed_cpm')
-                    if l_cpm is not None:
+                    if l_cpm is not None and e_cpm >= 20.0:
                         cpm_z = abs(l_cpm - e_cpm) / e_cpm_std
                         if cpm_z > 5.0:
                             hard_reject   = True
@@ -665,12 +751,16 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
         except Exception as e:
             print(f"[keystroke] model error: {e}")
             import traceback; traceback.print_exc()
+            log_error("keystroke", payload.username, e,
+                      extra={"phase": "model_eval", "model_path": model_path})
             confidence    = 0.0
             authenticated = False
 
     else:
         # No trained model — hard reject until enrollment is complete.
         print(f"[keystroke] No model for '{payload.username}' — hard reject until model is trained")
+        log_auth_stage("keystroke", payload.username, "denied",
+                       score=0.0, extra={"reason": "no_model", "model_path": model_path})
         confidence    = 0.0
         authenticated = False
 
@@ -685,6 +775,27 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                 "granted" if authenticated else "denied",
                 template_maturity=_log_mat,
                 effective_threshold=_log_thr)
+
+    _extra = {
+        "maturity":      _log_mat,
+        "mode":          locals().get('mode'),
+        "model_type":    locals().get('model_type'),
+        "model_stage":   locals().get('model_stage'),
+        "rf_score":      locals().get('rf_score'),
+        "mah_score":     locals().get('mah_score'),
+        "profile_score": locals().get('profile_score'),
+        "speed_ratio":   locals().get('speed_ratio'),
+        "hard_reject":   locals().get('hard_reject'),
+        "reject_reason": locals().get('reject_reason') or None,
+    }
+    log_auth_stage(
+        "keystroke", payload.username,
+        "granted" if authenticated else "denied",
+        score=float(confidence),
+        threshold=float(_log_thr) if _log_thr is not None else None,
+        model=locals().get('model_type'),
+        extra={k: v for k, v in _extra.items() if v is not None},
+    )
 
     # ═════════════════════════════════════════════════════════════════
     # ADAPTIVE LEARNING
@@ -712,7 +823,11 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
     # Case B (keystroke failed, voice recovery will run): defer to /fuse —
     # it only saves if the *full* multi-factor pipeline grants access.
     if authenticated:
-        _save_keystroke_sample(db, user, payload, source="login_ks")
+        _save_keystroke_sample(
+            db, user, payload, source="login_ks",
+            ks_score=float(confidence),
+            effective_threshold=float(_log_thr) if _log_thr is not None else None,
+        )
     elif confidence > 0:
         # Case B: low confidence, voice recovery path — hold for fusion
         _pending_ks_samples[payload.username] = payload
@@ -776,6 +891,7 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
     except Exception as e:
         print(f"[voice] ECAPA error: {e}")
         import traceback; traceback.print_exc()
+        log_error("voice", payload.username, e, extra={"phase": "ecapa_predict"})
         confidence    = 0.0
         authenticated = False
 
@@ -909,13 +1025,30 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
     log_attempt(db, user.id, "voice", confidence,
                 "granted" if authenticated else "denied")
 
+    log_auth_stage(
+        "voice", payload.username,
+        "granted" if authenticated else "denied",
+        score=float(confidence),
+        model="ecapa-tdnn",
+        extra={
+            "ecapa_similarity": locals().get('ecapa_r', {}).get('similarity') if 'ecapa_r' in locals() else None,
+            "ecapa_threshold":  locals().get('ecapa_r', {}).get('threshold') if 'ecapa_r' in locals() else None,
+            "ecapa_note":       locals().get('ecapa_r', {}).get('error') if 'ecapa_r' in locals() else None,
+            "transcript":       transcript or None,
+            "expected_phrase":  expected_phrase or None,
+            "char_ratio":       locals().get('char_ratio'),
+            "word_overlap":     locals().get('word_overlap'),
+            "phonetic_ratio":   locals().get('phonetic_ratio'),
+            "phrase_final":     locals().get('final_score'),
+            "phrase_match":     locals().get('phrase_match'),
+            "phrase_error":     phrase_error or None,
+            "has_embedding":    bool(getattr(payload, 'ecapa_embedding', []) or []),
+        },
+    )
+
     # Handle failed voice attempts — count voice method only to avoid cross-method false lockout
     if not authenticated:
-        voice_denials = db.query(AuthLog).filter(
-            AuthLog.user_id == user.id,
-            AuthLog.auth_method == "voice",
-            AuthLog.result == "denied"
-        ).count()
+        voice_denials = _consecutive_denials(db, user.id, "voice")
         if voice_denials >= 10:
             user.is_flagged = True
             db.commit()
@@ -999,13 +1132,15 @@ def verify_security(payload: SecurityAuth, db: Session = Depends(get_db)):
                 1.0 if authenticated else 0.0,
                 "granted" if authenticated else "denied")
 
+    log_auth_stage(
+        "security_question", payload.username,
+        "granted" if authenticated else "denied",
+        score=1.0 if authenticated else 0.0,
+    )
+
     if not authenticated:
         # Require 3 failed security answers before flagging — one typo shouldn't lock an account
-        sq_denials = db.query(AuthLog).filter(
-            AuthLog.user_id == user.id,
-            AuthLog.auth_method == "security_question",
-            AuthLog.result == "denied"
-        ).count()
+        sq_denials = _consecutive_denials(db, user.id, "security_question")
         if sq_denials >= 3:
             user.is_flagged = True
             db.commit()
@@ -1080,9 +1215,11 @@ def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
         FUSED_THRESHOLD         = 0.58
         case_label              = "A (ks-passed, voice-confirms)"
     else:
-        # Case B: KS failed — voice is recovery, stricter threshold
+        # Case B: KS failed — voice is recovery, stricter threshold.
+        # Threshold at 0.62 (not 0.65) so a strong voice ≥0.95 can still
+        # recover when ks=0.0: 0.65*0.95 = 0.6175 ≈ 0.62.
         base_ks_w, base_voice_w = 0.35, 0.65
-        FUSED_THRESHOLD         = 0.65
+        FUSED_THRESHOLD         = 0.62
         case_label              = "B (ks-failed, voice-recovery)"
 
     # Scale keystroke weight by measured reliability; voice absorbs the rest.
@@ -1117,6 +1254,27 @@ def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
                     "granted" if granted else "denied",
                     template_maturity=fuse_maturity)
 
+    log_auth_stage(
+        "fusion", payload.username,
+        "granted" if granted else "denied",
+        score=float(fused),
+        threshold=float(FUSED_THRESHOLD),
+        extra={
+            "case":            case_label,
+            "ks_score":        round(ks, 4),
+            "voice_score":     round(voice, 4),
+            "ks_passed":       bool(payload.keystroke_passed),
+            "voice_passed":    bool(payload.voice_passed),
+            "ks_weight":       round(ks_w, 3),
+            "voice_weight":    round(voice_w, 3),
+            "ks_reliability":  round(ks_reliability, 3),
+            "voice_floor_ok":  bool(voice_floor_ok),
+            "voice_floor":     VOICE_FLOOR,
+            "maturity":        locals().get('fuse_maturity'),
+            "reason":          reason or None,
+        },
+    )
+
     # ── Save pending keystroke sample (Case B: voice recovery path) ───────────
     # Case A samples (keystroke granted directly) were already saved in
     # verify_keystroke.  Here we only handle Case B: keystroke failed but
@@ -1124,7 +1282,10 @@ def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
     if granted:
         ks_payload = _pending_ks_samples.pop(payload.username, None)
         if ks_payload and user:
-            _save_keystroke_sample(db, user, ks_payload, source="login_fusion")
+            _save_keystroke_sample(
+                db, user, ks_payload, source="login_fusion",
+                ks_score=float(ks),
+            )
     else:
         # Login denied — discard the cached sample, do not save
         discarded = _pending_ks_samples.pop(payload.username, None)

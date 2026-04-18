@@ -12,7 +12,7 @@
 #                     rhythm is very different from the genuine user.
 #       Tier 3 (30%): Random impostors — original broad-range behaviour for
 #                     full input-space coverage.
-#  2. _strip_inactive() / _patch_impostor_digraphs(): CMU and enrolled-other-
+#  2. phrase-aware impostor patching: CMU and enrolled-other-
 #     user impostors previously had zeros for phrase-specific extra_ digraph
 #     columns (they typed a different phrase).  This caused the model to learn
 #     "extra_ = 0 → impostor" rather than learning timing patterns.  We now
@@ -126,6 +126,120 @@ HUMAN_RANGES = {
 }
 DIGRAPH_RANGE = (20, 300)
 
+MODEL_STAGE_EARLY_MAX = 7
+MODEL_STAGE_MID_MAX = 20
+PROFILE_MATCHER_THRESHOLD = MODEL_STAGE_MID_MAX
+
+EARLY_BASE_FEATURES = [
+    'dwell_mean', 'dwell_std',
+    'flight_mean', 'flight_std',
+    'p2p_mean',
+    'typing_speed_cpm',
+    'rhythm_cv',
+    'backspace_ratio',
+    'pause_count',
+    'dwell_mean_norm',
+    'flight_mean_norm',
+]
+
+MID_BASE_EXTRA_FEATURES = [
+    'p2p_std',
+    'r2r_mean', 'r2r_std',
+    'pause_mean',
+    'backspace_count',
+    'same_hand_sequence_mean',
+    'finger_transition_ratio',
+    'seek_time_mean',
+    'shift_lag_norm',
+]
+
+_DYNAMIC_LIMITS = {
+    # Early now carries 70% of its weight on digraph A+R measures, so the rank
+    # statistic needs enough pairs to be discriminative (minimum ~6–8 digraphs).
+    'early': {'digraph': 8,  'key': 0, 'flight': 0, 'trigraph': 0},
+    'mid':   {'digraph': 10, 'key': 3, 'flight': 5, 'trigraph': 0},
+    'late':  {'digraph': None, 'key': None, 'flight': None, 'trigraph': None},
+}
+
+
+def _determine_model_stage(n_enrollment: int) -> str:
+    """Cold-start profile stages inspired by commercial same-text systems."""
+    if n_enrollment <= MODEL_STAGE_EARLY_MAX:
+        return 'early'
+    if n_enrollment <= MODEL_STAGE_MID_MAX:
+        return 'mid'
+    return 'late'
+
+
+def _rank_dynamic_features(vectors: list, feat_names: list, candidates: list) -> list:
+    """
+    Rank sparse phrase-specific features by usefulness for early stages.
+
+    Preference order:
+      1. high coverage across enrollment samples
+      2. low within-user CV (stable for this typist)
+      3. higher mean (non-trivial signal)
+    """
+    if not vectors or not candidates:
+        return []
+
+    arr = np.asarray(vectors, dtype=np.float64)
+    idx = {name: i for i, name in enumerate(feat_names)}
+    ranked = []
+    for name in candidates:
+        col_idx = idx.get(name)
+        if col_idx is None:
+            continue
+        col = arr[:, col_idx]
+        nonzero = col[np.abs(col) > 1e-6]
+        coverage = len(nonzero) / max(len(col), 1)
+        if len(nonzero) == 0:
+            continue
+        mean = float(np.mean(nonzero))
+        std = float(np.std(nonzero))
+        cv = std / (abs(mean) + 1e-9)
+        ranked.append((name, coverage, cv, mean))
+
+    ranked.sort(key=lambda row: (-row[1], row[2], -row[3], row[0]))
+    return [name for name, *_ in ranked]
+
+
+def _select_stage_feature_names(stage: str, full_feat_names: list, genuine_vectors_full: list) -> list:
+    """
+    Keep the early stage dense and low-dimensional, then widen with maturity.
+    """
+    selected = set(EARLY_BASE_FEATURES)
+    if stage in ('mid', 'late'):
+        selected.update(MID_BASE_EXTRA_FEATURES)
+    if stage == 'late':
+        selected.update(full_feat_names)
+
+    digraph_candidates = [
+        name for name in full_feat_names
+        if name.startswith('digraph_') or name.startswith('extra_')
+    ]
+    key_candidates = [name for name in full_feat_names if name.startswith('key_')]
+    flight_candidates = [name for name in full_feat_names if name.startswith('flight_') and name not in {
+        'flight_mean', 'flight_std', 'flight_median', 'flight_mean_norm', 'flight_std_norm'
+    }]
+    trigraph_candidates = [name for name in full_feat_names if name.startswith('trigraph_')]
+
+    ranked = {
+        'digraph': _rank_dynamic_features(genuine_vectors_full, full_feat_names, digraph_candidates),
+        'key': _rank_dynamic_features(genuine_vectors_full, full_feat_names, key_candidates),
+        'flight': _rank_dynamic_features(genuine_vectors_full, full_feat_names, flight_candidates),
+        'trigraph': _rank_dynamic_features(genuine_vectors_full, full_feat_names, trigraph_candidates),
+    }
+
+    for group, limit in _DYNAMIC_LIMITS[stage].items():
+        names = ranked[group]
+        if limit is None:
+            selected.update(names)
+        else:
+            selected.update(names[:limit])
+
+    return [name for name in full_feat_names if name in selected]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  DATA EXTRACTION
@@ -143,8 +257,8 @@ def extract_feature_vector(template, extra_keys: list = None, key_keys: list = N
     trigraph_keys    : 3-letter sequences ['the','qui',...] — press[i]→press[i+2],
                        read from template.trigraph_map
 
-    Tail order matters — must match `active_feat_names` construction in
-    train_random_forest() and the n_tail count in _strip_inactive/_patch_impostor.
+    Tail order matters — must match the feature-name construction in
+    train_random_forest() and the auth-time vector rebuild.
     """
     vals = []
     for name in FEATURE_NAMES:
@@ -234,7 +348,7 @@ def load_real_impostors(db, exclude_user_id: int, n_genuine: int = 99):
     impostors   = []
     for u in other_users:
         # Load WITHOUT extra_keys — vectors stay at FEATURE_NAMES length.
-        # _strip_inactive() in train_random_forest() pads the user-specific
+        # train_random_forest() pads the user-specific
         # extra_pairs columns with zeros, which is correct: the impostor never
         # typed the genuine user's phrase so those bigram timings are unknown.
         samples = load_enrollment_samples(db, u.id)
@@ -672,30 +786,29 @@ def train_random_forest(username: str):
     # get_active_digraphs returns TWO values:
     #   standard_active : subset of the 27 hardcoded FEATURE_NAMES digraphs
     #   extra_pairs     : all other bigrams in the phrase (stored in extra_digraphs JSON)
-    standard_active, extra_pairs = get_active_digraphs(user_phrase)
-    key_keys          = get_active_key_dwells(user_phrase)
-    flight_pair_keys  = get_phrase_digraph_pairs(user_phrase)   # ALL phrase pairs (UD)
-    trigraph_keys     = get_active_trigraphs(user_phrase)
-    all_digraph_feats = {f for f in FEATURE_NAMES if f.startswith("digraph_")}
-    inactive_digraphs = all_digraph_feats - standard_active
-    drop_indices      = [i for i, n in enumerate(FEATURE_NAMES) if n in inactive_digraphs]
-    active_feat_names = (
-        [n for n in FEATURE_NAMES if n not in inactive_digraphs]
-        + [f"extra_{p}"    for p in extra_pairs]
-        + [f"key_{k}"      for k in key_keys]
-        + [f"flight_{p}"   for p in flight_pair_keys]
-        + [f"trigraph_{t}" for t in trigraph_keys]
+    standard_active, extra_pairs_all = get_active_digraphs(user_phrase)
+    key_keys_all          = get_active_key_dwells(user_phrase)
+    flight_pair_keys_all  = get_phrase_digraph_pairs(user_phrase)   # ALL phrase pairs (UD)
+    trigraph_keys_all     = get_active_trigraphs(user_phrase)
+    all_digraph_feats     = {f for f in FEATURE_NAMES if f.startswith("digraph_")}
+    inactive_digraphs_all = all_digraph_feats - standard_active
+    full_feat_names = (
+        list(FEATURE_NAMES)
+        + [f"extra_{p}"    for p in extra_pairs_all]
+        + [f"key_{k}"      for k in key_keys_all]
+        + [f"flight_{p}"   for p in flight_pair_keys_all]
+        + [f"trigraph_{t}" for t in trigraph_keys_all]
     )
 
     # Reload genuine samples WITH all four phrase-specific dict expansions.
     db2 = SessionLocal()
     try:
-        genuine_vectors = load_enrollment_samples(
+        genuine_vectors_full = load_enrollment_samples(
             db2, user_id,
-            extra_keys=extra_pairs, key_keys=key_keys,
-            flight_pair_keys=flight_pair_keys, trigraph_keys=trigraph_keys,
+            extra_keys=extra_pairs_all, key_keys=key_keys_all,
+            flight_pair_keys=flight_pair_keys_all, trigraph_keys=trigraph_keys_all,
         )
-        if not genuine_vectors:
+        if not genuine_vectors_full:
             print("❌ No valid enrollment samples found.")
             return None
     finally:
@@ -704,85 +817,94 @@ def train_random_forest(username: str):
         except Exception:
             pass
 
-    n_genuine_real = len(genuine_vectors)
+    n_genuine_real = len(genuine_vectors_full)
     print(f"\n  Enrollment samples loaded: {n_genuine_real}")
+    model_stage = _determine_model_stage(n_genuine_real)
+    print(f"  Feature stage      : {model_stage.upper()}")
         # ── Outlier trimming ──────────────────────────────────────────────────────
-    if len(genuine_vectors) >= 4:
+    if len(genuine_vectors_full) >= 4:
         dropped_total = 0
 
         # Trim by dwell_mean
-        dwell_idx = (active_feat_names.index('dwell_mean')
-                     if 'dwell_mean' in active_feat_names else None)
+        dwell_idx = (full_feat_names.index('dwell_mean')
+                     if 'dwell_mean' in full_feat_names else None)
         if dwell_idx is not None:
-            dwells       = np.array([v[dwell_idx] for v in genuine_vectors])
+            dwells       = np.array([v[dwell_idx] for v in genuine_vectors_full])
             median_dwell = np.median(dwells)
             std_dwell    = max(np.std(dwells), median_dwell * 0.10)
-            trimmed      = [v for v in genuine_vectors
+            trimmed      = [v for v in genuine_vectors_full
                             if abs(v[dwell_idx] - median_dwell) <= 2.5 * std_dwell]
-            dropped = len(genuine_vectors) - len(trimmed)
+            dropped = len(genuine_vectors_full) - len(trimmed)
             if dropped and len(trimmed) >= 3:
                 print(f"  ⚠  Dropped {dropped} outlier(s) by dwell_mean "
                       f"(> 2.5σ from median={median_dwell:.0f}ms)")
-                genuine_vectors = trimmed
+                genuine_vectors_full = trimmed
                 dropped_total += dropped
 
         # Trim by typing_speed_cpm — catches samples where the user typed
         # at a very different speed (e.g. 188 vs 341 cpm) that dwell trimming misses.
-        cpm_idx = (active_feat_names.index('typing_speed_cpm')
-                   if 'typing_speed_cpm' in active_feat_names else None)
-        if cpm_idx is not None and len(genuine_vectors) >= 4:
-            cpms       = np.array([v[cpm_idx] for v in genuine_vectors])
+        cpm_idx = (full_feat_names.index('typing_speed_cpm')
+                   if 'typing_speed_cpm' in full_feat_names else None)
+        # Require n >= 6 before CPM outlier trimming — with 5 samples,
+        # dropping one leaves n=4 which disables LOO in the profile matcher.
+        if cpm_idx is not None and len(genuine_vectors_full) >= 6:
+            cpms       = np.array([v[cpm_idx] for v in genuine_vectors_full])
             median_cpm = np.median(cpms)
             std_cpm    = max(np.std(cpms), median_cpm * 0.10)
-            trimmed    = [v for v in genuine_vectors
+            trimmed    = [v for v in genuine_vectors_full
                           if abs(v[cpm_idx] - median_cpm) <= 2.0 * std_cpm]
-            dropped = len(genuine_vectors) - len(trimmed)
+            dropped = len(genuine_vectors_full) - len(trimmed)
             if dropped and len(trimmed) >= 3:
                 print(f"  ⚠  Dropped {dropped} outlier(s) by typing_speed_cpm "
                       f"(> 2.0σ from median={median_cpm:.0f} cpm)")
-                genuine_vectors = trimmed
+                genuine_vectors_full = trimmed
                 dropped_total += dropped
 
         if dropped_total == 0:
-            print(f"  ✅ All {len(genuine_vectors)} enrollment samples passed outlier check")
-        elif len(genuine_vectors) < 3:
+            print(f"  ✅ All {len(genuine_vectors_full)} enrollment samples passed outlier check")
+        elif len(genuine_vectors_full) < 3:
             print(f"  ⚠  Outlier trimming skipped — would leave < 3 samples")
-    # Pre-compute extra-digraph stats from genuine enrollment so we can generate
-    # realistic (non-zero) values for real impostors who typed a different phrase.
-    # We do this BEFORE _strip_inactive is called so profile_mean/std are available.
-    # (They are computed from genuine_vectors right after this block.)
-    _extra_start_idx = len(FEATURE_NAMES) - len(inactive_digraphs)  # index in stripped vec where extra cols begin
+    trimmed_stage = _determine_model_stage(len(genuine_vectors_full))
+    if trimmed_stage != model_stage:
+        print(f"  Stage adjusted after trimming: {model_stage.upper()} -> {trimmed_stage.upper()}")
+        model_stage = trimmed_stage
+        n_genuine_real = len(genuine_vectors_full)
+    active_feat_names = _select_stage_feature_names(
+        model_stage, full_feat_names, genuine_vectors_full
+    )
+    extra_pairs = [name[len("extra_"):] for name in active_feat_names if name.startswith("extra_")]
+    key_keys = [name[len("key_"):] for name in active_feat_names if name.startswith("key_")]
+    flight_pair_keys = [
+        name[len("flight_"):] for name in active_feat_names
+        if name.startswith("flight_") and name not in {
+            'flight_mean', 'flight_std', 'flight_median',
+            'flight_mean_norm', 'flight_std_norm',
+        }
+    ]
+    trigraph_keys = [name[len("trigraph_"):] for name in active_feat_names if name.startswith("trigraph_")]
+    selected_hardcoded_digraphs = {
+        name for name in active_feat_names if name.startswith("digraph_")
+    }
+    inactive_digraphs = all_digraph_feats - selected_hardcoded_digraphs
 
-    def _strip_inactive(vecs, is_impostor: bool = False, rng_inst=None):
-        """
-        Strip inactive hardcoded digraphs from every vector.
+    full_idx = {name: i for i, name in enumerate(full_feat_names)}
+    base_idx = {name: i for i, name in enumerate(FEATURE_NAMES)}
 
-        For GENUINE vectors the extra_pairs columns are already appended and
-        contain real timing data — keep them as-is.
+    def _project_genuine_vectors(vecs):
+        return [
+            np.array([float(v[full_idx[name]]) for name in active_feat_names], dtype=np.float64)
+            for v in vecs
+        ]
 
-        For IMPOSTOR vectors (CMU / enrolled-other-user) the extra_pairs columns
-        are missing because those people typed a different phrase.  Instead of
-        padding with zeros (which taught the model 'zero extra_ = impostor'),
-        we inject phrase-plausible noise drawn from the genuine user's digraph
-        distribution shifted away by ±1.5–3 std.  This forces the model to
-        learn on TIMING differences, not on the zero/non-zero artifact.
-        """
-        _rng = rng_inst if rng_inst is not None else np.random.default_rng(99)
-        stripped = []
+    def _project_impostor_vectors(vecs):
+        projected = []
         for v in vecs:
-            base = np.delete(v[:len(FEATURE_NAMES)], drop_indices)
-            if not is_impostor and len(v) > len(FEATURE_NAMES):
-                # Genuine vector — real extra digraph + key_dwell timings already appended
-                tail = v[len(FEATURE_NAMES):]
-            else:
-                # Impostor vector — zero out phrase-specific columns; they get
-                # patched with realistic-but-distinct values by _patch_impostor_digraphs.
-                tail = np.zeros(
-                    len(extra_pairs) + len(key_keys)
-                    + len(flight_pair_keys) + len(trigraph_keys)
-                )
-            stripped.append(np.concatenate([base, tail]))
-        return stripped
+            row = []
+            for name in active_feat_names:
+                idx = base_idx.get(name)
+                row.append(float(v[idx]) if idx is not None and idx < len(v) else 0.0)
+            projected.append(np.array(row, dtype=np.float64))
+        return projected
 
     def _patch_impostor_digraphs(vecs, p_mean, p_std, rng_inst):
         """
@@ -792,22 +914,33 @@ def train_random_forest(username: str):
 
         This forces the model to distinguish on TIMING, not on zero vs non-zero.
         """
-        n_tail = (len(extra_pairs) + len(key_keys)
-                  + len(flight_pair_keys) + len(trigraph_keys))
-        if n_tail == 0:
+        dyn_cols = [
+            i for i, name in enumerate(active_feat_names)
+            if (name.startswith('extra_') or name.startswith('key_')
+                or name.startswith('trigraph_')
+                or (name.startswith('flight_') and name not in {
+                    'flight_mean', 'flight_std', 'flight_median',
+                    'flight_mean_norm', 'flight_std_norm',
+                }))
+        ]
+        if not dyn_cols:
             return vecs
-        tail_col_start = len(p_mean) - n_tail
         patched = []
         for v in vecs:
             v = v.copy()
-            for j in range(n_tail):
-                col    = tail_col_start + j
+            for col in dyn_cols:
+                name   = active_feat_names[col]
                 g_mean = p_mean[col]
                 g_std  = p_std[col]
                 min_sep = max(g_std * 1.5, g_mean * 0.15, 5.0)
                 for _ in range(20):
                     val = rng_inst.normal(g_mean, g_std * 2.5 + 15.0)
-                    val = float(np.clip(val, DIGRAPH_RANGE[0], DIGRAPH_RANGE[1]))
+                    if name.startswith('key_'):
+                        val = float(np.clip(val, 20.0, 300.0))
+                    elif name.startswith('trigraph_'):
+                        val = float(np.clip(val, 40.0, 500.0))
+                    else:
+                        val = float(np.clip(val, DIGRAPH_RANGE[0], DIGRAPH_RANGE[1]))
                     if abs(val - g_mean) >= min_sep:
                         break
                 v[col] = val
@@ -815,7 +948,7 @@ def train_random_forest(username: str):
         return patched
 
     _rng_patch = np.random.default_rng(77)
-    genuine_vectors = _strip_inactive(genuine_vectors, is_impostor=False)
+    genuine_vectors = _project_genuine_vectors(genuine_vectors_full)
 
     print(f"  User phrase      : '{user_phrase}'")
     print(f"  Standard active  : {len(standard_active)}  ({', '.join(sorted(standard_active)) or 'none'})")
@@ -851,7 +984,7 @@ def train_random_forest(username: str):
             print(f"    {label:20s}: {profile_mean[fn.index(feat)]:.3f}")
 
     # ── Hybrid model selection ────────────────────────────────────────────────
-    # With ≤ 10 real enrollment samples, a GBM/RF trained on synthetic augmentation
+    # With ≤ 15 real enrollment samples, a GBM/RF trained on synthetic augmentation
     # is unreliable: the augmented genuine cluster doesn't reflect real within-session
     # variance and the decision boundary lands inside the genuine distribution.
     #
@@ -861,10 +994,8 @@ def train_random_forest(username: str):
     #   - Tiered Z-tolerance: digraphs 1.8 | dwell/flight 2.2 | rhythm 2.8
     #   - Weighted group score: 40% digraphs | 40% dwell/flight | 20% rhythm
     #
-    # RF/GBM kicks in automatically once the user has built up ≥ 11 samples through
+    # RF/GBM kicks in automatically once the user has built up ≥ 16 samples through
     # adaptive learning (successful logins are saved back to the database).
-    PROFILE_MATCHER_THRESHOLD = 10   # switch to RF after this many real samples
-
     if n_genuine_real <= PROFILE_MATCHER_THRESHOLD:
         # Ensure ml/ is on sys.path so this import works whether train_keystroke_rf
         # is called standalone (already in ml/) or as a module from the backend.
@@ -882,8 +1013,31 @@ def train_random_forest(username: str):
             username         = username,
             user_id          = user_id,
             user_phrase      = user_phrase,
+            model_stage      = model_stage,
             threshold        = 0.65,
         )
+
+        # Sanity-check critical profile features before persisting. A zero
+        # mean here means the feature/vector projection misaligned and the
+        # pickle would hard-reject every real login. Fail loudly instead.
+        _critical_mins = {
+            'typing_speed_cpm': 20.0,
+            'dwell_mean':       20.0,
+            'flight_mean':       5.0,
+            'p2p_mean':         20.0,
+        }
+        _pm    = model_data.get('profile_mean')
+        _names = model_data.get('feature_names', [])
+        for _feat, _minv in _critical_mins.items():
+            if _feat in _names:
+                _v = float(_pm[_names.index(_feat)])
+                if _v < _minv:
+                    raise ValueError(
+                        f"Profile pickle refused: {_feat}={_v:.3f} below "
+                        f"sanity floor {_minv}. Likely a feature/vector "
+                        f"alignment bug in training — check full_feat_names "
+                        f"vs extract_feature_vector."
+                    )
 
         model_path = os.path.join(model_dir, f"{_safe_filename(username)}_keystroke_rf.pkl")
         with open(model_path, 'wb') as f:
@@ -891,7 +1045,7 @@ def train_random_forest(username: str):
 
         size_kb = os.path.getsize(model_path) / 1024
         print(f"\n  ✅ PROFILE MODEL SAVED: {model_path}  ({size_kb:.1f} KB)")
-        print(f"  Mode: Profile Matcher (n={n_genuine_real} ≤ {PROFILE_MATCHER_THRESHOLD})")
+        print(f"  Mode: Profile Matcher ({model_stage.upper()} stage, n={n_genuine_real} ≤ {PROFILE_MATCHER_THRESHOLD})")
         print(f"  Will upgrade to RF/GBM after {PROFILE_MATCHER_THRESHOLD + 1}+ enrollment samples\n")
         return model_path
 
@@ -900,8 +1054,8 @@ def train_random_forest(username: str):
 
     genuine_aug = generate_genuine_samples(genuine_vectors, n=n_aug, feat_names=active_feat_names)
 
-    cmu_impostors  = _strip_inactive(cmu_impostors,  is_impostor=True)
-    real_impostors = _strip_inactive(real_impostors, is_impostor=True)
+    cmu_impostors  = _project_impostor_vectors(cmu_impostors)
+    real_impostors = _project_impostor_vectors(real_impostors)
 
     # Now that profile_mean/std are computed, replace the placeholder zeros in
     # real impostor extra_ columns with realistic phrase-plausible timings.
@@ -1034,6 +1188,8 @@ def train_random_forest(username: str):
 
     model_data = {
         'pipeline':         pipeline,
+        'model_type':       'rf',
+        'model_stage':      model_stage,
         'feature_names':    active_feat_names,
         'username':         username,
         'user_id':          user_id,
@@ -1046,6 +1202,7 @@ def train_random_forest(username: str):
         'far':              float(far_f),
         'frr':              float(frr_f),
         'eer':              float(best_eer),
+        'ks_reliability':   float(np.clip(1.0 - frr_f, 0.15, 1.0)),
         'phrase':           user_phrase,
         # Phrase-specific dict-expansion key lists — required so predict_keystroke
         # can rebuild the same vector from the auth payload.

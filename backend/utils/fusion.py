@@ -15,7 +15,6 @@
 #     fuse_multimodal(keystroke_score, voice_score, ...) → dict
 
 import numpy as np
-from typing import Optional, Dict
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -38,15 +37,10 @@ VOICE_GBM_WEIGHT = 0.70
 VOICE_MAH_WEIGHT = 0.30
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  INTER-MODAL FUSION WEIGHTS
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Equal weighting — keystroke captures fine motor habit; voice captures
-# vocal-tract geometry. Neither modality dominates; 50/50 gives each equal
-# influence on the final authentication decision.
-MULTIMODAL_KEYSTROKE_WEIGHT = 0.50
-MULTIMODAL_VOICE_WEIGHT     = 0.50
+# Note: inter-modal (keystroke+voice) weights are NOT defined here — the
+# `/fuse` endpoint in routers/auth.py uses case-dependent weights (Case A
+# vs Case B) that depend on whether keystroke passed its own threshold.
+# See that endpoint for the authoritative inter-modal weighting.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,125 +99,3 @@ def fuse_voice_scores(gbm_score: float, mah_score: float) -> float:
     mah_score = float(np.clip(mah_score, 0.0, 1.0))
     return VOICE_GBM_WEIGHT * gbm_score + VOICE_MAH_WEIGHT * mah_score
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  INTER-MODAL FUSION FUNCTION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fuse_multimodal(
-    keystroke_score: Optional[float] = None,
-    voice_score: Optional[float] = None,
-    keystroke_threshold: float = 0.55,
-    voice_threshold: float = 0.50,
-    strategy: str = "weighted_sum",
-) -> Dict:
-    """
-    Inter-modal (multimodal) fusion of keystroke and voice confidence scores.
-
-    Handles partial availability gracefully: if one modality's model is not
-    yet trained (score = None), fusion falls back to the available modality
-    only rather than rejecting the attempt outright.
-
-    Parameters
-    ----------
-    keystroke_score     : float [0, 1] or None
-        Fused keystroke confidence from fuse_keystroke_scores(), or None if
-        the keystroke model has not been trained yet.
-    voice_score         : float [0, 1] or None
-        Fused voice confidence from fuse_voice_scores(), or None if the
-        voice model has not been trained yet.
-    keystroke_threshold : float
-        Per-user decision threshold for the keystroke modality (stored in pkl).
-    voice_threshold     : float
-        Per-user decision threshold for the voice modality (stored in pkl).
-    strategy            : str
-        Fusion rule — one of: 'weighted_sum' | 'and' | 'or' | 'min'.
-
-    Strategies
-    ----------
-    weighted_sum (default)
-        Normalised weighted average of available scores. Threshold is the
-        proportionally combined per-modality threshold. Best for balanced
-        systems where both modalities are reliable and enrolled.
-
-    and
-        BOTH modalities must independently exceed their thresholds. Most
-        secure; rejects if either modality fails. Use when both modalities
-        are fully enrolled and minimising FAR is the priority.
-
-    or
-        AT LEAST ONE modality must exceed its threshold. Most permissive;
-        useful during partial enrolment or as a fallback mode. Increases FAR
-        — use only when minimising FRR is the priority.
-
-    min
-        Fused score = min(available scores). The weakest modality dominates.
-        Conservative baseline suitable for high-security scenarios.
-
-    Returns
-    -------
-    dict with keys:
-        fused_score            : float [0, 1]   final combined score
-        decision               : bool            True = access granted
-        strategy               : str             strategy used
-        contributing_modalities: list[str]       modalities included
-        individual_scores      : dict[str,float] per-modality scores
-    """
-    available: Dict[str, float] = {}
-    if keystroke_score is not None:
-        available["keystroke"] = float(np.clip(keystroke_score, 0.0, 1.0))
-    if voice_score is not None:
-        available["voice"] = float(np.clip(voice_score, 0.0, 1.0))
-
-    if not available:
-        return {
-            "fused_score":             0.0,
-            "decision":                False,
-            "strategy":                strategy,
-            "contributing_modalities": [],
-            "individual_scores":       {},
-            "reason":                  "no biometric scores available",
-        }
-
-    thresholds = {
-        "keystroke": keystroke_threshold,
-        "voice":     voice_threshold,
-    }
-    weights = {
-        "keystroke": MULTIMODAL_KEYSTROKE_WEIGHT,
-        "voice":     MULTIMODAL_VOICE_WEIGHT,
-    }
-
-    if strategy == "weighted_sum":
-        total_w  = sum(weights[m] for m in available)
-        fused    = sum(available[m] * weights[m] for m in available) / total_w
-        thresh   = sum(thresholds[m] * weights[m] for m in available) / total_w
-        decision = fused >= thresh
-
-    elif strategy == "and":
-        decisions = {m: available[m] >= thresholds[m] for m in available}
-        decision  = all(decisions.values())
-        fused     = sum(available.values()) / len(available)
-
-    elif strategy == "or":
-        decisions = {m: available[m] >= thresholds[m] for m in available}
-        decision  = any(decisions.values())
-        fused     = sum(available.values()) / len(available)
-
-    elif strategy == "min":
-        fused    = min(available.values())
-        decision = fused >= min(thresholds[m] for m in available)
-
-    else:
-        raise ValueError(
-            f"Unknown fusion strategy: '{strategy}'. "
-            f"Valid options: weighted_sum, and, or, min."
-        )
-
-    return {
-        "fused_score":             float(np.clip(fused, 0.0, 1.0)),
-        "decision":                bool(decision),
-        "strategy":                strategy,
-        "contributing_modalities": list(available.keys()),
-        "individual_scores":       dict(available),
-    }

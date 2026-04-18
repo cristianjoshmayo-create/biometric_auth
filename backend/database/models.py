@@ -34,6 +34,11 @@ class KeystrokeTemplate(Base):
     enrollment_session = Column(Integer, default=1)
     sample_order       = Column(Integer, default=0)
     source             = Column(String(50), default="enrollment")
+    # Score this sample earned at save time. Used for quality-weighted eviction:
+    # when the adaptive pool overflows, the lowest-scoring adaptive row is evicted
+    # instead of the oldest, bounding centroid drift. Null for enrollment rows.
+    #   ALTER TABLE keystroke_templates ADD COLUMN IF NOT EXISTS saved_score FLOAT;
+    saved_score        = Column(Float, nullable=True)
 
     dwell_times  = Column(ARRAY(Float), nullable=False)
     flight_times = Column(ARRAY(Float), nullable=False)

@@ -148,10 +148,10 @@ async function submitKeystrokeAuth() {
             status.className = "text-center text-sm mb-4 text-green-400";
             setTimeout(() => moveToVoiceAuth(), 1200);
         } else {
-            // Failed keystroke — voice as recovery path
+            // Low keystroke confidence — voice needed for fusion decision
             recordFailedAttempt();
             status.textContent =
-                `⚠️ Keystroke low (${(_ksScore * 100).toFixed(1)}%) — trying voice for fusion…`;
+                `⚠️ Keystroke confidence low (${(_ksScore * 100).toFixed(1)}%) — confirming with voice for fusion…`;
             status.className = "text-center text-sm mb-4 text-yellow-400";
             setTimeout(() => moveToVoiceAuth(), 1200);
         }
@@ -252,8 +252,8 @@ async function onVoiceAuthComplete(fullFeatureDict) {
             recordFailedAttempt();
             const reason = fuseResult.reason ? ` (${fuseResult.reason})` : "";
             status.textContent =
-                `❌ Voice (${(_voiceScore * 100).toFixed(1)}%) — ` +
-                `fused: ${(fuseResult.fused_score * 100).toFixed(1)}%${reason} — proceeding to security question…`;
+                `❌ Combined confidence too low ` +
+                `(fused: ${(fuseResult.fused_score * 100).toFixed(1)}%)${reason} — proceeding to security question…`;
             status.className = "text-center text-sm mb-4 text-red-400";
             setTimeout(() => moveToSecurityAuth(), 1000);
         }
