@@ -45,6 +45,15 @@
 import sys
 import os
 
+# Force UTF-8 stdout/stderr so emoji/box-drawing prints don't crash on Windows
+# cp1252 consoles (which happens silently when training is launched as a
+# subprocess from auth.py — crash aborts training before the RF pkl is saved).
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 backend_path = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'backend'
 )
@@ -128,7 +137,7 @@ DIGRAPH_RANGE = (20, 300)
 
 MODEL_STAGE_EARLY_MAX = 7
 MODEL_STAGE_MID_MAX = 20
-PROFILE_MATCHER_THRESHOLD = MODEL_STAGE_MID_MAX
+PROFILE_MATCHER_THRESHOLD = 19
 
 EARLY_BASE_FEATURES = [
     'dwell_mean', 'dwell_std',
@@ -852,11 +861,11 @@ def train_random_forest(username: str):
             median_cpm = np.median(cpms)
             std_cpm    = max(np.std(cpms), median_cpm * 0.10)
             trimmed    = [v for v in genuine_vectors_full
-                          if abs(v[cpm_idx] - median_cpm) <= 2.0 * std_cpm]
+                          if abs(v[cpm_idx] - median_cpm) <= 2.5 * std_cpm]
             dropped = len(genuine_vectors_full) - len(trimmed)
             if dropped and len(trimmed) >= 3:
                 print(f"  ⚠  Dropped {dropped} outlier(s) by typing_speed_cpm "
-                      f"(> 2.0σ from median={median_cpm:.0f} cpm)")
+                      f"(> 2.5σ from median={median_cpm:.0f} cpm)")
                 genuine_vectors_full = trimmed
                 dropped_total += dropped
 
@@ -1263,6 +1272,18 @@ def predict_keystroke(username: str, feature_dict: dict) -> dict:
         return float(feature_dict.get(name, 0.0) or 0.0)
 
     vec = np.array([_get_val(n) for n in feat_names])
+
+    # Neutralize backspace features at scoring time.
+    # Why: enrollment samples are typed cleanly, so profile_std for these
+    # columns is ~0. A single live backspace makes diff²/var explode in
+    # Mahalanobis (→ score 0) and also trips RF splits learned on synthetic
+    # impostors with non-zero counts. The frontend's clean-press chain
+    # already strips corrected characters from all digraph/p2p/flight/trigraph
+    # timings, so the backspace count/ratio carry no additional genuine signal
+    # at auth time — zeroing them mirrors what the profile matcher does.
+    for _bs in ('backspace_ratio', 'backspace_count'):
+        if _bs in feat_names:
+            vec[feat_names.index(_bs)] = float(profile_mean[feat_names.index(_bs)])
 
     ok, reason = _is_quality_sample(vec, feat_names)
     if not ok:

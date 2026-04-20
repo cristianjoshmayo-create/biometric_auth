@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONIOENCODING=utf-8 venv310/Scripts/python.exe ml/train_keystroke_rf.py nayvejessica@gmail.com)",
+      "Bash(venv310/Scripts/python.exe -c ' *)"
+    ]
+  }
+}

@@ -1,113 +1,43 @@
 # ml/keystroke_profile_matcher.py
 #
-# TypingDNA-style per-user profile matcher for small enrollment sets (≤10 samples).
+# Keystroke matcher implementing TypingDNA's public approach literally
+# (Gunetti & Picardi, 2005). Scoring is ratio-based A-measure + rank-
+# displacement R-measure over per-digraph DD timings and per-key dwell
+# times only. Aggregate rhythm/hand/speed features may be present in the
+# feature vector but are ignored by the score.
 #
-# Key design decisions:
-#   1. No classifier training — direct comparison against enrollment profile (mean ± std).
-#      This sidesteps the augmentation quality problem: with only 5 real samples, any
-#      GBM/RF trains on fake data whose spread doesn't match real within-session variance.
+#   A = fraction of (live_i, ref_i) positions where max/min <= t (t=1.25)
+#   R = 1 - sum(|rank_live - rank_ref|) / floor(n^2 / 2)
+#   score = (A + R) / 2
 #
-#   2. Speed normalization.  All ms-valued timing features are divided by the speed ratio
-#      (live_p2p_mean / enrolled_p2p_mean) before computing Z-scores.  This handles the
-#      "tired fingers" / "different keyboard" problem: if the genuine user types 15% faster
-#      today, every digraph and dwell time scales proportionally and still matches.
+# Same-Text verification compares the live sample against each stored
+# enrollment vector individually, then combines the top matches.
 #
-#   3. Tiered Z-tolerance per feature group:
-#       Digraphs (digraph_*, extra_*) → Z ≤ 1.8  (tight — muscle-memory fingerprint)
-#       Dwell / flight ms             → Z ≤ 2.2  (medium — varies with fatigue)
-#       Rhythm / ratios / counts      → Z ≤ 2.8  (loose — changes with stress / context)
-#
-#   4. Adaptive digraph tolerance.  When speed ratio is extreme (< 0.65 or > 1.55),
-#      tighten digraph tolerance to Z ≤ 1.4 — someone typing at a very different overall
-#      speed whose individual digraph ratios don't scale proportionally is suspicious.
-#
-#   5. Weighted group scoring:
-#       digraphs:     40%  (highest discrimination power — inter-person muscle memory)
-#       dwell/flight: 40%  (strong signal — per-key hold time)
-#       rhythm/other: 20%  (weakest — too context-dependent for high weight)
-#
-# Score range: [0, 1].  Threshold is 0.65 by default (set at training time).
-# A genuine user with consistent enrollment typically scores 0.73–0.88.
-# An impostor with similar speed scores 0.48–0.63 because digraph muscle memory diverges.
+# Positions with either live or ref below ε (5ms) are excluded — they
+# represent digraphs that never fired and carry no signal.
 
 import numpy as np
 from typing import List, Optional
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Feature group classification
-# ──────────────────────────────────────────────────────────────────────────────
 
-# Features whose ms values scale proportionally with overall typing speed.
-# We normalize these by the live/enrolled p2p ratio before computing Z.
-_MS_TIMING_PREFIXES = (
-    'dwell_', 'flight_', 'p2p_', 'r2r_', 'rhythm_mean', 'rhythm_std',
-    'pause_mean', 'seek_time_mean', 'digraph_', 'extra_', 'key_',
-    'trigraph_',   # press[i]→press[i+2] elapsed ms — scales with overall speed
-)
-
-# Already-normalised or ratio features — do NOT speed-normalize again.
-_NO_NORMALIZE = {
-    'dwell_mean_norm', 'dwell_std_norm', 'flight_mean_norm', 'flight_std_norm',
-    'p2p_std_norm', 'r2r_mean_norm', 'shift_lag_norm',
-    'rhythm_cv', 'backspace_ratio', 'hand_alternation_ratio',
-    'finger_transition_ratio',
-    'pause_count', 'backspace_count', 'seek_time_count',
-    'typing_speed_cpm',   # CPM is inverse of time — already normalised
-    'typing_duration',    # total seconds — do not scale
-    'same_hand_sequence_mean',
-}
-
-# Binary Z-tolerance still used for aggregate dwell/flight + rhythm.
-_STAGE_CFG = {
-    # Cold start — TypingDNA-style: lean on digraph A-measure (dist) + R-measure (rank).
-    # Aggregate dwell/rhythm are demoted to supporting signals because their std estimate
-    # from 5-7 samples is too noisy to discriminate similar-speed impostors. Rank is
-    # scale-invariant by construction so it works well with small enrollments.
-    'early': {
-        'z_tol': {'dwell_flight': 2.2, 'rhythm': 2.6},
-        'weights': {'digraph_dist': 0.40, 'digraph_rank': 0.30, 'dwell_flight': 0.20, 'rhythm': 0.10},
-        'dist_mean_z_max': 3.6,
-        'z_cap': 6.0,
-        'digraph_dist_floor': 0.15,
-        'digraph_rank_floor': 0.15,
-        'std_cap': {'digraph': 0.30, 'dwell_flight': 0.28, 'rhythm': 0.40},
-    },
-    # Mid stage: bring phrase-specific timing back in, but keep rank modest.
-    'mid': {
-        'z_tol': {'dwell_flight': 2.0, 'rhythm': 2.4},
-        'weights': {'digraph_dist': 0.45, 'digraph_rank': 0.05, 'dwell_flight': 0.35, 'rhythm': 0.15},
-        'dist_mean_z_max': 3.2,
-        'z_cap': 5.0,
-        'digraph_dist_floor': 0.20,
-        'digraph_rank_floor': 0.20,
-        'std_cap': {'digraph': 0.27, 'dwell_flight': 0.26, 'rhythm': 0.37},
-    },
-    # Mature profile matcher stage, just before the learned model takes over.
-    'late': {
-        'z_tol': {'dwell_flight': 1.8, 'rhythm': 2.2},
-        'weights': {'digraph_dist': 0.55, 'digraph_rank': 0.10, 'dwell_flight': 0.25, 'rhythm': 0.10},
-        'dist_mean_z_max': 3.0,
-        'z_cap': 5.0,
-        'digraph_dist_floor': 0.25,
-        'digraph_rank_floor': 0.30,
-        'std_cap': {'digraph': 0.25, 'dwell_flight': 0.25, 'rhythm': 0.35},
-    },
-}
+# Fixed GP tolerance — TypingDNA's published ratio bound.
+_T_RATIO = 1.25
+# Positions below this many ms are treated as "missing" (digraph didn't fire).
+_EPS_MS = 5.0
+# Minimum number of valid positions for A+R to be meaningful.
+_MIN_VALID = 4
 
 
-def _get_stage_cfg(model_stage: Optional[str]) -> dict:
-    stage = (model_stage or 'mid').lower()
-    return _STAGE_CFG.get(stage, _STAGE_CFG['mid'])
+def _is_scoring_feature(name: str) -> bool:
+    """TypingDNA scoring uses only digraph DD timings and per-key dwells."""
+    return (name.startswith('digraph_')
+            or name.startswith('extra_')
+            or name.startswith('key_')
+            or name.startswith('trigraph_'))
 
 
 def _classify_feature(name: str) -> str:
-    """
-    Return the group name for a feature.
-
-    Per-key dwells (`key_*`) and trigraphs (`trigraph_*`) are person-specific
-    muscle-memory signals — they belong with digraphs, not in dwell_flight
-    (which is for aggregate ms-timings).
-    """
+    """Group label used only for diagnostic output."""
     if (name.startswith('digraph_') or name.startswith('extra_')
             or name.startswith('key_') or name.startswith('trigraph_')):
         return 'digraph'
@@ -117,247 +47,231 @@ def _classify_feature(name: str) -> str:
     return 'rhythm'
 
 
-def _rank_agreement(live_vals: np.ndarray, mean_vals: np.ndarray) -> float:
+def _stable_ranks(arr: np.ndarray) -> np.ndarray:
+    """1-indexed ranks; ties broken stably by index order."""
+    order = np.argsort(arr, kind='stable')
+    ranks = np.empty_like(order)
+    ranks[order] = np.arange(1, len(arr) + 1)
+    return ranks
+
+
+def _gp_score(live: np.ndarray, ref: np.ndarray) -> tuple:
     """
-    Fraction of digraph pairs whose relative ordering in `live` matches
-    the ordering in the enrolled mean profile (Gunetti–Picardi R-measure).
-
-    Returns a value in [0.5, 1.0] for typical inputs (0.5 = random ordering,
-    1.0 = identical ordering). The caller should remap to [0, 1] via
-    max(0, 2*frac - 1) so random ordering gets score 0.
+    Return (A, R, n_valid) on aligned (live, ref) timing vectors.
+    Filters positions where either side is below ε.
     """
-    n = len(live_vals)
-    if n < 2:
-        return 1.0
-    concordant = 0
-    total = 0
-    for i in range(n):
-        li, mi = live_vals[i], mean_vals[i]
-        for j in range(i + 1, n):
-            dl = li - live_vals[j]
-            dm = mi - mean_vals[j]
-            # Ignore pairs where either profile or live treats them as tied —
-            # they carry no ordering signal.
-            if abs(dl) < 1.0 or abs(dm) < 1.0:
-                continue
-            total += 1
-            if (dl > 0) == (dm > 0):
-                concordant += 1
-    if total == 0:
-        return 1.0
-    return concordant / total
+    valid = (live >= _EPS_MS) & (ref >= _EPS_MS)
+    n = int(valid.sum())
+    if n < _MIN_VALID:
+        return 0.0, 0.0, n
 
+    vl = live[valid]
+    vr = ref[valid]
 
-def _is_ms_timing(name: str) -> bool:
-    """True if this feature should be speed-normalized (its value is in ms and scales with speed)."""
-    if name in _NO_NORMALIZE:
-        return False
-    return any(name.startswith(p) for p in _MS_TIMING_PREFIXES)
+    ratios = np.maximum(vl, vr) / np.minimum(vl, vr)
+    A = float(np.mean(ratios <= _T_RATIO))
+
+    rl = _stable_ranks(vl)
+    rr = _stable_ranks(vr)
+    max_disp = (n * n) // 2
+    if max_disp <= 0:
+        R = 1.0
+    else:
+        disp = float(np.sum(np.abs(rl - rr)))
+        R = float(1.0 - disp / max_disp)
+    return A, R, n
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Core scoring function
+#  Core scoring
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_profile_score(
     live_vec:     np.ndarray,
     feat_names:   List[str],
     profile_mean: np.ndarray,
-    profile_std:  np.ndarray,
+    profile_std:  np.ndarray,          # accepted for signature compatibility; unused
     model_stage:  Optional[str] = None,
 ) -> dict:
-    """
-    Score a login attempt against the user's enrollment profile.
-
-    Parameters
-    ----------
-    live_vec     : 1-D feature vector from the login attempt (same feature order as enrollment)
-    feat_names   : list of feature name strings (same length as live_vec / profile arrays)
-    profile_mean : per-feature mean over enrollment samples
-    profile_std  : per-feature std over enrollment samples (with 1e-9 floor already added)
-
-    Returns
-    -------
-    dict with keys:
-        score       : float in [0, 1]  (higher = more genuine)
-        speed_ratio : float  (live / enrolled p2p_mean, clamped [0.5, 2.0])
-        group_scores: dict   {group_name: fraction_within_tolerance}
-        details     : list of (feature_name, z_score, within_tol) for debugging
-    """
+    """Gunetti-Picardi A+R score against a single reference vector."""
     fn = list(feat_names)
-    live = np.asarray(live_vec, dtype=np.float64)
-    pmean = np.asarray(profile_mean, dtype=np.float64)
-    pstd  = np.asarray(profile_std,  dtype=np.float64)
-    cfg = _get_stage_cfg(model_stage)
-    z_tol = cfg['z_tol']
-    weights = cfg['weights']
-    dist_mean_z_max = float(cfg['dist_mean_z_max'])
-    z_cap = float(cfg['z_cap'])
-    digraph_dist_floor = float(cfg['digraph_dist_floor'])
-    digraph_rank_floor = float(cfg['digraph_rank_floor'])
+    live_all = np.asarray(live_vec,     dtype=np.float64)
+    ref_all  = np.asarray(profile_mean, dtype=np.float64)
 
-    # ── Speed normalization ────────────────────────────────────────────────────
-    p2p_idx = fn.index('p2p_mean') if 'p2p_mean' in fn else None
-    if p2p_idx is not None and pmean[p2p_idx] > 1e-6 and live[p2p_idx] > 1e-6:
-        speed_ratio = float(np.clip(live[p2p_idx] / pmean[p2p_idx], 0.5, 2.0))
+    score_idx = [i for i, n in enumerate(fn) if _is_scoring_feature(n)]
+
+    # Purely informational — for logs. Not used in scoring.
+    if 'p2p_mean' in fn:
+        p = fn.index('p2p_mean')
+        if ref_all[p] > 1e-6 and live_all[p] > 1e-6:
+            speed_ratio = float(np.clip(live_all[p] / ref_all[p], 0.25, 4.0))
+        else:
+            speed_ratio = 1.0
     else:
         speed_ratio = 1.0
 
-    _STD_CAP = cfg['std_cap']
+    if not score_idx:
+        return {
+            'score':        0.0,
+            'speed_ratio':  speed_ratio,
+            'group_scores': {
+                'digraph_dist': 0.0, 'digraph_rank': 0.0,
+                'dwell_flight': 1.0, 'rhythm': 1.0,
+                'digraph_mean_z': 0.0,
+                'floor_breach': 'no scoring features in feat_names',
+                'stage': (model_stage or 'mid').lower(),
+                'n_valid': 0,
+            },
+            'details': [(n, 0.0, _classify_feature(n)) for n in fn],
+        }
 
-    # ── Per-feature Z-scores ───────────────────────────────────────────────────
-    digraph_z = []                                # |live-μ|/σ for digraph features
-    digraph_live_norm = []                        # speed-normalized live values
-    digraph_mean_ref  = []                        # enrollment means
-    group_hits = {'dwell_flight': [], 'rhythm': []}
-    details    = []
+    live = live_all[score_idx]
+    ref  = ref_all[score_idx]
+    A, R, n_valid = _gp_score(live, ref)
 
+    score = (A + R) / 2.0
+
+    # Per-feature diagnostic: ratio-1 as a stand-in for "distance" so the
+    # auth.py top-N diag dump still produces something meaningful.
+    details = []
     for i, name in enumerate(fn):
-        enr_mean = float(pmean[i])
         grp = _classify_feature(name)
-        cap = _STD_CAP[grp]
-        enr_std = float(np.clip(
-            max(pstd[i], abs(enr_mean) * 0.03, 1.0),
-            0,
-            abs(enr_mean) * cap + 1.0
-        ))
-
-        norm_val = float(live[i])
-        if _is_ms_timing(name) and speed_ratio != 1.0:
-            norm_val = norm_val / speed_ratio
-
-        z = abs(norm_val - enr_mean) / enr_std
-
         if grp == 'digraph':
-            # Only include digraphs that carry signal — skip zero-mean features
-            # (happens when a digraph never fired during enrollment).
-            if enr_mean > 1e-6:
-                digraph_z.append(z)
-                digraph_live_norm.append(norm_val)
-                digraph_mean_ref.append(enr_mean)
+            l = float(live_all[i]); r = float(ref_all[i])
+            if l >= _EPS_MS and r >= _EPS_MS:
+                d = max(l, r) / min(l, r) - 1.0
+            else:
+                d = 0.0
+            details.append((name, float(d), grp))
         else:
-            group_hits[grp].append(z <= z_tol[grp])
+            details.append((name, 0.0, grp))
 
-        details.append((name, float(z), grp))
-
-    # ── Digraph distance sub-score (scaled Manhattan) ─────────────────────────
-    if digraph_z:
-        # Winsorize per-feature z to stop single-key spikes from torching mean_z.
-        z_arr = np.minimum(np.asarray(digraph_z), z_cap)
-        mean_z = float(z_arr.mean())
-        digraph_dist = float(np.clip(1.0 - mean_z / dist_mean_z_max, 0.0, 1.0))
-    else:
-        mean_z = 0.0
-        digraph_dist = 1.0
-
-    # ── Digraph rank sub-score (R-measure) ─────────────────────────────────────
-    if len(digraph_live_norm) >= 2:
-        frac = _rank_agreement(
-            np.asarray(digraph_live_norm),
-            np.asarray(digraph_mean_ref),
-        )
-        # Remap [0.5,1.0] → [0,1]; sub-0.5 (anti-correlated) clips to 0.
-        digraph_rank = float(max(0.0, 2.0 * frac - 1.0))
-    else:
-        digraph_rank = 1.0
-
-    # ── Aggregate group scores ─────────────────────────────────────────────────
-    def _frac(hits):
-        return (sum(hits) / len(hits)) if hits else 1.0
-    dwell_flight_score = float(_frac(group_hits['dwell_flight']))
-    rhythm_score       = float(_frac(group_hits['rhythm']))
-
-    group_scores = {
-        'digraph_dist': digraph_dist,
-        'digraph_rank': digraph_rank,
-        'dwell_flight': dwell_flight_score,
-        'rhythm':       rhythm_score,
-        'digraph_mean_z': mean_z,
-    }
-
-    total_score = (
-        weights['digraph_dist'] * digraph_dist
-        + weights['digraph_rank'] * digraph_rank
-        + weights['dwell_flight'] * dwell_flight_score
-        + weights['rhythm']       * rhythm_score
-    )
-
-    # ── Soft penalties on digraph sub-scores ───────────────────────────────────
-    # Both rank and dist floors now apply MULTIPLICATIVE penalties rather than
-    # hard-zeroing. A hard zero on rank produced FRR=100% on self-check for
-    # inconsistent typists whose enrollment samples pairwise-flip a handful of
-    # digraph orderings — the user is genuine, the phrase is short, and the
-    # sample size is 5, so a rank dip below 0.3 is common. Impostors still get
-    # heavily penalised by the compound of both penalties + the base weights.
-    floor_breach = None
-    if len(digraph_live_norm) >= 2 and digraph_rank_floor > 0 and digraph_rank < digraph_rank_floor:
-        floor_breach = f"digraph_rank={digraph_rank:.2f} < {digraph_rank_floor:.2f} (soft ×0.6)"
-        total_score *= 0.6
-    if digraph_z and digraph_dist < digraph_dist_floor:
-        note = f"digraph_dist={digraph_dist:.2f} < {digraph_dist_floor:.2f} (soft ×0.5)"
-        floor_breach = f"{floor_breach}; {note}" if floor_breach else note
-        total_score *= 0.5
-    group_scores['floor_breach'] = floor_breach
-    group_scores['stage'] = (model_stage or 'mid')
+    breach = None
+    if n_valid < _MIN_VALID:
+        breach = f'only {n_valid} valid positions (< {_MIN_VALID})'
 
     return {
-        'score':        float(np.clip(total_score, 0.0, 1.0)),
+        'score':        float(np.clip(score, 0.0, 1.0)),
         'speed_ratio':  speed_ratio,
-        'group_scores': group_scores,
+        'group_scores': {
+            'digraph_dist':   float(A),
+            'digraph_rank':   float(R),
+            'dwell_flight':   1.0,
+            'rhythm':         1.0,
+            'digraph_mean_z': 0.0,
+            'floor_breach':   breach,
+            'stage':          (model_stage or 'mid').lower(),
+            'n_valid':        n_valid,
+        },
         'details':      details,
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Profile builder (called from train_keystroke_rf.py)
+#  Same-Text set matching
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_set_match_score(
+    live_vec:        np.ndarray,
+    feat_names:      List[str],
+    genuine_vectors: list,
+    profile_std:     np.ndarray,        # unused; kept for signature compat
+    model_stage:     Optional[str] = None,
+    top_k:           Optional[int] = None,
+) -> dict:
+    """Best-of-N over stored enrollment vectors, weighted toward best match."""
+    per_sample = []
+    for sample_vec in genuine_vectors:
+        r = compute_profile_score(
+            live_vec, feat_names,
+            np.asarray(sample_vec, dtype=np.float64),
+            profile_std,
+            model_stage=model_stage,
+        )
+        per_sample.append(r)
+
+    scores = np.array([r['score'] for r in per_sample])
+    n = len(scores)
+    if top_k is None:
+        k = min(3, max(2, n // 2))
+    else:
+        k = min(int(top_k), n)
+    best_idx = np.argsort(scores)[-k:][::-1]
+    top_scores = scores[best_idx]
+
+    if k == 1:
+        weights = np.array([1.0])
+    elif k == 2:
+        weights = np.array([0.65, 0.35])
+    elif k == 3:
+        weights = np.array([0.55, 0.30, 0.15])
+    else:
+        weights = 0.55 * (0.55 ** np.arange(k))
+        weights = weights / weights.sum()
+    final = float(np.sum(top_scores * weights))
+
+    if k >= 2:
+        spread = float(top_scores.std())
+        confidence = float(np.clip(1.0 - spread * 2.0, 0.0, 1.0))
+    else:
+        confidence = 1.0
+
+    best = per_sample[int(best_idx[0])]
+    best['score']             = final
+    best['confidence']        = confidence
+    best['per_sample_scores'] = scores.tolist()
+    best['top_k_used']        = k
+    return best
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Profile model builder (called from train_keystroke_rf.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_profile_model(
-    genuine_vectors: list,
+    genuine_vectors:   list,
     active_feat_names: List[str],
-    username: str,
-    user_id: int,
-    user_phrase: str,
-    model_stage: Optional[str] = None,
-    threshold: float = 0.65,
+    username:          str,
+    user_id:           int,
+    user_phrase:       str,
+    model_stage:       Optional[str] = None,
+    threshold:         float = 0.65,
 ) -> dict:
     """
-    Build the serialisable profile model dict (same format as RF model dict,
-    but with model_type='profile' and no pipeline key).
-
-    threshold : accept if score >= threshold.  Default 0.62 — tuned for the
-                new scoring scheme (distance + R-measure + binary groups).
-                Genuine typically scores 0.70–0.85; similar-typist impostors
-                land in 0.35–0.55 due to the digraph rank sub-score.
+    Build the serialisable profile model dict.
+    Fixed threshold (default 0.65) — no per-user calibration. Inconsistent
+    typists get downweighted in fusion via `ks_reliability`, not by relaxing
+    the keystroke threshold itself.
     """
     vecs = np.array(genuine_vectors, dtype=np.float64)
     n_in = len(genuine_vectors)
 
     print(f"\n{'='*70}")
-    print(f"  KEYSTROKE PROFILE MATCHER  —  user: {username}")
+    print(f"  KEYSTROKE PROFILE MATCHER (GP A+R)  —  user: {username}")
     print(f"{'='*70}")
     print(f"  Enrollment samples : {n_in}")
     print(f"  Stage              : {(model_stage or 'mid').upper()}")
     print(f"  Feature dimensions : {len(active_feat_names)}")
+    print(f"  Scoring features   : "
+          f"{sum(1 for n in active_feat_names if _is_scoring_feature(n))} "
+          f"(digraph/key/trigraph)")
 
-    # ── LOO-based outlier rejection ────────────────────────────────────────────
-    # For each sample, score it against a profile built from the other n-1.
-    # Drop samples whose LOO score is > 1.5σ below the median — they disagree
-    # with the bulk of enrollment and would poison mean/std if retained.
+    # LOO outlier rejection: drop samples whose GP self-match is > 1.5σ below
+    # the median. Prevents one noisy sample from polluting the reference set.
     if n_in >= 5:
         loo_scores = []
         for i in range(n_in):
-            others = np.delete(vecs, i, axis=0)
-            m = others.mean(axis=0)
-            s = others.std(axis=0) + 1e-9
-            r = compute_profile_score(vecs[i], active_feat_names, m, s, model_stage=model_stage)
+            others = [genuine_vectors[j] for j in range(n_in) if j != i]
+            r = compute_set_match_score(
+                vecs[i], active_feat_names, others,
+                np.zeros(len(active_feat_names)), model_stage=model_stage,
+            )
             loo_scores.append(r['score'])
         loo_arr = np.array(loo_scores)
-        med     = float(np.median(loo_arr))
-        sigma   = float(np.std(loo_arr)) or 1e-6
-        cutoff  = med - 1.5 * sigma
+        med   = float(np.median(loo_arr))
+        sigma = float(np.std(loo_arr)) or 1e-6
+        cutoff = med - 1.5 * sigma
         keep_mask = loo_arr >= cutoff
-        # Never drop below 4 survivors
         if keep_mask.sum() < 4:
             keep_mask = np.ones(n_in, dtype=bool)
         dropped = n_in - int(keep_mask.sum())
@@ -373,7 +287,7 @@ def build_profile_model(
         print(f"  ⓘ  LOO outlier check skipped (need ≥ 5 samples, have {n_in})")
 
     profile_mean = vecs.mean(axis=0)
-    profile_std  = vecs.std(axis=0) + 1e-9   # floor for division safety
+    profile_std  = vecs.std(axis=0) + 1e-9   # retained for RF-path / diagnostic use
     n = len(genuine_vectors)
     fn = active_feat_names
     for label, feat in [
@@ -381,112 +295,122 @@ def build_profile_model(
         ("dwell_mean (ms)",  "dwell_mean"),
         ("flight_mean (ms)", "flight_mean"),
         ("typing_speed_cpm", "typing_speed_cpm"),
-        ("rhythm_cv",        "rhythm_cv"),
     ]:
         if feat in fn:
             idx = fn.index(feat)
             print(f"  {label:22s}: {profile_mean[idx]:.1f}  ±{profile_std[idx]:.1f}")
 
-    # Quick self-check: score each enrollment sample against the profile
+    # Self-check via leave-one-out set-matching: realistic preview of
+    # enrolled-user scores against the final reference set at auth time.
     self_scores = []
-    for v in genuine_vectors:
-        r = compute_profile_score(v, active_feat_names, profile_mean, profile_std, model_stage=model_stage)
+    for i, v in enumerate(genuine_vectors):
+        others = [genuine_vectors[j] for j in range(len(genuine_vectors)) if j != i]
+        if len(others) == 0:
+            r = compute_profile_score(v, active_feat_names, profile_mean, profile_std,
+                                      model_stage=model_stage)
+        else:
+            r = compute_set_match_score(v, active_feat_names, others, profile_std,
+                                        model_stage=model_stage)
         self_scores.append(r['score'])
     s_mean = float(np.mean(self_scores))
     s_std  = float(np.std(self_scores))
-    print(f"\n  Self-check scores (enrollment vs own profile):")
-    print(f"    min={min(self_scores):.3f}  mean={s_mean:.3f}  max={max(self_scores):.3f}  σ={s_std:.3f}")
+    print(f"\n  Self-check scores (LOO set-match):")
+    print(f"    min={min(self_scores):.3f}  mean={s_mean:.3f}  "
+          f"max={max(self_scores):.3f}  σ={s_std:.3f}")
 
-    # ── Per-user threshold calibration ─────────────────────────────────────────
-    # Use the user's own score distribution: threshold = mean - 2σ. Bounds
-    # widened from [0.50, 0.70] to [0.35, 0.70] so inconsistent typists (whose
-    # self-check scatter is wide) aren't pinned to a threshold above their
-    # own mean. Security is maintained by fusion + ks_reliability downweighting
-    # — keystroke alone is not expected to carry the decision.
-    auto_thr = s_mean - 2.0 * s_std
-    calibrated = float(np.clip(auto_thr, 0.35, 0.70))
-    # Final safety: if calibrated still rejects any enrolled sample, drop it
-    # to min(self_scores) - small margin, hard-floored at 0.30. Never save a
-    # profile that would lock out the user who just enrolled.
-    if any(s < calibrated for s in self_scores):
-        rescue = max(0.30, min(self_scores) - 0.02)
-        if rescue < calibrated:
-            print(f"  ⚠  Calibrated threshold {calibrated:.3f} would reject enrolled "
-                  f"samples; rescuing to {rescue:.3f}")
-            calibrated = rescue
-    print(f"  Calibrated threshold: {calibrated:.3f}  "
-          f"(raw mean-2σ={auto_thr:.3f}, default was {threshold:.2f})")
-    threshold = calibrated
+    # Fixed threshold, no calibration.
+    print(f"  Fixed threshold    : {threshold:.3f}  (no per-user calibration)")
     frr_at_thresh = sum(s < threshold for s in self_scores) / len(self_scores)
     print(f"    FRR at {threshold:.2f}: {frr_at_thresh:.0%}  "
-          f"({'OK' if frr_at_thresh == 0 else 'WARNING: genuine would be rejected'})")
+          f"({'OK' if frr_at_thresh == 0 else 'some enrollments would miss — expect fusion fallback'})")
 
-    # ── Adaptive-fusion reliability score ─────────────────────────────────────
-    # Quantifies how well the profile represents this user. Used by /fuse to
-    # down-weight keystroke for inconsistent typists. Floor at 0.15 so keystroke
-    # never contributes literally zero — it's still a minor signal.
+    # Reliability feeds adaptive fusion weighting in auth.py. Floor at 0.15 so
+    # keystroke retains a minimal contribution even for very inconsistent typists.
     ks_reliability = float(np.clip(1.0 - frr_at_thresh, 0.15, 1.0))
-    print(f"  Keystroke reliability: {ks_reliability:.2f}  "
-          f"(used for adaptive fusion weighting)")
+    print(f"  Keystroke reliability: {ks_reliability:.2f}  (for fusion weighting)")
+
+    # Inconsistency flag: high LOO σ OR low LOO mean means this user's typing
+    # varies enough that the global threshold will over-reject them. Auth-side
+    # threshold calibration uses these to relax the floor for these users only.
+    is_inconsistent = bool(s_std > 0.08 or s_mean < 0.70)
+    print(f"  Consistency        : {'INCONSISTENT' if is_inconsistent else 'stable'} "
+          f"(mean={s_mean:.2f}, σ={s_std:.2f})")
 
     return {
-        'model_type':    'profile',
-        'model_stage':   (model_stage or 'mid'),
-        'feature_names': active_feat_names,
-        'username':      username,
-        'user_id':       user_id,
-        'n_enrollment':  n,
-        'profile_mean':  profile_mean,
-        'profile_std':   profile_std,
-        'threshold':     threshold,
-        'phrase':        user_phrase,
-        'ks_reliability': ks_reliability,
+        'model_type':       'profile',
+        'model_stage':      (model_stage or 'mid'),
+        'feature_names':    active_feat_names,
+        'username':         username,
+        'user_id':          user_id,
+        'n_enrollment':     n,
+        'profile_mean':     profile_mean,
+        'profile_std':      profile_std,
+        'genuine_vectors':  [np.asarray(v, dtype=np.float64).tolist() for v in genuine_vectors],
+        'threshold':        threshold,
+        'phrase':           user_phrase,
+        'ks_reliability':   ks_reliability,
+        'self_score_mean':  s_mean,
+        'self_score_std':   s_std,
+        'is_inconsistent':  is_inconsistent,
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Standalone test
+#  Standalone self-test
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
     rng = np.random.default_rng(0)
 
-    feat_names = (
-        [f"digraph_ab", f"digraph_bc", f"extra_cd"]
-        + [f"dwell_{i}" for i in range(5)]
-        + [f"flight_{i}" for i in range(5)]
-        + [f"p2p_mean", f"p2p_std", f"r2r_mean"]
-        + [f"rhythm_cv", f"backspace_ratio", f"pause_count",
-           f"typing_speed_cpm", f"typing_duration", f"hand_alternation_ratio"]
-    )
+    # Build a mixed feat_names list: scoring features (digraph/key) + aggregates.
+    digraphs = [f"digraph_{c1}{c2}" for c1, c2 in
+                [('t','h'),('h','e'),('e',' '),(' ','q'),('q','u'),('u','i'),
+                 ('i','c'),('c','k'),('k',' '),(' ','b'),('b','r'),('r','o')]]
+    keys     = [f"key_{c}" for c in "thequickbrownfox"]
+    aggregates = ['dwell_mean', 'flight_mean', 'p2p_mean', 'rhythm_cv',
+                  'typing_speed_cpm', 'hand_alternation_ratio']
+    feat_names = digraphs + keys + aggregates
+    N = len(feat_names)
 
-    # Build a fake genuine profile (5 samples)
-    N_FEAT = len(feat_names)
-    base = rng.uniform(50, 200, size=N_FEAT)
-    enrollment = [base + rng.normal(0, base * 0.05) for _ in range(5)]
+    # Genuine user: each digraph+key timing has a per-person baseline (uniform)
+    # plus ~5% within-session noise.
+    base = np.concatenate([
+        rng.uniform(80, 220, size=len(digraphs)),     # DD ms
+        rng.uniform(60, 140, size=len(keys)),         # dwell ms
+        np.array([95.0, 85.0, 180.0, 0.35, 240.0, 0.55]),  # aggregates
+    ])
+    enrollment = [base + rng.normal(0, np.abs(base) * 0.05) for _ in range(5)]
 
-    model = build_profile_model(enrollment, feat_names, "test_user", 1, "abc phrase")
+    model = build_profile_model(enrollment, feat_names, "test_user", 1, "the quick brown")
 
-    # Genuine login (slight speed change — 10% faster today)
-    genuine_live = base.copy() * 0.90
-    genuine_live += rng.normal(0, base * 0.04)
-    r = compute_profile_score(genuine_live, feat_names, model['profile_mean'], model['profile_std'])
-    print(f"\nGenuine login score: {r['score']:.3f}  speed_ratio={r['speed_ratio']:.2f}")
-    print(f"  Groups: {r['group_scores']}")
+    # Genuine login: same person, different day (10% slower overall, 4% noise).
+    genuine = base.copy() * 1.10
+    genuine += rng.normal(0, np.abs(base) * 0.04)
+    g = compute_set_match_score(genuine, feat_names, enrollment,
+                                model['profile_std'], model_stage='mid')
+    print(f"\nGenuine login:   score={g['score']:.3f}  "
+          f"A={g['group_scores']['digraph_dist']:.2f} "
+          f"R={g['group_scores']['digraph_rank']:.2f} "
+          f"n_valid={g['group_scores']['n_valid']} "
+          f"conf={g.get('confidence', 1.0):.2f}")
 
-    # Realistic impostor: their own muscle memory, independently drawn from a
-    # different baseline.  Digraphs differ substantially; overall speed similar.
-    impostor_base = rng.uniform(40, 220, size=N_FEAT)  # different person's timing profile
-    impostor_live = impostor_base.copy()
-    # Adjust p2p_mean index so speed_ratio ~1 (similar overall speed, different digraphs)
-    p2p_i = feat_names.index('p2p_mean')
-    impostor_live[p2p_i] = base[p2p_i] * rng.uniform(0.92, 1.08)
-    impostor_live += rng.normal(0, impostor_base * 0.04)
-    r2 = compute_profile_score(impostor_live, feat_names, model['profile_mean'], model['profile_std'])
-    print(f"Impostor score:      {r2['score']:.3f}  speed_ratio={r2['speed_ratio']:.2f}")
-    print(f"  Groups: {r2['group_scores']}")
+    # Impostor: different person, similar overall speed (so naive speed
+    # gates can't tell them apart) but independent muscle memory.
+    impostor_base = np.concatenate([
+        rng.uniform(70, 230, size=len(digraphs)),
+        rng.uniform(55, 150, size=len(keys)),
+        np.array([90.0, 90.0, 180.0, 0.40, 240.0, 0.58]),  # matched aggregates
+    ])
+    impostor = impostor_base + rng.normal(0, np.abs(impostor_base) * 0.04)
+    i = compute_set_match_score(impostor, feat_names, enrollment,
+                                model['profile_std'], model_stage='mid')
+    print(f"Impostor login:  score={i['score']:.3f}  "
+          f"A={i['group_scores']['digraph_dist']:.2f} "
+          f"R={i['group_scores']['digraph_rank']:.2f} "
+          f"n_valid={i['group_scores']['n_valid']} "
+          f"conf={i.get('confidence', 1.0):.2f}")
 
     thr = model['threshold']
-    print(f"\nThreshold {thr:.2f}: genuine {'PASS' if r['score'] >= thr else 'FAIL'}  "
-          f"impostor {'PASS (BAD)' if r2['score'] >= thr else 'REJECT (good)'}")
+    print(f"\nThreshold {thr:.2f}: "
+          f"genuine  {'PASS ✓' if g['score'] >= thr else 'FAIL ✗'}   "
+          f"impostor {'PASS (BAD) ✗' if i['score'] >= thr else 'REJECT ✓'}")

@@ -1,0 +1,47 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Start Server (venv310)",
+      "type": "shell",
+      "command": "& .\\venv310\\Scripts\\Activate.ps1; cd backend; uvicorn main:app --host 127.0.0.1 --port 8000",
+      "options": {
+        "shell": {
+          "executable": "powershell.exe",
+          "args": ["-NoExit", "-Command"]
+        },
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "panel": "dedicated",
+        "group": "public",
+        "reveal": "always"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Start ngrok Tunnel",
+      "type": "shell",
+      "command": "& .\\venv310\\Scripts\\Activate.ps1; .\\ngrok.exe http 8000",
+      "options": {
+        "shell": {
+          "executable": "powershell.exe",
+          "args": ["-NoExit", "-Command"]
+        },
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "panel": "dedicated",
+        "group": "public",
+        "reveal": "always"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Start Public (Server + ngrok)",
+      "dependsOn": ["Start Server (venv310)", "Start ngrok Tunnel"],
+      "dependsOrder": "parallel",
+      "problemMatcher": []
+    }
+  ]
+}

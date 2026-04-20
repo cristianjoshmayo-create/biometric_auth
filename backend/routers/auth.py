@@ -35,7 +35,7 @@ MAX_SAMPLES = 50
 # count against this — only source in ('login_ks','login_fusion') are adaptive.
 # When the cap is hit, the lowest-scoring adaptive row is evicted so the pool
 # self-cleans toward the user's strongest patterns instead of drifting with age.
-MAX_ADAPTIVE = 15
+MAX_ADAPTIVE = 30
 
 def _safe_filename(username: str) -> str:
     """Sanitize email for use as filename. user@gmail.com → user_at_gmail_com"""
@@ -245,6 +245,18 @@ def _effective_keystroke_threshold(stored_threshold: float, maturity: int) -> fl
     return _RAMP_THRESHOLD + progress * (float(stored_threshold) - _RAMP_THRESHOLD)
 
 
+def _personalize_threshold(base: float, s_mean: float, s_std: float,
+                           is_inconsistent: bool) -> float:
+    # TypingDNA-style per-user calibration: for users whose LOO self-check shows
+    # high variance or a low mean, relax the bar toward `s_mean - 2σ` so their
+    # own genuine lower tail fits above threshold. Never drops below SOFT and
+    # never raises above the base — we only loosen for inconsistent typists.
+    if not is_inconsistent or s_std <= 0:
+        return base
+    personalized = max(_SOFT_THRESHOLD, s_mean - 2.0 * s_std)
+    return min(base, personalized)
+
+
 def _consecutive_denials(db: Session, user_id: int, method: str) -> int:
     # Count denials since the user's last granted attempt for this method.
     # Why: the old all-time count permanently flagged accounts once lifetime
@@ -294,18 +306,11 @@ def verify_password(payload: PasswordAuth, db: Session = Depends(get_db)):
                 1.0 if authenticated else 0.0,
                 "granted" if authenticated else "denied")
 
-    if not authenticated:
-        pw_denials = _consecutive_denials(db, user.id, "password")
-        if pw_denials >= 5:
-            user.is_flagged = True
-            db.commit()
-
     log_auth_stage(
         "password", email,
         "granted" if authenticated else "denied",
         score=1.0 if authenticated else 0.0,
         threshold=1.0,
-        extra={"flagged_now": bool(user.is_flagged)},
     )
 
     return {
@@ -332,16 +337,19 @@ def _save_keystroke_sample(
       - verify_keystroke  : when keystroke alone grants access
       - fuse_scores       : when voice recovery + fusion grants access
     """
-    # Quality gate: borderline samples drifted the profile centroid on multiple
-    # users (Jessica, Albaniathea) — after ~7 adaptive absorbs, genuine typing
-    # was scoring 0.15–0.48. Only feed back samples the template already fits
-    # well, so retraining tightens rather than widens the cluster.
+    # TypingDNA-style save gate: the auth threshold IS the quality bar.
+    # A second stricter gate locks out inconsistent typists whose genuine
+    # scores cluster near threshold — the adaptive loop never learns their
+    # variance. If a sample passed auth, it's genuine enough to absorb.
+    # For fusion saves (voice recovered a keystroke-fail), require the sample
+    # to have come close to the auth threshold on its own — otherwise voice
+    # would drag the keystroke pool off-profile.
     if ks_score is not None:
+        thr = float(effective_threshold) if effective_threshold is not None else 0.50
         if source == "login_ks":
-            thr = float(effective_threshold) if effective_threshold is not None else 0.55
-            quality_bar = max(thr + 0.05, 0.62)
+            quality_bar = thr
         elif source == "login_fusion":
-            quality_bar = 0.55
+            quality_bar = thr
         else:
             quality_bar = 0.0
         if ks_score < quality_bar:
@@ -353,29 +361,23 @@ def _save_keystroke_sample(
             KeystrokeTemplate.user_id == user.id
         ).count()
 
-        # Quality-weighted eviction over the ADAPTIVE pool only. Enrollment rows
-        # are pinned (never deleted) so the anchor patterns survive indefinitely.
-        # When the adaptive cap is hit, drop the weakest-scoring adaptive row —
-        # NOT the oldest — so the pool trends toward the user's best samples.
+        # TypingDNA-style FIFO eviction over the ADAPTIVE pool only. Enrollment
+        # rows are pinned. When the cap is hit, drop the OLDEST adaptive row —
+        # not the weakest — so the pool preserves diversity and drifts with how
+        # the user currently types. A strict-monotonic "must beat weakest" gate
+        # locks out inconsistent genuine typists once a few high-scoring samples
+        # seed the pool; FIFO avoids that failure mode.
         adaptive_q = db.query(KeystrokeTemplate).filter(
             KeystrokeTemplate.user_id == user.id,
             KeystrokeTemplate.source.in_(["login_ks", "login_fusion"]),
         )
         adaptive_count = adaptive_q.count()
         if adaptive_count >= MAX_ADAPTIVE:
-            weakest = adaptive_q.order_by(
-                KeystrokeTemplate.saved_score.asc().nullsfirst(),
-                KeystrokeTemplate.sample_order.asc(),
+            oldest = adaptive_q.order_by(
+                KeystrokeTemplate.sample_order.asc()
             ).first()
-            if weakest:
-                # Refuse to absorb a new sample that is worse than the weakest
-                # one already in the pool — otherwise the pool only degrades.
-                incoming = float(ks_score) if ks_score is not None else 0.0
-                existing = float(weakest.saved_score) if weakest.saved_score is not None else 0.0
-                if incoming <= existing:
-                    print(f"  🚫 Keystroke sample not saved — incoming {incoming:.3f} ≤ weakest in pool {existing:.3f}")
-                    return
-                db.delete(weakest)
+            if oldest:
+                db.delete(oldest)
                 db.flush()
 
         max_order = db.query(func.max(KeystrokeTemplate.sample_order)).filter(
@@ -520,8 +522,6 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == payload.username).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if user.is_flagged:
-        raise HTTPException(status_code=403, detail="Account flagged")
 
     model_path = os.path.join(_model_dir(), f"{_safe_filename(payload.username)}_keystroke_rf.pkl")
 
@@ -536,6 +536,12 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
             profile_mean = model_data['profile_mean']
             stored_threshold = model_data['threshold']
 
+            # Per-user consistency signals (present on profile models only; RF
+            # models trained before this field was added fall back to defaults).
+            s_mean = float(model_data.get('self_score_mean', 1.0))
+            s_std  = float(model_data.get('self_score_std',  0.0))
+            is_inconsistent = bool(model_data.get('is_inconsistent', False))
+
             # Progressive threshold: relaxed during template stabilization.
             maturity  = _keystroke_maturity(db, user.id)
             threshold = _effective_keystroke_threshold(stored_threshold, maturity)
@@ -543,6 +549,9 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                     "RAMP" if maturity < _RAMP_MATURITY_END else "HARD")
             print(f"[keystroke] stage={model_stage}  maturity={maturity}  mode={mode}  "
                   f"effective_threshold={threshold:.2f}  (stored={stored_threshold:.2f})")
+            if is_inconsistent:
+                print(f"[keystroke] inconsistent profile: mean={s_mean:.2f} σ={s_std:.2f} "
+                      f"→ will relax toward {max(_SOFT_THRESHOLD, s_mean - 2*s_std):.2f}")
 
             # Build live feature vector. Must route prefixed feature names to the
             # correct source dict. Previously only extra_* and key_* were handled,
@@ -572,105 +581,82 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                 for name in feat_names
             ])
 
-            # ── Profile Matcher path (≤10 enrollment samples) ─────────────────
+            # ── Profile Matcher path (≤20 enrollment samples) ─────────────────
             if model_type == 'profile':
-                print(f"[keystroke] Using Profile Matcher for '{payload.username}'")
-                # Profile path lacks Mahalanobis — keep an absolute safety
-                # floor of 0.50 so SOFT mode can't drop below it, but do NOT
-                # override a higher per-user calibrated threshold.
-                if threshold < 0.50:
-                    print(f"  ⚠  Profile-path threshold floor: {threshold:.2f} → 0.50")
-                    threshold = 0.50
+                print(f"[keystroke] Using Profile Matcher (GP A+R) for '{payload.username}'")
+                # TypingDNA-literal: fixed stored threshold, no maturity ramp.
+                # The maturity ramp was designed for the old Z-score matcher whose
+                # enrollment σ was noisy at low n. GP A+R is scale-aware via the
+                # ratio test and rank-invariant, so it needs no warmup relaxation.
+                if threshold != stored_threshold:
+                    print(f"  Using stored threshold {stored_threshold:.2f} "
+                          f"(ignoring maturity ramp → {threshold:.2f})")
+                    threshold = stored_threshold
+                personalized = _personalize_threshold(threshold, s_mean, s_std, is_inconsistent)
+                if personalized < threshold:
+                    print(f"  ⚑ Inconsistent typist — relaxing threshold "
+                          f"{threshold:.2f} → {personalized:.2f} (mean={s_mean:.2f}, σ={s_std:.2f})")
+                    threshold = personalized
                 _project_root = os.path.normpath(os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), '..', '..'
                 ))
                 if _project_root not in sys.path:
                     sys.path.insert(0, _project_root)
-                from ml.keystroke_profile_matcher import compute_profile_score
+                from ml.keystroke_profile_matcher import compute_profile_score, compute_set_match_score
                 profile_std = model_data['profile_std']
-                result = compute_profile_score(
-                    vec, feat_names, profile_mean, profile_std, model_stage=model_stage
-                )
+                # TypingDNA Same-Text style: if raw enrollment vectors were
+                # stored at training time, score against each individually and
+                # take top-3 mean — preserves per-pattern variance instead of
+                # collapsing to one blurred centroid.
+                genuine_vectors = model_data.get('genuine_vectors')
+                if genuine_vectors:
+                    result = compute_set_match_score(
+                        vec, feat_names, genuine_vectors, profile_std,
+                        model_stage=model_stage,
+                    )
+                    _k = result.get('top_k_used', '?')
+                    _conf = result.get('confidence', 1.0)
+                    print(f"  🎯 Set-match: top-{_k} weighted={result['score']:.3f} conf={_conf:.2f} | per-sample={[f'{s:.2f}' for s in result['per_sample_scores']]}")
+                else:
+                    result = compute_profile_score(
+                        vec, feat_names, profile_mean, profile_std, model_stage=model_stage
+                    )
                 profile_score = result['score']
                 speed_ratio   = result['speed_ratio']
                 group_scores  = result['group_scores']
 
-                # ── Hard sanity gates (mirror RF path) ──────────────────────
-                hard_reject   = False
-                reject_reason = ""
                 fn_list = list(feat_names)
-                def _fv(name):
-                    try:
-                        return float(vec[fn_list.index(name)])
-                    except (ValueError, IndexError):
-                        return None
-
-                if 'dwell_mean' in fn_list:
-                    e_dwell     = float(profile_mean[fn_list.index('dwell_mean')])
-                    e_dwell_std = float(profile_std[fn_list.index('dwell_mean')]) + 1e-9
-                    e_dwell_std = max(e_dwell_std, e_dwell * 0.10, 20.0)
-                    l_dwell     = _fv('dwell_mean')
-                    # Skip gate if enrolled profile is zeroed (sentinel for a
-                    # broken/untrained pickle) — otherwise z-score divides by
-                    # ~1e-9 and hard-rejects every login.
-                    if l_dwell is not None and e_dwell >= 20.0:
-                        dwell_z = abs(l_dwell - e_dwell) / e_dwell_std
-                        if dwell_z > 3.0:
-                            hard_reject   = True
-                            reject_reason = (f"dwell_mean z={dwell_z:.1f} "
-                                             f"(live={l_dwell:.0f}ms enrolled={e_dwell:.0f}ms)")
-
-                if not hard_reject and 'typing_speed_cpm' in fn_list:
-                    e_cpm     = float(profile_mean[fn_list.index('typing_speed_cpm')])
-                    e_cpm_std = float(profile_std[fn_list.index('typing_speed_cpm')]) + 1e-9
-                    e_cpm_std = max(e_cpm_std, e_cpm * 0.20)
-                    l_cpm     = _fv('typing_speed_cpm')
-                    if l_cpm is not None and e_cpm >= 20.0:
-                        cpm_z = abs(l_cpm - e_cpm) / e_cpm_std
-                        if cpm_z > 5.0:
-                            hard_reject   = True
-                            reject_reason = (f"typing_speed_cpm z={cpm_z:.1f} "
-                                             f"(live={l_cpm:.0f} enrolled={e_cpm:.0f})")
-
-                if hard_reject:
-                    confidence    = 0.0
-                    authenticated = False
-                    print(f"  ⛔ Hard reject: {reject_reason}")
-                else:
-                    confidence    = profile_score
-                    authenticated = confidence >= threshold
+                confidence    = profile_score
+                authenticated = confidence >= threshold
+                hard_reject   = False
 
                 breach = group_scores.get('floor_breach')
-                if breach and not hard_reject:
+                if breach:
                     print(f"  ⛔ {breach}")
-                print(f"  Profile score={profile_score:.3f}  speed_ratio={speed_ratio:.2f}  "
+                n_valid = group_scores.get('n_valid', '?')
+                print(f"  GP score={profile_score:.3f}  speed_ratio={speed_ratio:.2f}  "
                       f"Threshold={threshold:.2f}  "
-                      f"mean_z={group_scores.get('digraph_mean_z', -1):.2f}  "
-                      f"dig_dist={group_scores['digraph_dist']:.2f} "
-                      f"dig_rank={group_scores['digraph_rank']:.2f} "
-                      f"df={group_scores['dwell_flight']:.2f} "
-                      f"rhy={group_scores['rhythm']:.2f}  "
+                      f"A={group_scores['digraph_dist']:.2f} "
+                      f"R={group_scores['digraph_rank']:.2f} "
+                      f"n_valid={n_valid}  "
                       f"→ {'PASS' if authenticated else 'FAIL'}")
 
-                # Diagnostic: on fail, dump top-10 highest-z digraph-group
-                # features with live/enrolled values so we can tell whether the
-                # miss is a handful of misaligned keys (cliff) or uniform
-                # cross-session drift (carpet).
-                if not authenticated and not hard_reject:
+                # Diagnostic: on fail, dump top-10 highest-ratio digraph
+                # positions so we can see which keys are dragging the score.
+                if not authenticated:
                     details = result.get('details', [])
                     dg_rows = [
                         (nm, z, grp) for (nm, z, grp) in details if grp == 'digraph'
                     ]
                     dg_rows.sort(key=lambda r: r[1], reverse=True)
-                    print(f"  [diag] top digraph-group z's (of {len(dg_rows)}):")
-                    for nm, z, _ in dg_rows[:10]:
+                    print(f"  [diag] top digraph-group ratio deviations (of {len(dg_rows)}):")
+                    for nm, d, _ in dg_rows[:10]:
                         idx_f = fn_list.index(nm) if nm in fn_list else -1
                         if idx_f >= 0:
                             enr = float(profile_mean[idx_f])
-                            std = float(profile_std[idx_f])
                             live_raw = float(vec[idx_f])
                             print(f"    {nm:24s} live={live_raw:7.1f}  "
-                                  f"enr={enr:7.1f} ±{std:5.1f}  z={z:.2f}")
+                                  f"enr={enr:7.1f}  ratio-1={d:+.2f}")
 
             # ── RF / GBM path (>10 enrollment samples) ────────────────────────
             else:
@@ -832,17 +818,6 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
         # Case B: low confidence, voice recovery path — hold for fusion
         _pending_ks_samples[payload.username] = payload
         print(f"  ⏳ Keystroke sample cached — will save only if fusion grants access")
-
-    # Handle failed attempts — count keystroke method only
-    if not authenticated:
-        ks_denials = db.query(AuthLog).filter(
-            AuthLog.user_id == user.id,
-            AuthLog.auth_method == "keystroke",
-            AuthLog.result == "denied"
-        ).count()
-        if ks_denials >= 10:
-            user.is_flagged = True
-            db.commit()
 
     return {"authenticated": bool(authenticated), "confidence": float(confidence)}
 
@@ -1046,14 +1021,6 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
         },
     )
 
-    # Handle failed voice attempts — count voice method only to avoid cross-method false lockout
-    if not authenticated:
-        voice_denials = _consecutive_denials(db, user.id, "voice")
-        if voice_denials >= 10:
-            user.is_flagged = True
-            db.commit()
-            print(f"  ⚠️ User '{payload.username}' flagged after {voice_denials} voice failures")
-
     # ── Adaptive learning: update ECAPA profile with new login embedding ────
     # ECAPA needs no retraining — just append the new embedding to the profile
     # so the mean vector gradually adapts to the user's voice over time.
@@ -1139,7 +1106,8 @@ def verify_security(payload: SecurityAuth, db: Session = Depends(get_db)):
     )
 
     if not authenticated:
-        # Require 3 failed security answers before flagging — one typo shouldn't lock an account
+        # Recovery path: password already passed, so a wrong answer here is
+        # high-signal impostor behavior. 3-strike buffer absorbs typos.
         sq_denials = _consecutive_denials(db, user.id, "security_question")
         if sq_denials >= 3:
             user.is_flagged = True
@@ -1148,7 +1116,8 @@ def verify_security(payload: SecurityAuth, db: Session = Depends(get_db)):
 
     return {
         "authenticated": authenticated,
-        "confidence":    1.0 if authenticated else 0.0
+        "confidence":    1.0 if authenticated else 0.0,
+        "flagged":       bool(user.is_flagged),
     }
 
 
