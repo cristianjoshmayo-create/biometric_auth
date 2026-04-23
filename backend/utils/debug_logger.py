@@ -130,6 +130,19 @@ def log_auth_stage(
 
     logger.log(level, msg, extra={"stage": f"auth.{stage}", "user": username, "extra_data": data})
 
+    # Update the per-user login-attempts summary file.
+    # Rebuild is cheap (current auth_events.log is small, rotates at 5MB) and
+    # keeps the summary accurate after each stage event.
+    try:
+        from backend.utils.login_attempt_log import rebuild_safe
+        rebuild_safe()
+    except Exception:
+        try:
+            from utils.login_attempt_log import rebuild_safe
+            rebuild_safe()
+        except Exception:
+            pass
+
 
 def log_error(stage: str, username: str, err: BaseException, *, extra: dict[str, Any] | None = None) -> None:
     logger = get_logger(f"auth.{stage}")

@@ -35,7 +35,7 @@ MAX_SAMPLES = 50
 # count against this — only source in ('login_ks','login_fusion') are adaptive.
 # When the cap is hit, the lowest-scoring adaptive row is evicted so the pool
 # self-cleans toward the user's strongest patterns instead of drifting with age.
-MAX_ADAPTIVE = 30
+MAX_ADAPTIVE = 45
 
 def _safe_filename(username: str) -> str:
     """Sanitize email for use as filename. user@gmail.com → user_at_gmail_com"""
@@ -261,10 +261,16 @@ def _consecutive_denials(db: Session, user_id: int, method: str) -> int:
     # Count denials since the user's last granted attempt for this method.
     # Why: the old all-time count permanently flagged accounts once lifetime
     # typos hit the limit. Consecutive-since-last-success resets on every win.
+    # For security_question, any successful full login (keystroke ≥0.80 grant
+    # or fusion grant) also resets — proving identity elsewhere clears the
+    # stale recovery-path counter so old typos can't compound months later.
+    reset_methods = [method]
+    if method == "security_question":
+        reset_methods += ["keystroke", "fusion"]
     last_grant = (
         db.query(AuthLog.attempted_at)
           .filter(AuthLog.user_id == user_id,
-                  AuthLog.auth_method == method,
+                  AuthLog.auth_method.in_(reset_methods),
                   AuthLog.result == "granted")
           .order_by(AuthLog.attempted_at.desc())
           .first()
@@ -757,8 +763,23 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
     # no-model hard-reject path below, fall back to nulls.
     _log_mat = locals().get('maturity')
     _log_thr = locals().get('threshold')
-    log_attempt(db, user.id, "keystroke", confidence,
-                "granted" if authenticated else "denied",
+
+    # 3-way result for AuthLog — the binary granted/denied was misleading
+    # because scores in the fusion band (0.55–0.89) aren't really denied;
+    # they're uncertain and the final call is made by /auth/fuse. Log-only
+    # change — the API response still exposes `authenticated` unchanged.
+    #   ≥ 0.90              → granted   (final, keystroke alone is sufficient)
+    #   0.55 – 0.89         → uncertain (fusion decides)
+    #   < 0.55 / hard reject → denied   (final-ish; fusion may still run
+    #                                    but needs very strong voice)
+    if not locals().get('hard_reject', False) and confidence >= 0.90 and authenticated:
+        _result = "granted"
+    elif not locals().get('hard_reject', False) and confidence >= 0.55:
+        _result = "uncertain"
+    else:
+        _result = "denied"
+
+    log_attempt(db, user.id, "keystroke", confidence, _result,
                 template_maturity=_log_mat,
                 effective_threshold=_log_thr)
 
@@ -776,7 +797,7 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
     }
     log_auth_stage(
         "keystroke", payload.username,
-        "granted" if authenticated else "denied",
+        _result,
         score=float(confidence),
         threshold=float(_log_thr) if _log_thr is not None else None,
         model=locals().get('model_type'),
@@ -1138,12 +1159,12 @@ def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
     """
     Authoritative multimodal fusion endpoint — adaptive threshold.
 
-    Only reached when keystroke score is in the uncertain range (0.55–0.79).
-    High-confidence keystroke (≥ 0.80) grants immediately without calling this.
+    Only reached when keystroke score is in the uncertain range (0.55–0.89).
+    High-confidence keystroke (≥ 0.90) grants immediately without calling this.
 
     Two cases handled:
 
-    Case A — keystroke_passed=True (scored ≥ per-user threshold but < 0.80):
+    Case A — keystroke_passed=True (scored ≥ per-user threshold but < 0.90):
         The user is plausibly genuine but keystroke isn't certain enough alone.
         Voice confirms. Fused threshold: 0.58 (lenient — we already passed KS).
         Weights: 0.45 keystroke + 0.55 voice (voice carries more weight as
@@ -1270,4 +1291,34 @@ def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
         "threshold":       FUSED_THRESHOLD,
         "case":            case_label,
         "reason":          reason,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  AUTH HISTORY  (for dashboard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/history/{username}")
+def auth_history(username: str, limit: int = 20, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == username.lower()).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    rows = (
+        db.query(AuthLog)
+          .filter(AuthLog.user_id == user.id)
+          .order_by(AuthLog.attempted_at.desc())
+          .limit(min(limit, 100))
+          .all()
+    )
+    return {
+        "flagged": bool(user.is_flagged),
+        "entries": [
+            {
+                "method":     r.auth_method,
+                "result":     r.result,
+                "confidence": float(r.confidence_score) if r.confidence_score is not None else None,
+                "at":         r.attempted_at.isoformat() if r.attempted_at else None,
+            }
+            for r in rows
+        ],
     }

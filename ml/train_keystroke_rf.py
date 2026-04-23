@@ -1273,6 +1273,30 @@ def predict_keystroke(username: str, feature_dict: dict) -> dict:
 
     vec = np.array([_get_val(n) for n in feat_names])
 
+    # Missing-digraph imputation — mirrors profile matcher's valid-mask.
+    # When the frontend clean-press chain strips a backspaced pair, its
+    # digraph/flight/trigraph/key timing arrives as 0.0. RF trees and
+    # Mahalanobis both treat that as a real extreme value → score collapses.
+    # Profile matcher drops such positions (keystroke_profile_matcher._gp_score
+    # via `live >= _EPS_MS`). Here we impute them with profile_mean so the
+    # feature contributes neutrally (ratio≈1, mahalanobis term≈0), and reject
+    # if too few per-pair features actually fired — same floor as GP.
+    from ml.keystroke_profile_matcher import _EPS_MS, _MIN_VALID, _is_scoring_feature
+    pair_idx = [i for i, n in enumerate(feat_names) if _is_scoring_feature(n)]
+    n_valid_pairs = 0
+    for i in pair_idx:
+        if vec[i] < _EPS_MS:
+            vec[i] = float(profile_mean[i])
+        else:
+            n_valid_pairs += 1
+    if pair_idx and n_valid_pairs < _MIN_VALID:
+        return {
+            'match':      False,
+            'confidence': 0.0,
+            'rejected':   True,
+            'reason':     f'Too few valid digraphs ({n_valid_pairs} < {_MIN_VALID}) — too many backspaces',
+        }
+
     # Neutralize backspace features at scoring time.
     # Why: enrollment samples are typed cleanly, so profile_std for these
     # columns is ~0. A single live backspace makes diff²/var explode in

@@ -127,16 +127,14 @@ async function submitKeystrokeAuth() {
         _ksPassed = result.authenticated === true;
 
         // ── Adaptive fusion decision ──────────────────────────────────────
-        // HIGH confidence (≥ 0.80): keystroke alone is sufficient — grant immediately.
-        //   The user did nothing extra compared to just typing a password.
-        //   This is the normal fast-path and makes the system faster than 2FA.
+        // HIGH confidence (≥ 0.90): keystroke alone is sufficient — grant immediately.
         //
-        // UNCERTAIN (0.55–0.79): keystroke passed its per-user threshold but
-        //   confidence is moderate — voice confirms and backend fuses both.
+        // UNCERTAIN (0.55–0.89): keystroke passed its per-user threshold but
+        //   confidence isn't top-tier — voice confirms and backend fuses both.
         //
         // LOW (< 0.55): keystroke clearly failed — voice still runs but the
         //   backend applies a stricter fusion threshold.
-        const KS_HIGH_CONF = 0.80;
+        const KS_HIGH_CONF = 0.90;
 
         if (_ksScore >= KS_HIGH_CONF) {
             // High-confidence single-modality grant — no voice needed
@@ -308,17 +306,31 @@ async function submitSecurityAuth() {
         const result = await Api.verifySecurityQuestion(authUsername, answer);
 
         if (result.authenticated) {
-            // Correct → identity confirmed, but must re-authenticate via biometrics
-            status.textContent = "✅ Identity confirmed! Please re-authenticate with biometrics.";
-            status.className   = "text-center text-sm mb-4 text-green-400";
+            // Correct answer confirms knowledge. Grant only if voice biometric
+            // already passed this session — security Q alone is not enough,
+            // since an attacker with stolen password + guessed answer would
+            // otherwise bypass biometrics. Voice-passed covers hand-injury
+            // cases (keystroke unreliable but voice healthy).
+            if (_voicePassed) {
+                status.textContent =
+                    `✅ Identity confirmed (voice biometric verified, ${(_voiceScore * 100).toFixed(1)}%).`;
+                status.className = "text-center text-sm mb-4 text-green-400";
+                setTimeout(() => {
+                    showSuccess("Security Question + Voice Biometric", _voiceScore);
+                }, 800);
+                return;
+            }
 
-            // Reset biometric scores so fusion starts fresh
+            // Voice did not pass — require biometric re-auth
+            status.textContent =
+                "✅ Identity confirmed, but voice biometric must also verify. Please re-authenticate.";
+            status.className = "text-center text-sm mb-4 text-yellow-400";
+
             _ksScore     = null;
             _ksPassed    = false;
             _voiceScore  = null;
             _voicePassed = false;
 
-            // Restart from keystroke step after a short delay
             setTimeout(() => {
                 document.getElementById("security-answer-input").value = "";
                 moveToKeystrokeAuth();
@@ -351,6 +363,13 @@ function showSuccess(method, confidence) {
         `Verified via: ${method}`;
     document.getElementById("success-confidence").textContent =
         `Confidence: ${(confidence * 100).toFixed(1)}%`;
+    // Persist session context for the dashboard's re-auth flow.
+    try {
+        sessionStorage.setItem("authUsername", authUsername || "");
+        sessionStorage.setItem("authLoginAt", Date.now().toString());
+        sessionStorage.setItem("authLastMethod", method);
+        sessionStorage.setItem("authLastConfidence", String(confidence));
+    } catch (_) {}
 }
 
 function showDenied() {

@@ -3,35 +3,368 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard</title>
+    <title>Dashboard — Biometric Auth</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/static/js/keystroke.js?v=11"></script>
+    <script src="/static/js/speech.js?v=14"></script>
+    <script src="/static/js/api.js"></script>
 </head>
-<body class="min-h-screen bg-gray-950 flex items-center justify-center p-4">
+<body class="min-h-screen bg-gray-950 text-gray-200 p-4">
 
-    <div class="bg-gray-900 rounded-2xl shadow-2xl w-full max-w-md p-8 text-center">
+<div class="max-w-4xl mx-auto">
 
-        <div class="text-6xl mb-4">🏠</div>
-        <h1 class="text-white text-2xl font-bold mb-2">Welcome!</h1>
-        <p class="text-gray-400 text-sm mb-8">
-            You have been successfully authenticated.
-        </p>
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-6">
+        <div>
+            <h1 class="text-white text-2xl font-bold">Dashboard</h1>
+            <p id="user-email" class="text-gray-400 text-sm">—</p>
+        </div>
+        <div class="flex items-center gap-3">
+            <span id="trust-badge"
+                  class="px-3 py-1 rounded-full text-xs font-semibold bg-green-600 text-white">
+                Verified just now
+            </span>
+            <a href="/static/pages/login.html"
+               onclick="sessionStorage.clear()"
+               class="bg-red-600 hover:bg-red-700 text-white text-sm font-semibold px-4 py-2 rounded-lg">
+                Logout
+            </a>
+        </div>
+    </div>
 
-        <div class="bg-gray-800 rounded-lg p-4 mb-6 border border-gray-700">
-            <p class="text-green-400 text-sm font-semibold">
-                ✅ Session Active
-            </p>
-            <p class="text-gray-400 text-xs mt-1">
-                Continuous authentication is monitoring your session
-            </p>
+    <!-- Session status -->
+    <div class="bg-gray-900 rounded-xl p-5 border border-gray-800 mb-6">
+        <div class="flex items-center justify-between">
+            <div>
+                <p class="text-green-400 text-sm font-semibold">✅ Session Active</p>
+                <p class="text-gray-400 text-xs mt-1">
+                    Sensitive actions require re-authentication.
+                </p>
+            </div>
+            <div class="text-right">
+                <p class="text-gray-400 text-xs">Last verified</p>
+                <p id="last-verified" class="text-white text-sm font-mono">—</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-6 mb-6">
+
+        <!-- Profile / Account -->
+        <div class="bg-gray-900 rounded-xl p-5 border border-gray-800">
+            <h2 class="text-white font-semibold mb-3">Profile & Account</h2>
+            <p class="text-gray-400 text-xs mb-4">These actions require re-auth.</p>
+            <div class="space-y-2">
+                <button class="reauth-btn w-full text-left bg-gray-800 hover:bg-gray-700 text-sm px-4 py-3 rounded-lg"
+                        data-action="Change password" data-level="strong">
+                    🔑 Change password
+                </button>
+                <button class="reauth-btn w-full text-left bg-gray-800 hover:bg-gray-700 text-sm px-4 py-3 rounded-lg"
+                        data-action="Update security question" data-level="strong">
+                    ❓ Update security question
+                </button>
+                <button class="reauth-btn w-full text-left bg-gray-800 hover:bg-gray-700 text-sm px-4 py-3 rounded-lg"
+                        data-action="Re-record voice sample" data-level="strong">
+                    🎤 Re-record voice sample
+                </button>
+            </div>
         </div>
 
-        <a href="/static/pages/login.html"
-           class="block w-full bg-red-600 hover:bg-red-700 text-white
-                  font-semibold py-3 rounded-lg transition-colors duration-200">
-            Logout
-        </a>
-
+        <!-- Sensitive info -->
+        <div class="bg-gray-900 rounded-xl p-5 border border-gray-800">
+            <h2 class="text-white font-semibold mb-3">Sensitive Info</h2>
+            <p class="text-gray-400 text-xs mb-4">Lighter re-auth (keystroke only).</p>
+            <div class="space-y-2">
+                <button class="reauth-btn w-full text-left bg-gray-800 hover:bg-gray-700 text-sm px-4 py-3 rounded-lg"
+                        data-action="Show enrolled phrase" data-level="light">
+                    👁 Show my enrolled phrase
+                </button>
+                <button class="reauth-btn w-full text-left bg-gray-800 hover:bg-gray-700 text-sm px-4 py-3 rounded-lg"
+                        data-action="View auth history" data-level="light">
+                    📜 View full auth history
+                </button>
+            </div>
+        </div>
     </div>
+
+    <!-- Auth history -->
+    <div class="bg-gray-900 rounded-xl p-5 border border-gray-800 mb-6">
+        <div class="flex items-center justify-between mb-3">
+            <h2 class="text-white font-semibold">Recent Auth Events</h2>
+            <button onclick="loadHistory()" class="text-xs text-purple-400 hover:text-purple-300">Refresh</button>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-xs">
+                <thead class="text-gray-500">
+                    <tr>
+                        <th class="text-left py-2">When</th>
+                        <th class="text-left py-2">Method</th>
+                        <th class="text-left py-2">Result</th>
+                        <th class="text-left py-2">Confidence</th>
+                    </tr>
+                </thead>
+                <tbody id="history-body" class="font-mono text-gray-300"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- ═════════════════════════ RE-AUTH MODAL ═════════════════════════ -->
+<div id="reauth-modal" class="hidden fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
+    <div class="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-md p-6">
+
+        <div class="flex items-center justify-between mb-2">
+            <h3 class="text-white font-bold">🔐 Re-authentication required</h3>
+            <button onclick="closeReauth()" class="text-gray-500 hover:text-white text-xl leading-none">&times;</button>
+        </div>
+        <p id="reauth-reason" class="text-gray-400 text-sm mb-4">—</p>
+
+        <!-- Stage 1: keystroke -->
+        <div id="reauth-ks-section">
+            <p class="text-gray-300 text-sm mb-2">
+                Type your passphrase: <span id="reauth-phrase" class="text-purple-400 font-mono"></span>
+            </p>
+            <input id="keystroke-input" type="text" autocomplete="off"
+                   class="w-full bg-gray-800 text-white rounded-lg px-4 py-3 mb-3 outline-none
+                          focus:ring-2 focus:ring-purple-500 border border-gray-700" />
+            <p id="reauth-ks-status" class="text-xs text-gray-500 mb-3">—</p>
+            <button onclick="submitReauthKeystroke()"
+                    class="w-full bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 rounded-lg">
+                Verify Typing
+            </button>
+        </div>
+
+        <!-- Stage 2: voice (escalation on anomaly) -->
+        <div id="reauth-voice-section" class="hidden text-center">
+            <div class="text-4xl mb-2">🎤</div>
+            <p class="text-yellow-400 text-sm mb-2">Anomaly detected — voice verification required</p>
+            <p class="text-gray-400 text-xs mb-4">Speak your passphrase clearly.</p>
+            <button id="record-btn" onclick="startRecording()"
+                    class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-lg">
+                🎤 Start Recording
+            </button>
+            <p id="reauth-voice-status" class="text-xs text-gray-500 mt-3">—</p>
+        </div>
+
+        <!-- Stage 3: result -->
+        <div id="reauth-result-section" class="hidden text-center">
+            <div id="reauth-result-icon" class="text-5xl mb-2">✅</div>
+            <h4 id="reauth-result-title" class="text-white font-bold mb-1">Re-authenticated</h4>
+            <p id="reauth-result-detail" class="text-gray-400 text-sm mb-4">—</p>
+            <button onclick="closeReauth()"
+                    class="w-full bg-gray-700 hover:bg-gray-600 text-white font-semibold py-3 rounded-lg">
+                Close
+            </button>
+        </div>
+    </div>
+</div>
+
+<script>
+// ─── Session bootstrap ───────────────────────────────────────────────────────
+const authUsername = sessionStorage.getItem("authUsername");
+if (!authUsername) {
+    window.location.href = "/static/pages/login.html";
+}
+document.getElementById("user-email").textContent = authUsername;
+
+function renderLastVerified() {
+    const ts = parseInt(sessionStorage.getItem("authLoginAt") || "0", 10);
+    const badge = document.getElementById("trust-badge");
+    const lv = document.getElementById("last-verified");
+    if (!ts) { lv.textContent = "—"; return; }
+    const secs = Math.floor((Date.now() - ts) / 1000);
+    const pretty = secs < 60 ? `${secs}s ago`
+                 : secs < 3600 ? `${Math.floor(secs/60)}m ago`
+                 : `${Math.floor(secs/3600)}h ago`;
+    lv.textContent = pretty;
+    // Soft trust decay: after 5 min, nudge user to re-auth before sensitive actions.
+    if (secs > 300) {
+        badge.textContent = "Re-auth recommended";
+        badge.className = "px-3 py-1 rounded-full text-xs font-semibold bg-yellow-600 text-white";
+    } else {
+        badge.textContent = `Verified ${pretty}`;
+        badge.className = "px-3 py-1 rounded-full text-xs font-semibold bg-green-600 text-white";
+    }
+}
+renderLastVerified();
+setInterval(renderLastVerified, 10_000);
+
+// ─── Auth history ────────────────────────────────────────────────────────────
+async function loadHistory() {
+    const tbody = document.getElementById("history-body");
+    tbody.innerHTML = `<tr><td colspan="4" class="py-3 text-gray-500">Loading…</td></tr>`;
+    try {
+        const res = await fetch(`${window.location.protocol}//${window.location.host}/api/auth/history/${encodeURIComponent(authUsername)}?limit=15`);
+        const data = await res.json();
+        if (!data.entries || !data.entries.length) {
+            tbody.innerHTML = `<tr><td colspan="4" class="py-3 text-gray-500">No events yet.</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = data.entries.map(e => {
+            const when = e.at ? new Date(e.at).toLocaleString() : "—";
+            const conf = e.confidence == null ? "—" : (e.confidence * 100).toFixed(1) + "%";
+            const color = e.result === "granted" ? "text-green-400"
+                        : e.result === "uncertain" ? "text-yellow-400"
+                        : "text-red-400";
+            const label = e.result === "uncertain"
+                ? "uncertain → fusion"
+                : e.result;
+            return `<tr class="border-t border-gray-800">
+                <td class="py-2">${when}</td>
+                <td class="py-2">${e.method}</td>
+                <td class="py-2 ${color}">${label}</td>
+                <td class="py-2">${conf}</td>
+            </tr>`;
+        }).join("");
+    } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="4" class="py-3 text-red-400">Failed to load.</td></tr>`;
+    }
+}
+loadHistory();
+
+// ─── Re-auth modal ───────────────────────────────────────────────────────────
+// Anomaly policy (thesis): a re-auth attempt is anomalous when
+//   - authenticated === false, OR
+//   - confidence falls in the uncertain band (0.55–0.79) and `level=strong`
+// Strong actions escalate to voice on anomaly. Light actions just deny.
+let _reauthAction = "";
+let _reauthLevel = "light";
+let _reauthKsScore = 0;
+
+async function openReauth(action, level) {
+    _reauthAction = action;
+    _reauthLevel = level;
+    _reauthKsScore = 0;
+
+    document.getElementById("reauth-modal").classList.remove("hidden");
+    document.getElementById("reauth-reason").textContent =
+        `Required for: ${action} (${level === "strong" ? "strong" : "light"} challenge)`;
+    document.getElementById("reauth-ks-section").classList.remove("hidden");
+    document.getElementById("reauth-voice-section").classList.add("hidden");
+    document.getElementById("reauth-result-section").classList.add("hidden");
+    document.getElementById("reauth-ks-status").textContent = "—";
+
+    const phraseRes = await Api.getPhrase(authUsername);
+    const phrase = phraseRes.phrase || "";
+    document.getElementById("reauth-phrase").textContent = phrase;
+    KeystrokeCapture.setPhrase(phrase);
+    KeystrokeCapture.reset();
+    KeystrokeCapture.attach("keystroke-input");
+    document.getElementById("keystroke-input").value = "";
+    document.getElementById("keystroke-input").focus();
+}
+
+function closeReauth() {
+    document.getElementById("reauth-modal").classList.add("hidden");
+    KeystrokeCapture.reset();
+}
+
+async function submitReauthKeystroke() {
+    const input = document.getElementById("keystroke-input");
+    const status = document.getElementById("reauth-ks-status");
+
+    if (!KeystrokeCapture.validatePhrase(input.value)) {
+        status.textContent = "Phrase does not match. Try again.";
+        status.className = "text-xs text-red-400 mb-3";
+        KeystrokeCapture.reset();
+        KeystrokeCapture.attach("keystroke-input");
+        input.value = "";
+        return;
+    }
+
+    status.textContent = "Verifying typing pattern…";
+    status.className = "text-xs text-gray-400 mb-3";
+
+    try {
+        const features = KeystrokeCapture.extractFeatures();
+        const result = await Api.verifyKeystroke(authUsername, features);
+        const conf = Number(result.confidence) || 0;
+        _reauthKsScore = conf;
+
+        const anomalous = !result.authenticated || (_reauthLevel === "strong" && conf < 0.80);
+
+        if (!anomalous) {
+            return showReauthSuccess("keystroke", conf);
+        }
+
+        // Anomaly path
+        if (_reauthLevel === "light") {
+            return showReauthFailure(
+                `Keystroke score too low (${(conf*100).toFixed(1)}%). Re-auth denied.`
+            );
+        }
+        // Strong action → escalate to voice
+        document.getElementById("reauth-ks-section").classList.add("hidden");
+        document.getElementById("reauth-voice-section").classList.remove("hidden");
+        document.getElementById("reauth-voice-status").textContent =
+            `Keystroke confidence was ${(conf*100).toFixed(1)}% — voice verification needed.`;
+    } catch (err) {
+        status.textContent = "Network error. Try again.";
+        status.className = "text-xs text-red-400 mb-3";
+    }
+}
+
+// Called by speech.js after recording completes
+async function onVoiceRecorded(featureDict) {
+    const status = document.getElementById("reauth-voice-status");
+    status.textContent = "Verifying voice…";
+    try {
+        const voiceRes = await Api.verifyVoice(authUsername, featureDict);
+        const voiceScore = Number(voiceRes.confidence) || 0;
+
+        // Fuse with earlier keystroke score (reuses backend's weighted fusion)
+        const fuseRes = await Api.fuseScores(
+            authUsername, _reauthKsScore, voiceScore,
+            false, Boolean(voiceRes.authenticated)
+        );
+
+        if (fuseRes.granted) {
+            showReauthSuccess("keystroke+voice fusion", fuseRes.fused_score);
+        } else {
+            showReauthFailure(
+                `Fusion score ${(fuseRes.fused_score*100).toFixed(1)}% below threshold. Re-auth denied.`
+            );
+        }
+    } catch (err) {
+        status.textContent = "Voice verification failed: " + err.message;
+    }
+}
+
+function showReauthSuccess(method, confidence) {
+    sessionStorage.setItem("authLoginAt", Date.now().toString());
+    sessionStorage.setItem("authLastMethod", method);
+    sessionStorage.setItem("authLastConfidence", String(confidence));
+    renderLastVerified();
+    loadHistory();
+
+    document.getElementById("reauth-ks-section").classList.add("hidden");
+    document.getElementById("reauth-voice-section").classList.add("hidden");
+    document.getElementById("reauth-result-section").classList.remove("hidden");
+    document.getElementById("reauth-result-icon").textContent = "✅";
+    document.getElementById("reauth-result-title").textContent = "Re-authenticated";
+    document.getElementById("reauth-result-title").className = "text-green-400 font-bold mb-1";
+    document.getElementById("reauth-result-detail").textContent =
+        `${_reauthAction} approved via ${method} (${(confidence*100).toFixed(1)}%).`;
+}
+
+function showReauthFailure(detail) {
+    loadHistory();
+    document.getElementById("reauth-ks-section").classList.add("hidden");
+    document.getElementById("reauth-voice-section").classList.add("hidden");
+    document.getElementById("reauth-result-section").classList.remove("hidden");
+    document.getElementById("reauth-result-icon").textContent = "🚫";
+    document.getElementById("reauth-result-title").textContent = "Re-auth denied";
+    document.getElementById("reauth-result-title").className = "text-red-400 font-bold mb-1";
+    document.getElementById("reauth-result-detail").textContent = detail;
+}
+
+// Wire up action buttons
+document.querySelectorAll(".reauth-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+        openReauth(btn.dataset.action, btn.dataset.level || "light");
+    });
+});
+</script>
 
 </body>
 </html>

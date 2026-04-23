@@ -198,7 +198,6 @@ const SpeechCapture = {
                                                // that degrades ECAPA speaker-embedding consistency.
                                                // Backend CMVN + _autoGain handle level normalization.
                     sampleRate:        { ideal: 16000 },
-                    sampleSize:        16,
                 }
             });
 
