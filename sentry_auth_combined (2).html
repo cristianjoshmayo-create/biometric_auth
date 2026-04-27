@@ -1,0 +1,1282 @@
+<!DOCTYPE html>
+<html class="light" lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Sentry Auth | Biometric Authentication</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+  tailwind.config = {
+    darkMode: "class",
+    theme: {
+      extend: {
+        colors: {
+          "secondary-fixed-dim": "#b4c5ff",
+          "surface-container-low": "#f1f3ff",
+          "inverse-surface": "#293040",
+          "background": "#f9f9ff",
+          "primary-fixed-dim": "#b4c5ff",
+          "error": "#ba1a1a",
+          "on-tertiary": "#ffffff",
+          "on-surface": "#141b2b",
+          "on-tertiary-fixed": "#360f00",
+          "on-background": "#141b2b",
+          "error-container": "#ffdad6",
+          "surface-bright": "#f9f9ff",
+          "outline-variant": "#c3c6d7",
+          "on-surface-variant": "#434655",
+          "on-primary": "#ffffff",
+          "primary-container": "#2563eb",
+          "on-tertiary-fixed-variant": "#7d2d00",
+          "surface": "#f9f9ff",
+          "inverse-primary": "#b4c5ff",
+          "surface-container-lowest": "#ffffff",
+          "tertiary-fixed": "#ffdbcd",
+          "surface-container-highest": "#dce2f7",
+          "on-secondary": "#ffffff",
+          "on-secondary-fixed-variant": "#31447b",
+          "surface-variant": "#dce2f7",
+          "on-secondary-container": "#394c84",
+          "secondary": "#495c95",
+          "outline": "#737686",
+          "on-secondary-fixed": "#00174b",
+          "on-primary-container": "#eeefff",
+          "on-primary-fixed": "#00174b",
+          "tertiary": "#943700",
+          "primary": "#004ac6",
+          "on-error-container": "#93000a",
+          "surface-container": "#e9edff",
+          "secondary-container": "#acbfff",
+          "on-tertiary-container": "#ffede6",
+          "inverse-on-surface": "#edf0ff",
+          "tertiary-fixed-dim": "#ffb596",
+          "tertiary-container": "#bc4800",
+          "surface-tint": "#0053db",
+          "on-primary-fixed-variant": "#003ea8",
+          "primary-fixed": "#dbe1ff",
+          "secondary-fixed": "#dbe1ff",
+          "surface-container-high": "#e1e8fd",
+          "on-error": "#ffffff",
+          "surface-dim": "#d3daef"
+        },
+        borderRadius: {
+          "DEFAULT": "0.5rem",
+          "lg": "0.5rem",
+          "xl": "1.5rem",
+          "full": "9999px"
+        },
+        fontFamily: {
+          "headline": ["Inter", "sans-serif"],
+          "body": ["Inter", "sans-serif"],
+          "label": ["Inter", "sans-serif"],
+          "mono": ["JetBrains Mono", "monospace"]
+        }
+      }
+    }
+  }
+</script>
+<style>
+  /* ── Light mode tokens ── */
+  :root {
+    --color-background: #f9f9ff;
+    --color-surface: #f9f9ff;
+    --color-surface-bright: #f9f9ff;
+    --color-surface-dim: #d3daef;
+    --color-surface-container-lowest: #ffffff;
+    --color-surface-container-low: #f1f3ff;
+    --color-surface-container: #e9edff;
+    --color-surface-container-high: #e1e8fd;
+    --color-surface-container-highest: #dce2f7;
+    --color-surface-variant: #dce2f7;
+    --color-surface-tint: #0053db;
+    --color-on-surface: #141b2b;
+    --color-on-surface-variant: #434655;
+    --color-on-background: #141b2b;
+    --color-outline: #737686;
+    --color-outline-variant: #c3c6d7;
+    --color-primary: #004ac6;
+    --color-on-primary: #ffffff;
+    --color-primary-container: #2563eb;
+    --color-on-primary-container: #eeefff;
+    --color-primary-fixed: #dbe1ff;
+    --color-primary-fixed-dim: #b4c5ff;
+    --color-on-primary-fixed: #00174b;
+    --color-on-primary-fixed-variant: #003ea8;
+    --color-secondary: #495c95;
+    --color-on-secondary: #ffffff;
+    --color-secondary-container: #acbfff;
+    --color-on-secondary-container: #394c84;
+    --color-secondary-fixed: #dbe1ff;
+    --color-secondary-fixed-dim: #b4c5ff;
+    --color-on-secondary-fixed: #00174b;
+    --color-on-secondary-fixed-variant: #31447b;
+    --color-tertiary: #943700;
+    --color-on-tertiary: #ffffff;
+    --color-tertiary-container: #bc4800;
+    --color-on-tertiary-container: #ffede6;
+    --color-tertiary-fixed: #ffdbcd;
+    --color-tertiary-fixed-dim: #ffb596;
+    --color-on-tertiary-fixed: #360f00;
+    --color-on-tertiary-fixed-variant: #7d2d00;
+    --color-error: #ba1a1a;
+    --color-on-error: #ffffff;
+    --color-error-container: #ffdad6;
+    --color-on-error-container: #93000a;
+    --color-inverse-surface: #293040;
+    --color-inverse-primary: #b4c5ff;
+    --color-inverse-on-surface: #edf0ff;
+    --navbar-bg: #ffffff;
+    --card-shadow: 0 32px 64px -12px rgba(20,27,43,0.06);
+  }
+
+  /* ── Dark mode token overrides ── */
+  .dark {
+    --color-background: #111827;
+    --color-surface: #111827;
+    --color-surface-bright: #1e2536;
+    --color-surface-dim: #0d1117;
+    --color-surface-container-lowest: #0d1117;
+    --color-surface-container-low: #161e2e;
+    --color-surface-container: #1a2235;
+    --color-surface-container-high: #1f2a3e;
+    --color-surface-container-highest: #243148;
+    --color-surface-variant: #1e2a40;
+    --color-surface-tint: #6d8ff5;
+    --color-on-surface: #e2e6f8;
+    --color-on-surface-variant: #a8adc5;
+    --color-on-background: #e2e6f8;
+    --color-outline: #6b7090;
+    --color-outline-variant: #2e3550;
+    --color-primary: #93b4ff;
+    --color-on-primary: #002882;
+    --color-primary-container: #3d70f0;
+    --color-on-primary-container: #dce8ff;
+    --color-primary-fixed: #1a3fa8;
+    --color-primary-fixed-dim: #4a6fcc;
+    --color-on-primary-fixed: #dce8ff;
+    --color-on-primary-fixed-variant: #93b4ff;
+    --color-secondary: #bac8ff;
+    --color-on-secondary: #1e2f6a;
+    --color-secondary-container: #2c3f80;
+    --color-on-secondary-container: #dce4ff;
+    --color-secondary-fixed: #1a2e6e;
+    --color-secondary-fixed-dim: #3a4e90;
+    --color-on-secondary-fixed: #dce4ff;
+    --color-on-secondary-fixed-variant: #bac8ff;
+    --color-tertiary: #ffb68a;
+    --color-on-tertiary: #5c1900;
+    --color-tertiary-container: #8a3200;
+    --color-on-tertiary-container: #ffdccc;
+    --color-tertiary-fixed: #5c1900;
+    --color-tertiary-fixed-dim: #8a3200;
+    --color-on-tertiary-fixed: #ffdccc;
+    --color-on-tertiary-fixed-variant: #ffb68a;
+    --color-error: #ffb4ab;
+    --color-on-error: #690005;
+    --color-error-container: #93000a;
+    --color-on-error-container: #ffdad6;
+    --color-inverse-surface: #e2e6f8;
+    --color-inverse-primary: #004ac6;
+    --color-inverse-on-surface: #293040;
+    --navbar-bg: #0d1117;
+    --card-shadow: 0 32px 64px -12px rgba(0,0,0,0.4);
+  }
+
+  /* ── Wire CSS vars into Tailwind-generated utilities ── */
+  /* We override the custom color classes to use CSS vars */
+  .bg-background { background-color: var(--color-background) !important; }
+  .bg-surface { background-color: var(--color-surface) !important; }
+  .bg-surface-bright { background-color: var(--color-surface-bright) !important; }
+  .bg-surface-dim { background-color: var(--color-surface-dim) !important; }
+  .bg-surface-container-lowest { background-color: var(--color-surface-container-lowest) !important; }
+  .bg-surface-container-low { background-color: var(--color-surface-container-low) !important; }
+  .bg-surface-container { background-color: var(--color-surface-container) !important; }
+  .bg-surface-container-high { background-color: var(--color-surface-container-high) !important; }
+  .bg-surface-container-highest { background-color: var(--color-surface-container-highest) !important; }
+  .bg-surface-variant { background-color: var(--color-surface-variant) !important; }
+  .bg-primary { background-color: var(--color-primary) !important; }
+  .bg-primary-container { background-color: var(--color-primary-container) !important; }
+  .bg-primary-fixed { background-color: var(--color-primary-fixed) !important; }
+  .bg-primary-fixed-dim { background-color: var(--color-primary-fixed-dim) !important; }
+  .bg-secondary { background-color: var(--color-secondary) !important; }
+  .bg-secondary-container { background-color: var(--color-secondary-container) !important; }
+  .bg-tertiary-container { background-color: var(--color-tertiary-container) !important; }
+  .bg-error { background-color: var(--color-error) !important; }
+  .bg-error-container { background-color: var(--color-error-container) !important; }
+
+  .text-on-surface { color: var(--color-on-surface) !important; }
+  .text-on-surface-variant { color: var(--color-on-surface-variant) !important; }
+  .text-on-background { color: var(--color-on-background) !important; }
+  .text-primary { color: var(--color-primary) !important; }
+  .text-on-primary { color: var(--color-on-primary) !important; }
+  .text-on-primary-container { color: var(--color-on-primary-container) !important; }
+  .text-secondary { color: var(--color-secondary) !important; }
+  .text-on-secondary-container { color: var(--color-on-secondary-container) !important; }
+  .text-on-tertiary-container { color: var(--color-on-tertiary-container) !important; }
+  .text-outline { color: var(--color-outline) !important; }
+  .text-outline-variant { color: var(--color-outline-variant) !important; }
+  .text-on-surface-variant\/50 { color: color-mix(in srgb, var(--color-on-surface-variant) 50%, transparent) !important; }
+  .text-on-surface-variant\/60 { color: color-mix(in srgb, var(--color-on-surface-variant) 60%, transparent) !important; }
+  .placeholder\:text-outline::placeholder { color: var(--color-outline) !important; }
+  .placeholder\:text-on-surface-variant\/50::placeholder { color: color-mix(in srgb, var(--color-on-surface-variant) 50%, transparent) !important; }
+
+  .border-outline-variant { border-color: var(--color-outline-variant) !important; }
+  .border-outline-variant\/10 { border-color: color-mix(in srgb, var(--color-outline-variant) 10%, transparent) !important; }
+  .border-outline-variant\/15 { border-color: color-mix(in srgb, var(--color-outline-variant) 15%, transparent) !important; }
+  .border-primary-container { border-color: var(--color-primary-container) !important; }
+  .border-primary { border-color: var(--color-primary) !important; }
+  .border-surface-container-highest { border-color: var(--color-surface-container-highest) !important; }
+  .border-primary\/20 { border-color: color-mix(in srgb, var(--color-primary) 20%, transparent) !important; }
+
+  .ring-primary\/20 { --tw-ring-color: color-mix(in srgb, var(--color-primary) 20%, transparent) !important; }
+  .focus\:border-primary:focus { border-color: var(--color-primary) !important; }
+  .hover\:text-primary:hover { color: var(--color-primary) !important; }
+  .hover\:text-primary-container:hover { color: var(--color-primary-container) !important; }
+  .hover\:text-on-surface:hover { color: var(--color-on-surface) !important; }
+  .hover\:bg-primary:hover { background-color: var(--color-primary) !important; }
+  .hover\:bg-secondary-container\/20:hover { background-color: color-mix(in srgb, var(--color-secondary-container) 20%, transparent) !important; }
+
+  .shadow-primary\/20 { --tw-shadow-color: color-mix(in srgb, var(--color-primary) 20%, transparent) !important; }
+  .shadow-primary\/30 { --tw-shadow-color: color-mix(in srgb, var(--color-primary) 30%, transparent) !important; }
+
+  /* Navbar */
+  nav, header { background-color: var(--navbar-bg) !important; }
+  .bg-white { background-color: var(--navbar-bg) !important; }
+
+  /* Card shadows */
+  .shadow-\[0_32px_64px_-12px_rgba\(20\2c 27\2c 43\2c 0\.06\)\],
+  .shadow-\[0_32px_64px_rgba\(20\2c 27\2c 43\2c 0\.04\)\] {
+    box-shadow: var(--card-shadow) !important;
+  }
+
+  /* Gradient blob dark overrides */
+  .dark .bg-primary\/5 { background-color: rgba(147,180,255,0.05) !important; }
+  .dark .bg-tertiary-container\/5 { background-color: rgba(255,182,138,0.05) !important; }
+  .dark .bg-primary\/10 { background-color: rgba(147,180,255,0.08) !important; }
+  .dark .bg-secondary\/10 { background-color: rgba(186,200,255,0.08) !important; }
+
+  /* Divider opacity classes */
+  .opacity-60 { opacity: 0.6; }
+
+  .material-symbols-outlined {
+    font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+  }
+  .glass-effect {
+    background: rgba(255,255,255,0.8);
+    backdrop-filter: blur(24px);
+  }
+  .dark .glass-effect {
+    background: rgba(20,27,43,0.8);
+  }
+  .signature-gradient {
+    background: linear-gradient(135deg, #004ac6 0%, #2563eb 100%);
+  }
+  /* Smooth dark mode transition */
+  *, *::before, *::after {
+    transition: background-color 0.2s ease, border-color 0.2s ease, color 0.15s ease;
+  }
+  /* Override transition for animations that shouldn't be affected */
+  .wave-bar, .animate-bounce, .animate-ping, .animate-pulse {
+    transition: none !important;
+  }
+  .page { display: none; animation: fadeIn 0.3s ease; }
+  .page.active { display: flex; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  /* Waveform animation */
+  .wave-bar { animation: wave 1.2s ease-in-out infinite; }
+  .wave-bar:nth-child(2) { animation-delay: 0.1s; }
+  .wave-bar:nth-child(3) { animation-delay: 0.2s; }
+  .wave-bar:nth-child(4) { animation-delay: 0.3s; }
+  .wave-bar:nth-child(5) { animation-delay: 0.4s; }
+  .wave-bar:nth-child(6) { animation-delay: 0.5s; }
+  .wave-bar:nth-child(7) { animation-delay: 0.6s; }
+  @keyframes wave {
+    0%, 100% { transform: scaleY(0.4); }
+    50% { transform: scaleY(1); }
+  }
+  .typing-cursor::after {
+    content: '|';
+    animation: blink 1s infinite;
+    color: #2563eb;
+  }
+  .mic-pulse {
+    animation: micpulse 2s infinite;
+  }
+  @keyframes micpulse {
+    0%   { box-shadow: 0 0 0 0 rgba(188,72,0,0.5); }
+    70%  { box-shadow: 0 0 0 16px rgba(188,72,0,0); }
+    100% { box-shadow: 0 0 0 0 rgba(188,72,0,0); }
+  }
+  @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
+</style>
+</head>
+<body class="bg-background text-on-background font-body min-h-screen flex flex-col" id="app">
+
+<!-- ── SHARED NAVBAR ── -->
+<nav class="w-full top-0 border-none bg-white dark:bg-gray-950 flex justify-between items-center px-6 py-4 z-50 sticky shadow-[0_1px_0_rgba(20,27,43,0.04)]">
+  <div class="flex items-center gap-2">
+    <div class="w-8 h-8 signature-gradient rounded-lg flex items-center justify-center">
+      <span class="material-symbols-outlined text-white text-sm" style="font-variation-settings:'FILL' 1;">security</span>
+    </div>
+    <span class="text-xl font-semibold tracking-tight" style="color: var(--color-primary);">Sentry Auth</span>
+  </div>
+  <div class="flex items-center gap-4">
+    <button onclick="toggleDark()" id="theme-btn" class="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors active:scale-95">
+      <span id="theme-icon" class="material-symbols-outlined text-gray-600 dark:text-gray-400">dark_mode</span>
+    </button>
+    <div class="w-8 h-8 rounded-full overflow-hidden bg-surface-container-highest">
+      <div class="w-full h-full signature-gradient flex items-center justify-center">
+        <span class="material-symbols-outlined text-white text-sm" style="font-variation-settings:'FILL' 1;">person</span>
+      </div>
+    </div>
+  </div>
+</nav>
+
+<!-- ══════════════════════════════════════════
+     PAGE 1: LOGIN
+═══════════════════════════════════════════ -->
+<div id="page-login" class="page active flex-col flex-grow">
+  <main class="flex-grow flex items-center justify-center px-4 py-12 relative overflow-hidden">
+    <div class="absolute inset-0 z-0 pointer-events-none opacity-40">
+      <div class="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-primary-fixed rounded-full blur-[120px]"></div>
+      <div class="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-secondary-container rounded-full blur-[120px]"></div>
+    </div>
+    <div class="relative z-10 w-full max-w-md">
+      <div class="bg-surface-container-lowest rounded-xl shadow-[0_32px_64px_-12px_rgba(20,27,43,0.06)] p-8 md:p-10 border border-outline-variant/15">
+        <div class="flex flex-col items-center text-center mb-8">
+          <div class="w-16 h-16 bg-primary-container text-on-primary-container rounded-full flex items-center justify-center mb-6 shadow-lg shadow-primary/20">
+            <span class="material-symbols-outlined text-4xl" style="font-variation-settings:'FILL' 1;">shield_lock</span>
+          </div>
+          <h1 class="text-2xl font-bold tracking-tight text-on-surface font-headline mb-2">Biometric Login</h1>
+          <p class="text-on-surface-variant text-sm max-w-[280px]">Secure access to your enterprise dashboard with encrypted identity verification.</p>
+        </div>
+        <form class="space-y-5" onsubmit="event.preventDefault(); goTo('page-login');">
+          <div class="space-y-2">
+            <label class="block text-sm font-medium text-on-surface-variant ml-1" for="login-email">Email Address</label>
+            <div class="relative group">
+              <span class="absolute left-3 top-1/2 -translate-y-1/2 material-symbols-outlined text-outline group-focus-within:text-primary transition-colors">mail</span>
+              <input class="w-full pl-10 pr-4 py-3 bg-surface-container-highest border border-outline-variant rounded-lg focus:ring-4 focus:ring-primary/20 focus:border-primary outline-none transition-all placeholder:text-outline text-on-surface text-sm" id="login-email" placeholder="name@company.com" type="email"/>
+            </div>
+          </div>
+          <div class="space-y-2">
+            <div class="flex justify-between items-center px-1">
+              <label class="text-sm font-medium text-on-surface-variant" for="login-pass">Password</label>
+              <a class="text-xs font-semibold text-primary hover:text-primary-container transition-colors" href="#">Forgot?</a>
+            </div>
+            <div class="relative group">
+              <span class="absolute left-3 top-1/2 -translate-y-1/2 material-symbols-outlined text-outline group-focus-within:text-primary transition-colors">lock</span>
+              <input class="w-full pl-10 pr-4 py-3 bg-surface-container-highest border border-outline-variant rounded-lg focus:ring-4 focus:ring-primary/20 focus:border-primary outline-none transition-all placeholder:text-outline text-on-surface text-sm" id="login-pass" placeholder="••••••••" type="password"/>
+            </div>
+          </div>
+          <div class="flex items-center gap-2 px-1 py-1">
+            <input class="w-4 h-4 rounded border-outline-variant text-primary focus:ring-primary cursor-pointer" id="remember" type="checkbox"/>
+            <label class="text-sm text-on-surface-variant cursor-pointer select-none" for="remember">Remember this device</label>
+          </div>
+          <div class="pt-2">
+            <button onclick="event.preventDefault(); goTo('page-ks-verify');" class="w-full py-3.5 bg-primary-container text-on-primary-container font-semibold rounded-lg shadow-lg shadow-primary/20 hover:bg-primary transition-all active:scale-[0.98] flex items-center justify-center gap-2">
+              <span>Login</span>
+              <span class="material-symbols-outlined text-xl">fingerprint</span>
+            </button>
+          </div>
+        </form>
+        <div class="mt-8 pt-6 border-t border-outline-variant/10 flex flex-col items-center gap-4">
+          <p class="text-sm text-on-surface-variant">
+            Not enrolled?
+            <a onclick="goTo('page-register')" class="text-primary font-semibold hover:underline decoration-2 underline-offset-4 ml-1 cursor-pointer">Register here</a>
+          </p>
+          <div class="flex items-center gap-6 mt-2">
+            <button class="p-2 rounded-full bg-surface-container-low text-on-surface-variant hover:text-primary transition-colors"><span class="material-symbols-outlined">face</span></button>
+            <button class="p-2 rounded-full bg-surface-container-low text-on-surface-variant hover:text-primary transition-colors"><span class="material-symbols-outlined">qr_code_scanner</span></button>
+            <button class="p-2 rounded-full bg-surface-container-low text-on-surface-variant hover:text-primary transition-colors"><span class="material-symbols-outlined">key</span></button>
+          </div>
+        </div>
+      </div>
+      <footer class="mt-8 text-center">
+        <p class="text-xs text-on-surface-variant tracking-wide">© 2025 FRANCINE HOPE BADENG. ALL RIGHTS RESERVED.</p>
+      </footer>
+    </div>
+  </main>
+</div>
+
+<!-- ══════════════════════════════════════════
+     PAGE 2: REGISTRATION
+═══════════════════════════════════════════ -->
+<div id="page-register" class="page flex-col flex-grow">
+  <main class="flex-grow flex items-center justify-center p-6 bg-surface relative overflow-hidden">
+    <div class="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-primary/5 rounded-full blur-[120px]"></div>
+    <div class="absolute bottom-[-10%] right-[-10%] w-[30%] h-[30%] bg-tertiary-container/5 rounded-full blur-[100px]"></div>
+    <div class="w-full max-w-lg z-10">
+      <div class="bg-surface-container-lowest rounded-xl shadow-[0_32px_64px_rgba(20,27,43,0.04)] p-8 md:p-12 border border-outline-variant/15">
+        <div class="mb-10 text-center">
+          <div class="inline-flex items-center justify-center w-16 h-16 bg-primary-container/10 text-primary-container rounded-full mb-6">
+            <span class="material-symbols-outlined text-4xl" style="font-variation-settings:'FILL' 1;">fingerprint</span>
+          </div>
+          <h1 class="text-3xl font-bold tracking-tight text-on-surface mb-2">Biometric Enrollment</h1>
+          <p class="text-on-surface-variant text-sm font-medium">Secure your digital identity with military-grade precision.</p>
+        </div>
+        <div class="space-y-6">
+          <div class="space-y-2">
+            <label class="text-sm font-medium text-on-surface-variant block px-1">Email Address</label>
+            <input class="w-full h-12 bg-surface-container-highest rounded-lg px-4 text-on-surface placeholder:text-outline focus:ring-2 focus:ring-primary/20 focus:outline-none transition-all" placeholder="name@company.com" type="email"/>
+          </div>
+          <div class="space-y-2">
+            <label class="text-sm font-medium text-on-surface-variant block px-1">Password</label>
+            <input class="w-full h-12 bg-surface-container-highest rounded-lg px-4 text-on-surface placeholder:text-outline focus:ring-2 focus:ring-primary/20 focus:outline-none transition-all" placeholder="••••••••" type="password"/>
+          </div>
+          <div class="space-y-2">
+            <label class="text-sm font-medium text-on-surface-variant block px-1">Confirm Password</label>
+            <input class="w-full h-12 bg-surface-container-highest rounded-lg px-4 text-on-surface placeholder:text-outline focus:ring-2 focus:ring-primary/20 focus:outline-none transition-all" placeholder="••••••••" type="password"/>
+          </div>
+          <div class="pt-4">
+            <button onclick="goTo('page-keystroke')" class="w-full h-12 bg-primary-container text-on-primary-container font-semibold rounded-lg shadow-lg hover:brightness-110 active:scale-[0.98] transition-all flex items-center justify-center gap-2">
+              <span>Create Account</span>
+              <span class="material-symbols-outlined text-xl">arrow_forward</span>
+            </button>
+          </div>
+        </div>
+        <div class="mt-8 text-center">
+          <p class="text-on-surface-variant text-sm">
+            Already enrolled?
+            <a onclick="goTo('page-login')" class="text-primary font-semibold hover:underline decoration-2 underline-offset-4 ml-1 cursor-pointer">Login here</a>
+          </p>
+        </div>
+      </div>
+      <div class="mt-8 flex justify-center items-center gap-6 opacity-60">
+        <div class="flex items-center gap-2">
+          <span class="material-symbols-outlined text-sm">verified_user</span>
+          <span class="text-[10px] font-bold tracking-widest uppercase text-on-surface-variant">AES-256 Encrypted</span>
+        </div>
+        <div class="w-1 h-1 bg-outline-variant rounded-full"></div>
+        <div class="flex items-center gap-2">
+          <span class="material-symbols-outlined text-sm">privacy_tip</span>
+          <span class="text-[10px] font-bold tracking-widest uppercase text-on-surface-variant">FIDO2 Compliant</span>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ══════════════════════════════════════════
+     PAGE 3: KEYSTROKE ENROLLMENT
+═══════════════════════════════════════════ -->
+<div id="page-keystroke" class="page flex-col flex-grow">
+  <main class="pt-8 pb-12 px-4 md:px-8 min-h-screen flex flex-col items-center relative">
+    <!-- Floating background -->
+    <div class="fixed top-0 left-0 w-full h-full -z-10 pointer-events-none opacity-40">
+      <div class="absolute top-1/4 -left-20 w-96 h-96 bg-primary/10 rounded-full blur-[100px]"></div>
+      <div class="absolute bottom-1/4 -right-20 w-96 h-96 bg-secondary/10 rounded-full blur-[100px]"></div>
+    </div>
+
+    <!-- Stepper -->
+    <div class="w-full max-w-3xl mb-10">
+      <div class="flex items-center justify-between relative">
+        <div class="absolute top-5 left-10 right-10 h-0.5 bg-surface-container-highest -z-10"></div>
+        <!-- Step 1 active -->
+        <div class="flex flex-col items-center gap-3">
+          <div class="w-10 h-10 rounded-full bg-primary-container text-on-primary-container flex items-center justify-center font-bold shadow-lg ring-4 ring-background">1</div>
+          <span class="text-sm font-semibold" style="color:var(--color-primary)">Keystroke</span>
+        </div>
+        <!-- Step 2 -->
+        <div class="flex flex-col items-center gap-3">
+          <div class="w-10 h-10 rounded-full bg-surface-container-highest text-on-surface-variant flex items-center justify-center font-bold ring-4 ring-background">2</div>
+          <span class="text-sm font-medium text-on-surface-variant">Voice</span>
+        </div>
+        <!-- Step 3 -->
+        <div class="flex flex-col items-center gap-3">
+          <div class="w-10 h-10 rounded-full bg-surface-container-highest text-on-surface-variant flex items-center justify-center font-bold ring-4 ring-background">3</div>
+          <span class="text-sm font-medium text-on-surface-variant">Security</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main grid -->
+    <div class="w-full max-w-4xl grid grid-cols-1 lg:grid-cols-12 gap-8">
+      <!-- Left: input -->
+      <div class="lg:col-span-8 space-y-6">
+        <div class="bg-surface-container-low rounded-xl p-8 space-y-4">
+          <div class="flex justify-between items-center">
+            <h2 class="text-xl font-semibold text-on-surface">Verification Phrase</h2>
+            <span class="text-xs font-medium px-2 py-1 bg-surface-container-highest rounded text-on-surface-variant">Attempt 1 of 5</span>
+          </div>
+          <p class="text-on-surface-variant text-sm">Type the phrase below exactly as shown. Maintain your natural typing rhythm.</p>
+          <div class="bg-surface-container-lowest border-l-4 border-primary-container p-6 rounded-r-lg">
+            <p class="font-mono text-xl tracking-tight leading-relaxed text-on-surface select-none">
+              The secure digital perimeter protects the integrity of our biometric identity.
+            </p>
+          </div>
+          <!-- Progress bar -->
+          <div class="pt-4 space-y-2">
+            <div class="flex justify-between text-xs font-medium text-on-surface-variant">
+              <span>Completion Progress</span>
+              <span id="ks-pct">0%</span>
+            </div>
+            <div class="w-full h-1.5 bg-surface-container-highest rounded-full overflow-hidden">
+              <div id="ks-bar" class="h-full bg-primary-container rounded-full transition-all duration-300" style="width:0%"></div>
+            </div>
+          </div>
+        </div>
+        <!-- Textarea -->
+        <div class="relative">
+          <textarea id="ks-input" oninput="updateKeystrokeProgress()" class="w-full h-48 bg-surface-container-highest border-none rounded-xl p-6 font-mono text-lg focus:ring-2 focus:ring-primary-container focus:ring-opacity-20 placeholder:text-outline outline-none transition-all resize-none text-on-surface" placeholder="Start typing the phrase here..." spellcheck="false"></textarea>
+          <div class="absolute bottom-4 right-4">
+            <button onclick="goTo('page-voice')" class="px-6 py-2 bg-primary-container text-on-primary-container font-semibold rounded shadow-lg hover:shadow-primary/20 active:scale-95 transition-all">
+              Submit Sequence
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: metrics -->
+      <div class="lg:col-span-4 space-y-6">
+        <div class="bg-surface-container-low rounded-xl p-6 space-y-6">
+          <h3 class="text-base font-semibold flex items-center gap-2">
+            <span class="material-symbols-outlined text-primary">analytics</span>
+            Live Analysis
+          </h3>
+          <div class="space-y-6">
+            <div class="space-y-2">
+              <div class="flex justify-between items-end">
+                <span class="text-sm text-on-surface-variant">Typing Speed</span>
+                <span id="ks-wpm" class="text-sm font-bold text-on-surface">0 WPM</span>
+              </div>
+              <div class="h-2 w-full bg-surface-container-highest rounded-full">
+                <div id="ks-speed-bar" class="h-full bg-secondary rounded-full transition-all duration-500" style="width:0%"></div>
+              </div>
+            </div>
+            <div class="space-y-2">
+              <div class="flex justify-between items-end">
+                <span class="text-sm text-on-surface-variant">Consistency</span>
+                <span id="ks-cons" class="text-sm font-bold text-on-surface">—</span>
+              </div>
+              <div class="h-2 w-full bg-surface-container-highest rounded-full">
+                <div id="ks-cons-bar" class="h-full bg-primary rounded-full transition-all duration-500" style="width:0%"></div>
+              </div>
+            </div>
+            <div class="space-y-3">
+              <span class="text-sm text-on-surface-variant">Flight Time Profile</span>
+              <div class="flex items-end justify-between h-16 gap-1">
+                <div class="wave-bar w-full bg-primary-fixed-dim rounded-t-sm origin-bottom" style="height:40%"></div>
+                <div class="wave-bar w-full bg-primary-container rounded-t-sm origin-bottom" style="height:65%"></div>
+                <div class="wave-bar w-full bg-primary-fixed-dim rounded-t-sm origin-bottom" style="height:35%"></div>
+                <div class="wave-bar w-full bg-primary-container rounded-t-sm origin-bottom" style="height:80%"></div>
+                <div class="wave-bar w-full bg-primary-fixed-dim rounded-t-sm origin-bottom" style="height:55%"></div>
+                <div class="wave-bar w-full bg-primary-container rounded-t-sm origin-bottom" style="height:90%"></div>
+                <div class="wave-bar w-full bg-primary-fixed-dim rounded-t-sm origin-bottom" style="height:45%"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="bg-tertiary-container text-on-tertiary-container rounded-xl p-6 relative overflow-hidden">
+          <div class="relative z-10">
+            <div class="flex items-center gap-2 mb-2">
+              <span class="material-symbols-outlined text-sm">info</span>
+              <span class="text-xs font-bold uppercase tracking-wider">Expert Tip</span>
+            </div>
+            <p class="text-sm leading-relaxed opacity-90">Keystroke dynamics capture unique timing patterns of your typing. Don't try to be fast — be yourself.</p>
+          </div>
+          <span class="material-symbols-outlined absolute -bottom-4 -right-4 text-8xl opacity-10 rotate-12">keyboard</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer nav -->
+    <div class="mt-10 w-full max-w-4xl flex justify-between items-center text-on-surface-variant">
+      <button onclick="goTo('page-register')" class="flex items-center gap-2 text-sm font-medium hover:text-on-surface transition-colors">
+        <span class="material-symbols-outlined text-sm">arrow_back</span>
+        Back to Registration
+      </button>
+      <div class="flex items-center gap-4 text-xs">
+        <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-green-500"></span>Sentry Node: Active</span>
+        <span class="text-outline">|</span>
+        <span>Encrypted AES-256</span>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ══════════════════════════════════════════
+     PAGE 4: VOICE ENROLLMENT
+═══════════════════════════════════════════ -->
+<div id="page-voice" class="page flex-col flex-grow">
+  <main class="max-w-4xl mx-auto px-6 py-12 w-full">
+    <!-- Stepper -->
+    <div class="flex items-center justify-center mb-14 gap-4">
+      <div class="flex items-center gap-3">
+        <div class="flex h-10 w-10 items-center justify-center rounded-full signature-gradient text-white font-semibold shadow-md">
+          <span class="material-symbols-outlined text-sm" style="font-variation-settings:'FILL' 1;">check</span>
+        </div>
+        <span class="text-on-surface-variant font-medium text-sm">Keystroke</span>
+      </div>
+      <div class="h-px w-12 bg-primary-container"></div>
+      <div class="flex items-center gap-3">
+        <div class="flex h-10 w-10 items-center justify-center rounded-full bg-primary-container text-on-primary-container font-semibold shadow-md ring-4 ring-background">2</div>
+        <span class="text-primary font-medium">Voice</span>
+      </div>
+      <div class="h-px w-12 bg-surface-container-highest"></div>
+      <div class="flex items-center gap-3 opacity-40">
+        <div class="flex h-10 w-10 items-center justify-center rounded-full bg-surface-container-highest text-on-surface-variant font-semibold">3</div>
+        <span class="text-on-surface-variant text-sm">Security</span>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+      <!-- Left -->
+      <div class="lg:col-span-5 space-y-6">
+        <h1 class="text-4xl font-semibold tracking-tight leading-tight">Enroll your secure voice profile</h1>
+        <p class="text-on-surface-variant text-lg">Our digital sentry uses neural acoustic patterns to ensure only you can access your encrypted vault.</p>
+        <div class="bg-surface-container-low p-6 rounded-xl space-y-4">
+          <div class="flex items-center gap-4">
+            <span class="material-symbols-outlined text-primary">record_voice_over</span>
+            <div>
+              <p class="text-sm font-medium" id="voice-recording-label">Recording 1 of 3</p>
+              <div class="flex gap-1 mt-2" id="voice-dots">
+                <div class="h-2 w-8 rounded-full bg-primary-container"></div>
+                <div class="h-2 w-8 rounded-full bg-surface-container-highest"></div>
+                <div class="h-2 w-8 rounded-full bg-surface-container-highest"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <button id="voice-btn" onclick="toggleRecording()" class="w-full py-4 bg-tertiary-container text-on-tertiary-container font-semibold rounded hover:brightness-110 transition-all active:scale-[0.98] flex items-center justify-center gap-2">
+          <span class="material-symbols-outlined" style="font-variation-settings:'FILL' 1;">mic</span>
+          <span id="voice-btn-label">Start Recording</span>
+        </button>
+      </div>
+
+      <!-- Right -->
+      <div class="lg:col-span-7 bg-surface-container-lowest p-8 lg:p-10 rounded-xl shadow-sm border border-outline-variant/15">
+        <div class="space-y-10">
+          <div class="bg-surface-container-low p-10 rounded-xl relative overflow-hidden text-center">
+            <span class="absolute top-4 left-4 text-[10px] font-bold tracking-widest text-on-surface-variant opacity-50 uppercase">Authentication Phrase</span>
+            <h2 class="text-2xl font-medium tracking-tight leading-relaxed">
+              "The swift blue sentry watches over the digital horizon."
+            </h2>
+          </div>
+          <!-- Visualizer -->
+          <div class="flex flex-col items-center gap-8">
+            <div class="relative flex items-center justify-center h-48 w-48">
+              <div class="absolute inset-0 rounded-full border-4 border-surface-container-highest"></div>
+              <div id="voice-pulse" class="absolute inset-2 rounded-full border-2 border-primary/20"></div>
+              <!-- waveform visible while recording -->
+              <div id="voice-waveform" class="hidden absolute inset-0 items-center justify-center gap-1 px-8">
+                <div class="wave-bar flex-1 bg-primary rounded-sm" style="height:30%"></div>
+                <div class="wave-bar flex-1 bg-primary rounded-sm" style="height:60%"></div>
+                <div class="wave-bar flex-1 bg-primary rounded-sm" style="height:40%"></div>
+                <div class="wave-bar flex-1 bg-primary rounded-sm" style="height:80%"></div>
+                <div class="wave-bar flex-1 bg-primary rounded-sm" style="height:50%"></div>
+                <div class="wave-bar flex-1 bg-primary rounded-sm" style="height:70%"></div>
+                <div class="wave-bar flex-1 bg-primary rounded-sm" style="height:35%"></div>
+              </div>
+              <button onclick="toggleRecording()" id="voice-mic-btn" class="relative h-24 w-24 bg-surface-container-highest rounded-full flex items-center justify-center group hover:bg-surface-container-high transition-colors z-10">
+                <span class="material-symbols-outlined text-4xl text-primary">mic</span>
+              </button>
+            </div>
+            <div id="voice-bounce-dots" class="hidden items-center gap-3">
+              <div class="h-3 w-3 rounded-full bg-primary animate-bounce" style="animation-delay:0ms"></div>
+              <div class="h-3 w-3 rounded-full bg-primary animate-bounce" style="animation-delay:150ms"></div>
+              <div class="h-3 w-3 rounded-full bg-primary animate-bounce" style="animation-delay:300ms"></div>
+            </div>
+            <p id="voice-status" class="text-sm text-on-surface-variant">Tap the mic or the button to begin recording.</p>
+            <!-- Continue button — shown after all 3 recordings -->
+            <div id="voice-continue-wrap" class="hidden w-full">
+              <button onclick="goTo('page-security')" class="w-full py-3.5 bg-primary-container text-on-primary-container font-semibold rounded-lg shadow-lg shadow-primary/20 hover:bg-primary transition-all active:scale-[0.98] flex items-center justify-center gap-2">
+                <span>Continue to Security Questions</span>
+                <span class="material-symbols-outlined text-xl">arrow_forward</span>
+              </button>
+              <p id="voice-countdown" class="text-xs text-center text-on-surface-variant mt-2 opacity-70"></p>
+            </div>
+          </div>
+          <!-- Nav -->
+          <div class="flex justify-between items-center pt-4">
+            <button onclick="goTo('page-keystroke')" class="text-on-surface-variant font-medium flex items-center gap-2 hover:text-on-surface text-sm">
+              <span class="material-symbols-outlined text-sm">arrow_back</span>
+              Back to Keystroke
+            </button>
+            <button onclick="goTo('page-security')" class="px-6 py-2.5 text-secondary font-medium hover:bg-secondary-container/20 rounded transition-colors text-sm">
+              Skip for now
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Info cards -->
+    <div class="mt-16 grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div class="p-6 rounded-xl bg-surface-container-low">
+        <span class="material-symbols-outlined text-primary mb-3">verified_user</span>
+        <h3 class="font-medium text-sm mb-1">Encrypted Storage</h3>
+        <p class="text-xs text-on-surface-variant leading-relaxed">Voiceprints are hashed and stored in our isolated secure enclave, never in plain audio format.</p>
+      </div>
+      <div class="p-6 rounded-xl bg-surface-container-low">
+        <span class="material-symbols-outlined text-primary mb-3">spatial_audio_off</span>
+        <h3 class="font-medium text-sm mb-1">Noise Suppression</h3>
+        <p class="text-xs text-on-surface-variant leading-relaxed">Our AI filter removes background noise to capture your unique vocal frequency accurately.</p>
+      </div>
+      <div class="p-6 rounded-xl bg-surface-container-low">
+        <span class="material-symbols-outlined text-primary mb-3">nest_cam_iq</span>
+        <h3 class="font-medium text-sm mb-1">Liveness Detection</h3>
+        <p class="text-xs text-on-surface-variant leading-relaxed">System verifies dynamic vocal modulations to prevent spoofing from high-quality recordings.</p>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ══════════════════════════════════════════
+     PAGE 5: SECURITY QUESTION
+═══════════════════════════════════════════ -->
+<div id="page-security" class="page flex-col flex-grow">
+  <main class="flex-grow flex items-center justify-center p-6 bg-surface-container-low">
+    <div class="max-w-4xl w-full grid grid-cols-1 md:grid-cols-12 gap-8 items-start">
+      <!-- Left: context -->
+      <div class="md:col-span-4 space-y-8">
+        <div>
+          <h1 class="text-3xl font-semibold tracking-tight text-on-surface mb-2">Final Step</h1>
+          <p class="text-on-surface-variant text-sm leading-relaxed">Complete your secure profile by establishing an encrypted fallback method for your identity.</p>
+        </div>
+        <nav class="space-y-6">
+          <div class="flex items-center gap-4">
+            <div class="w-8 h-8 rounded-full signature-gradient flex items-center justify-center text-white text-sm font-bold">
+              <span class="material-symbols-outlined text-xs" style="font-variation-settings:'FILL' 1;">check</span>
+            </div>
+            <div>
+              <p class="text-xs font-semibold text-primary">Step 1</p>
+              <p class="text-sm font-medium text-on-surface">Identity Verification</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-4">
+            <div class="w-8 h-8 rounded-full signature-gradient flex items-center justify-center text-white text-sm font-bold">
+              <span class="material-symbols-outlined text-xs" style="font-variation-settings:'FILL' 1;">check</span>
+            </div>
+            <div>
+              <p class="text-xs font-semibold text-primary">Step 2</p>
+              <p class="text-sm font-medium text-on-surface">Biometric Capture</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-4">
+            <div class="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-white text-sm font-bold ring-4 ring-primary/20">3</div>
+            <div>
+              <p class="text-xs font-semibold text-primary">Step 3</p>
+              <p class="text-sm font-medium text-on-surface">Security Question</p>
+            </div>
+          </div>
+        </nav>
+        <div class="p-6 rounded-xl bg-surface-container-lowest shadow-sm space-y-4">
+          <div class="flex items-center gap-2 text-primary">
+            <span class="material-symbols-outlined text-sm">verified_user</span>
+            <span class="text-xs font-semibold">SECURE ENROLLMENT</span>
+          </div>
+          <p class="text-xs text-on-surface-variant leading-relaxed">Your answers are hashed using SHA-256 before being stored in our vault.</p>
+        </div>
+      </div>
+
+      <!-- Right: form -->
+      <div class="md:col-span-8">
+        <div class="bg-surface-container-lowest rounded-xl p-8 shadow-sm">
+          <div class="mb-8">
+            <h2 class="text-xl font-semibold text-on-surface mb-2">Set a security question as fallback authentication</h2>
+            <p class="text-on-surface-variant text-sm">This allows you to recover your account if biometric sensors are unavailable.</p>
+          </div>
+          <div class="space-y-8">
+            <div class="space-y-2">
+              <label class="text-xs font-medium text-on-surface-variant ml-1">Select Security Question</label>
+              <div class="relative">
+                <select class="w-full appearance-none bg-surface-container-highest text-on-surface rounded-lg px-4 py-4 pr-12 focus:outline-none focus:ring-2 focus:ring-primary/20 cursor-pointer">
+                  <option disabled selected value="">Choose a question...</option>
+                  <option>What was the name of your first pet?</option>
+                  <option>In what city were you born?</option>
+                  <option>What was the make of your first car?</option>
+                  <option>What is your mother's maiden name?</option>
+                  <option>What was the name of your elementary school?</option>
+                </select>
+                <div class="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-on-surface-variant">
+                  <span class="material-symbols-outlined">expand_more</span>
+                </div>
+              </div>
+            </div>
+            <div class="space-y-2">
+              <label class="text-xs font-medium text-on-surface-variant ml-1">Your Answer</label>
+              <div class="relative">
+                <input class="w-full bg-surface-container-highest text-on-surface rounded-lg px-4 py-4 focus:outline-none focus:ring-2 focus:ring-primary/20 placeholder:text-on-surface-variant/50" placeholder="Type your answer here..." type="text"/>
+                <div class="absolute right-4 top-1/2 -translate-y-1/2 text-on-surface-variant/30">
+                  <span class="material-symbols-outlined">lock</span>
+                </div>
+              </div>
+              <p class="text-[10px] text-on-surface-variant/60 italic ml-1">Answers are not case-sensitive.</p>
+            </div>
+            <div class="pt-6 flex items-center justify-between gap-4">
+              <button onclick="goTo('page-voice')" class="text-sm font-medium text-on-surface-variant hover:text-on-surface px-6 py-3 transition-colors active:scale-95">
+                ← Back
+              </button>
+              <button onclick="showSuccess()" class="bg-[#10b981] hover:bg-[#059669] text-white font-semibold text-sm px-8 py-4 rounded-lg flex items-center gap-3 shadow-lg shadow-emerald-500/20 active:scale-[0.98] transition-all">
+                <span>Complete Enrollment</span>
+                <span class="material-symbols-outlined text-sm">arrow_forward</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Ambient image card -->
+        <div class="mt-8 relative h-44 w-full rounded-xl overflow-hidden bg-gradient-to-br from-primary/10 to-secondary/10 flex items-end p-6">
+          <div class="absolute inset-0 opacity-5">
+            <svg width="100%" height="100%" viewBox="0 0 400 200"><circle cx="50" cy="100" r="80" fill="#004ac6"/><circle cx="200" cy="60" r="50" fill="#2563eb"/><circle cx="350" cy="130" r="90" fill="#495c95"/></svg>
+          </div>
+          <div class="flex items-center gap-4 relative z-10">
+            <div class="w-12 h-12 rounded-full bg-surface-container-lowest flex items-center justify-center shadow-lg">
+              <span class="material-symbols-outlined text-primary">verified_user</span>
+            </div>
+            <div>
+              <p class="text-xs font-bold text-on-surface uppercase tracking-widest">Sentry Shield Active</p>
+              <p class="text-[10px] text-on-surface-variant">Global Threat Intelligence Engine Enabled</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+  <footer class="p-6 text-center">
+    <p class="text-xs text-on-surface-variant/50">© 2025 Sentry Auth Systems. Encrypted under AES-256 standard.</p>
+  </footer>
+</div>
+
+<!-- ══════════════════════════════════════════
+     PAGE 6: LOGIN – KEYSTROKE VERIFICATION
+═══════════════════════════════════════════ -->
+<div id="page-ks-verify" class="page flex-col flex-grow">
+  <main class="flex-grow flex items-center justify-center px-4 pt-10 pb-12">
+    <div class="w-full max-w-md">
+      <div class="bg-surface-container-lowest rounded-xl shadow-[0_32px_64px_-12px_rgba(20,27,43,0.06)] border border-outline-variant/10 overflow-hidden">
+        <div class="p-8 flex flex-col items-center text-center">
+          <!-- Icon -->
+          <div class="w-16 h-16 rounded-full bg-surface-container-low flex items-center justify-center mb-6">
+            <span class="material-symbols-outlined text-primary text-4xl" style="font-variation-settings:'FILL' 1;">shield_person</span>
+          </div>
+          <h1 class="text-2xl font-semibold tracking-tight text-on-surface mb-8 font-headline">Biometric Login</h1>
+          <!-- 3-step stepper -->
+          <div class="w-full flex items-center justify-between mb-10 px-4">
+            <div class="flex flex-col items-center gap-2">
+              <div class="w-10 h-10 rounded-full bg-primary-container text-on-primary-container flex items-center justify-center">
+                <span class="material-symbols-outlined" style="font-variation-settings:'FILL' 1;">keyboard</span>
+              </div>
+              <span class="text-xs font-medium" style="color:var(--color-primary)">Keystroke</span>
+            </div>
+            <div class="flex-grow h-px bg-surface-container-highest mx-2 mb-6"></div>
+            <div class="flex flex-col items-center gap-2">
+              <div class="w-10 h-10 rounded-full bg-surface-container-highest text-on-surface-variant flex items-center justify-center">
+                <span class="material-symbols-outlined">mic</span>
+              </div>
+              <span class="text-xs font-medium text-on-surface-variant">Voice</span>
+            </div>
+            <div class="flex-grow h-px bg-surface-container-highest mx-2 mb-6"></div>
+            <div class="flex flex-col items-center gap-2">
+              <div class="w-10 h-10 rounded-full bg-surface-container-highest text-on-surface-variant flex items-center justify-center">
+                <span class="material-symbols-outlined">verified_user</span>
+              </div>
+              <span class="text-xs font-medium text-on-surface-variant">Access</span>
+            </div>
+          </div>
+          <!-- Info banner -->
+          <div class="w-full bg-surface-container-low border-l-4 border-primary p-4 rounded-r-lg flex items-start gap-3 text-left mb-8">
+            <span class="material-symbols-outlined text-primary text-xl mt-0.5">info</span>
+            <p class="text-sm text-on-surface-variant leading-relaxed">Credentials verified. Now verify your typing pattern.</p>
+          </div>
+          <!-- Phrase -->
+          <div class="w-full text-left mb-6">
+            <label class="text-xs font-medium text-on-surface-variant mb-2 block px-1">Type this phrase:</label>
+            <div class="bg-surface-container rounded-lg p-4 font-mono text-sm tracking-wide border border-outline-variant/10" style="color:var(--color-primary)">
+              the quick security sentry jumps over the firewall
+            </div>
+          </div>
+          <!-- Input -->
+          <div class="w-full mb-8">
+            <input id="ks-verify-input" oninput="updateKsVerify()" class="w-full h-12 bg-surface-container-highest border-none focus:ring-2 focus:ring-primary/20 rounded-lg px-4 text-on-surface placeholder:text-on-surface-variant/50 transition-all" placeholder="Start typing above phrase..." type="text"/>
+            <div class="mt-3 h-1.5 w-full bg-surface-container-highest rounded-full overflow-hidden">
+              <div id="ks-verify-bar" class="h-full bg-primary-container rounded-full transition-all duration-300" style="width:0%"></div>
+            </div>
+          </div>
+          <!-- CTA -->
+          <button onclick="goTo('page-voice-verify')" class="w-full bg-primary-container text-on-primary-container h-12 rounded-lg font-semibold hover:bg-primary active:scale-[0.98] transition-all flex items-center justify-center gap-2">
+            Verify Keystroke
+            <span class="material-symbols-outlined text-xl">arrow_forward</span>
+          </button>
+          <!-- Attempt dots -->
+          <div class="mt-8 flex items-center gap-2">
+            <div class="w-2 h-2 rounded-full bg-outline-variant"></div>
+            <div class="w-2 h-2 rounded-full bg-outline-variant"></div>
+            <div class="w-2 h-2 rounded-full bg-outline-variant"></div>
+          </div>
+        </div>
+      </div>
+      <p class="text-center mt-8 text-on-surface-variant text-sm">
+        Need help? <a class="font-medium hover:underline cursor-pointer" style="color:var(--color-primary)">Contact Security Admin</a>
+      </p>
+    </div>
+  </main>
+  <footer class="py-6 px-6 border-t border-outline-variant/10">
+    <div class="max-w-screen-xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
+      <span class="text-xs text-on-surface-variant">© 2025 Biometric Sentry. Secure Identity Management.</span>
+      <div class="flex gap-6">
+        <a class="text-xs text-on-surface-variant hover:underline" href="#">Privacy Policy</a>
+        <a class="text-xs text-on-surface-variant hover:underline" href="#">Terms of Service</a>
+        <a class="text-xs text-on-surface-variant hover:underline" href="#">Security Whitepaper</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- ══════════════════════════════════════════
+     PAGE 7: LOGIN – VOICE VERIFICATION
+═══════════════════════════════════════════ -->
+<div id="page-voice-verify" class="page flex-col flex-grow">
+  <main class="flex-grow pt-8 pb-16 px-4 flex flex-col items-center justify-center">
+    <!-- Warning banner -->
+    <div class="w-full max-w-xl mb-0 bg-tertiary-fixed text-on-tertiary-fixed px-6 py-3 flex items-center gap-3 rounded-t-xl" style="background-color:var(--color-tertiary-fixed);color:var(--color-on-tertiary-fixed);">
+      <span class="material-symbols-outlined" style="color:var(--color-tertiary)">warning</span>
+      <p class="text-sm font-medium">Keystroke verified. Final check: voice biometric.</p>
+    </div>
+    <div class="w-full max-w-xl bg-surface-container-low rounded-b-xl shadow-sm overflow-hidden">
+      <div class="p-8 md:p-10 flex flex-col items-center">
+        <!-- Header -->
+        <div class="mb-8 flex flex-col items-center text-center">
+          <div class="w-16 h-16 bg-primary-container rounded-full flex items-center justify-center text-on-primary-container mb-4">
+            <span class="material-symbols-outlined text-4xl">shield</span>
+          </div>
+          <h1 class="text-2xl font-semibold tracking-tight text-on-surface">Biometric Login</h1>
+        </div>
+        <!-- Stepper -->
+        <div class="w-full max-w-xs mb-12 flex items-center justify-between relative">
+          <div class="absolute top-1/2 left-0 w-full h-0.5 bg-outline-variant -translate-y-1/2 z-0"></div>
+          <div class="absolute top-1/2 left-0 w-1/2 h-0.5 -translate-y-1/2 z-0" style="background-color:var(--color-primary)"></div>
+          <div class="relative z-10 w-8 h-8 rounded-full bg-primary-container text-on-primary-container flex items-center justify-center text-sm font-bold">1</div>
+          <div class="relative z-10 w-8 h-8 rounded-full bg-primary-container text-on-primary-container flex items-center justify-center text-sm font-bold">2</div>
+          <div class="relative z-10 w-8 h-8 rounded-full bg-surface-container-high text-outline flex items-center justify-center text-sm font-bold">3</div>
+        </div>
+        <!-- Phrase -->
+        <div class="w-full mb-8">
+          <label class="text-sm font-medium text-on-surface-variant block mb-2">Say this phrase:</label>
+          <div class="bg-surface-container-lowest border border-outline-variant/20 rounded-lg p-6 text-center">
+            <p class="font-mono text-xl md:text-2xl tracking-wide" style="color:var(--color-primary)">"The azure vault remains secure under constant watch."</p>
+          </div>
+        </div>
+        <!-- Mic -->
+        <div class="flex flex-col items-center gap-6 mb-10 w-full">
+          <div class="relative">
+            <div id="vv-mic-ring" class="w-24 h-24 bg-surface-variant rounded-full flex items-center justify-center cursor-pointer hover:brightness-95 transition-all active:scale-95" onclick="toggleVoiceVerify()">
+              <span class="material-symbols-outlined text-4xl" style="color:var(--color-tertiary);font-variation-settings:'FILL' 1;">mic</span>
+            </div>
+          </div>
+          <div class="text-center">
+            <div class="flex items-center justify-center gap-2 mb-1">
+              <div id="vv-status-dot" class="w-2 h-2 rounded-full bg-outline-variant"></div>
+              <p id="vv-status-text" class="text-xs font-medium text-on-surface-variant">Tap mic to begin recording</p>
+            </div>
+            <p id="vv-quality" class="text-xs font-mono text-outline uppercase tracking-wider opacity-0 transition-opacity">Audio quality: excellent — SNR=47.2dB voiced=75%</p>
+          </div>
+        </div>
+        <!-- Actions -->
+        <div class="flex flex-col w-full gap-3">
+          <button id="vv-stop-btn" onclick="toggleVoiceVerify()" class="w-full font-semibold py-3.5 rounded-lg hover:opacity-90 transition-all flex items-center justify-center gap-2" style="background-color:var(--color-tertiary-container);color:var(--color-on-tertiary-container);">
+            <span class="material-symbols-outlined">mic</span>
+            <span id="vv-btn-label">Start Recording</span>
+          </button>
+          <button onclick="goTo('page-welcome')" class="w-full font-semibold py-3.5 rounded-lg hover:opacity-90 transition-all" style="background-color:var(--color-secondary);color:var(--color-on-secondary);">
+            Verify & Access Dashboard
+          </button>
+        </div>
+        <!-- Attempt dots -->
+        <div class="mt-8 flex items-center gap-2">
+          <div id="vv-dot-1" class="w-2.5 h-2.5 rounded-full bg-outline-variant"></div>
+          <div id="vv-dot-2" class="w-2.5 h-2.5 rounded-full bg-outline-variant"></div>
+          <div id="vv-dot-3" class="w-2.5 h-2.5 rounded-full bg-outline-variant"></div>
+        </div>
+        <p class="mt-2 text-[10px] text-outline uppercase tracking-widest font-bold">Verification Attempts</p>
+      </div>
+    </div>
+    <!-- Info bento -->
+    <div class="mt-10 grid grid-cols-1 md:grid-cols-3 gap-6 w-full max-w-4xl">
+      <div class="p-6 bg-surface-container-low rounded-xl flex flex-col gap-2">
+        <span class="material-symbols-outlined" style="color:var(--color-primary)">record_voice_over</span>
+        <h3 class="font-semibold text-on-surface text-sm">Vocal Biometrics</h3>
+        <p class="text-xs text-on-surface-variant">Analyzing pitch, frequency, and spectral envelope for identity confirmation.</p>
+      </div>
+      <div class="p-6 bg-surface-container-low rounded-xl flex flex-col gap-2">
+        <span class="material-symbols-outlined" style="color:var(--color-primary)">lock_clock</span>
+        <h3 class="font-semibold text-on-surface text-sm">Time-Limited Session</h3>
+        <p class="text-xs text-on-surface-variant">Your voice token expires in 120 seconds to prevent replay attacks.</p>
+      </div>
+      <div class="p-6 bg-surface-container-low rounded-xl flex flex-col gap-2">
+        <span class="material-symbols-outlined" style="color:var(--color-primary)">visibility_off</span>
+        <h3 class="font-semibold text-on-surface text-sm">Privacy First</h3>
+        <p class="text-xs text-on-surface-variant">Audio is processed locally and never stored in raw format on our servers.</p>
+      </div>
+    </div>
+  </main>
+  <footer class="py-6 px-6 border-t border-outline-variant/10">
+    <div class="max-w-screen-xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
+      <span class="text-xs text-on-surface-variant">© 2025 Biometric Sentry. Secure Identity Management.</span>
+      <div class="flex gap-6">
+        <a class="text-xs text-on-surface-variant hover:underline" href="#">Privacy Policy</a>
+        <a class="text-xs text-on-surface-variant hover:underline" href="#">Terms of Service</a>
+        <a class="text-xs text-on-surface-variant hover:underline" href="#">Security Whitepaper</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- ══════════════════════════════════════════
+     PAGE 8: WELCOME DASHBOARD
+═══════════════════════════════════════════ -->
+<div id="page-welcome" class="page flex-col flex-grow">
+  <!-- Dashboard-style secondary nav -->
+  <div class="w-full bg-surface-container-lowest border-b border-outline-variant/10 px-6 py-2 flex items-center gap-8">
+    <a class="text-sm font-semibold border-b-2 pb-2 -mb-2 cursor-pointer" style="color:var(--color-primary);border-color:var(--color-primary)">Dashboard</a>
+    <a class="text-sm text-on-surface-variant hover:text-on-surface transition-colors pb-2 -mb-2 cursor-pointer">Logs</a>
+    <a class="text-sm text-on-surface-variant hover:text-on-surface transition-colors pb-2 -mb-2 cursor-pointer">Devices</a>
+    <div class="ml-auto">
+      <button class="p-2 rounded-full hover:bg-surface-container-low transition-colors">
+        <span class="material-symbols-outlined text-on-surface-variant">notifications</span>
+      </button>
+    </div>
+  </div>
+  <main class="flex-grow flex items-center justify-center p-6 bg-surface-container-low">
+    <div class="w-full max-w-md">
+      <!-- Welcome card -->
+      <div class="bg-surface-container-lowest rounded-xl shadow-[0_32px_64px_-12px_rgba(20,27,43,0.06)] p-8 flex flex-col items-center text-center">
+        <div class="mb-6 p-4 bg-primary-container/10 rounded-full">
+          <span class="material-symbols-outlined text-4xl" style="font-variation-settings:'FILL' 1;color:var(--color-primary)">home</span>
+        </div>
+        <h1 class="text-2xl font-semibold text-on-surface mb-2 tracking-tight">Welcome!</h1>
+        <p class="text-on-surface-variant mb-8">You have been successfully authenticated.</p>
+        <!-- Session status -->
+        <div class="w-full bg-surface-container-low rounded-xl p-5 mb-8 border border-outline-variant/15">
+          <div class="flex items-center justify-center gap-2 mb-1">
+            <span class="material-symbols-outlined text-xl" style="color:#059669;font-variation-settings:'FILL' 1;">check_circle</span>
+            <span class="font-semibold text-sm" style="color:#047857">Session Active</span>
+          </div>
+          <p class="text-xs text-on-surface-variant leading-relaxed">Continuous authentication is monitoring your session</p>
+        </div>
+        <!-- Logout -->
+        <button onclick="goTo('page-login')" class="w-full py-3.5 px-6 font-semibold rounded-lg flex items-center justify-center gap-2 transition-all hover:opacity-90 active:scale-[0.98]" style="background-color:var(--color-error-container);color:var(--color-on-error-container);">
+          <span class="material-symbols-outlined text-lg">logout</span>
+          Logout
+        </button>
+        <!-- Tunnel indicator -->
+        <div class="mt-8 flex items-center gap-4 py-3 px-4 bg-surface rounded-full border border-outline-variant/10">
+          <div class="w-2 h-2 rounded-full animate-pulse" style="background-color:var(--color-primary)"></div>
+          <span class="text-[10px] uppercase tracking-widest font-bold text-on-surface-variant">Encrypted Biometric Tunnel Active</span>
+        </div>
+      </div>
+      <!-- Footer meta -->
+      <div class="mt-8 text-center">
+        <p class="text-xs text-on-surface-variant">SentryCore v4.2.0 • Identity Verification Protocol 7-B</p>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ══════════════════════════════════════════
+     SUCCESS MODAL (enrollment complete)
+═══════════════════════════════════════════ -->
+<div id="success-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4" style="background:rgba(20,27,43,0.4);backdrop-filter:blur(8px);">
+  <div class="bg-surface-container-lowest rounded-xl p-10 max-w-sm w-full text-center shadow-[0_32px_64px_rgba(20,27,43,0.12)] border border-outline-variant/15 animate-[fadeIn_0.3s_ease]">
+    <div class="w-20 h-20 signature-gradient rounded-full flex items-center justify-center mx-auto mb-6 shadow-xl shadow-primary/30">
+      <span class="material-symbols-outlined text-white text-4xl" style="font-variation-settings:'FILL' 1;">verified_user</span>
+    </div>
+    <h2 class="text-2xl font-bold text-on-surface mb-2">Enrollment Complete</h2>
+    <p class="text-on-surface-variant text-sm mb-8">Your biometric identity has been secured. Welcome to the Sentry network.</p>
+    <div class="space-y-3">
+      <button onclick="closeSuccess(); goTo('page-welcome')" class="w-full py-3.5 bg-primary-container text-on-primary-container font-semibold rounded-lg hover:bg-primary transition-all active:scale-[0.98] flex items-center justify-center gap-2">
+        <span>Go to Dashboard</span>
+        <span class="material-symbols-outlined text-xl">home</span>
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── Dark mode ──
+  function toggleDark() {
+    const html = document.documentElement;
+    html.classList.toggle('dark');
+    const isDark = html.classList.contains('dark');
+    document.getElementById('theme-icon').textContent = isDark ? 'light_mode' : 'dark_mode';
+    localStorage.setItem('theme', isDark ? 'dark' : 'light');
+  }
+  // Restore saved preference
+  if (localStorage.getItem('theme') === 'dark') {
+    document.documentElement.classList.add('dark');
+    document.addEventListener('DOMContentLoaded', () => {
+      const icon = document.getElementById('theme-icon');
+      if (icon) icon.textContent = 'light_mode';
+    });
+  }
+
+  // ── Navigation ──
+  function goTo(pageId) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    const target = document.getElementById(pageId);
+    if (target) target.classList.add('active');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  // ── Keystroke metrics ──
+  let ksStart = null;
+  const phrase = "The secure digital perimeter protects the integrity of our biometric identity.";
+
+  function updateKeystrokeProgress() {
+    const input = document.getElementById('ks-input').value;
+    if (!ksStart && input.length > 0) ksStart = Date.now();
+
+    const pct = Math.min(100, Math.round((input.length / phrase.length) * 100));
+    document.getElementById('ks-pct').textContent = pct + '%';
+    document.getElementById('ks-bar').style.width = pct + '%';
+
+    if (ksStart && input.length > 0) {
+      const mins = (Date.now() - ksStart) / 60000;
+      const words = input.trim().split(/\s+/).length;
+      const wpm = Math.round(words / Math.max(mins, 0.01));
+      const capped = Math.min(wpm, 120);
+      document.getElementById('ks-wpm').textContent = capped + ' WPM';
+      document.getElementById('ks-speed-bar').style.width = (capped / 120 * 100) + '%';
+
+      // Fake consistency score based on length
+      const cons = Math.min(98, 60 + Math.round(input.length / phrase.length * 38));
+      document.getElementById('ks-cons').textContent = cons + '%';
+      document.getElementById('ks-cons-bar').style.width = cons + '%';
+    }
+  }
+
+  // ── Voice recording toggle ──
+  let isRecording = false;
+  let voiceCount = 0;
+  let recordTimer = null;
+
+  function toggleRecording() {
+    isRecording = !isRecording;
+    const btn = document.getElementById('voice-btn');
+    const label = document.getElementById('voice-btn-label');
+    const pulse = document.getElementById('voice-pulse');
+    const waveform = document.getElementById('voice-waveform');
+    const bounceDots = document.getElementById('voice-bounce-dots');
+    const status = document.getElementById('voice-status');
+
+    if (isRecording) {
+      btn.classList.remove('bg-tertiary-container', 'text-on-tertiary-container');
+      btn.classList.add('bg-error', 'text-white');
+      label.textContent = 'Stop Recording';
+      pulse.classList.add('animate-ping');
+      waveform.classList.remove('hidden');
+      waveform.classList.add('flex');
+      bounceDots.classList.remove('hidden');
+      bounceDots.classList.add('flex');
+      status.textContent = 'Recording in progress... speak clearly.';
+
+      recordTimer = setTimeout(() => {
+        if (isRecording) toggleRecording(); // auto-stop after 5s
+      }, 5000);
+    } else {
+      clearTimeout(recordTimer);
+      btn.classList.add('bg-tertiary-container', 'text-on-tertiary-container');
+      btn.classList.remove('bg-error', 'text-white');
+      pulse.classList.remove('animate-ping');
+      waveform.classList.add('hidden');
+      waveform.classList.remove('flex');
+      bounceDots.classList.add('hidden');
+      bounceDots.classList.remove('flex');
+
+      voiceCount = Math.min(voiceCount + 1, 3);
+      const dots = document.getElementById('voice-dots').children;
+      for (let i = 0; i < dots.length; i++) {
+        if (i < voiceCount) {
+          dots[i].classList.remove('bg-surface-container-highest');
+          dots[i].classList.add('bg-primary-container');
+        }
+      }
+      if (voiceCount >= 3) {
+        label.textContent = 'All recordings captured ✓';
+        btn.disabled = true;
+        btn.classList.add('opacity-60');
+        status.textContent = 'All 3 recordings captured successfully!';
+        document.getElementById('voice-recording-label').textContent = 'Recording 3 of 3 ✓';
+        // Show continue button and auto-advance
+        const wrap = document.getElementById('voice-continue-wrap');
+        wrap.classList.remove('hidden');
+        wrap.classList.add('flex', 'flex-col');
+        let secs = 5;
+        const cdEl = document.getElementById('voice-countdown');
+        cdEl.textContent = `Auto-advancing in ${secs}s...`;
+        const iv = setInterval(() => {
+          secs--;
+          if (secs > 0) {
+            cdEl.textContent = `Auto-advancing in ${secs}s...`;
+          } else {
+            clearInterval(iv);
+            goTo('page-security');
+          }
+        }, 1000);
+      } else {
+        label.textContent = 'Record Again';
+        document.getElementById('voice-recording-label').textContent = `Recording ${voiceCount + 1} of 3`;
+        status.textContent = `Recording ${voiceCount} saved. ${3 - voiceCount} remaining.`;
+      }
+    }
+  }
+
+  // ── Keystroke verify (login flow) ──
+  const ksVerifyPhrase = "the quick security sentry jumps over the firewall";
+  function updateKsVerify() {
+    const val = document.getElementById('ks-verify-input').value;
+    const pct = Math.min(100, Math.round((val.length / ksVerifyPhrase.length) * 100));
+    document.getElementById('ks-verify-bar').style.width = pct + '%';
+  }
+
+  // ── Voice verify (login flow) ──
+  let vvRecording = false;
+  let vvAttempts = 0;
+  let vvTimer = null;
+  function toggleVoiceVerify() {
+    vvRecording = !vvRecording;
+    const ring = document.getElementById('vv-mic-ring');
+    const dot = document.getElementById('vv-status-dot');
+    const text = document.getElementById('vv-status-text');
+    const quality = document.getElementById('vv-quality');
+    const btnLabel = document.getElementById('vv-btn-label');
+    const stopBtn = document.getElementById('vv-stop-btn');
+    if (vvRecording) {
+      ring.classList.add('mic-pulse');
+      dot.style.backgroundColor = '#22c55e';
+      text.textContent = 'Status: Recording...';
+      quality.style.opacity = '1';
+      btnLabel.textContent = 'Stop Recording';
+      stopBtn.innerHTML = '<span class="material-symbols-outlined">stop</span> <span>Stop Recording</span>';
+      vvTimer = setTimeout(() => { if (vvRecording) toggleVoiceVerify(); }, 4000);
+    } else {
+      clearTimeout(vvTimer);
+      ring.classList.remove('mic-pulse');
+      dot.style.backgroundColor = '';
+      dot.classList.add('bg-outline-variant');
+      vvAttempts = Math.min(vvAttempts + 1, 3);
+      text.textContent = `Recording ${vvAttempts} captured. Tap to record again.`;
+      quality.style.opacity = '0';
+      btnLabel.textContent = 'Record Again';
+      stopBtn.innerHTML = '<span class="material-symbols-outlined">mic</span> <span id="vv-btn-label">Record Again</span>';
+      const dotEls = ['vv-dot-1','vv-dot-2','vv-dot-3'];
+      if (vvAttempts <= 3) {
+        document.getElementById(dotEls[vvAttempts-1]).style.backgroundColor = 'var(--color-error)';
+      }
+    }
+  }
+
+  // ── Success modal ──
+  function showSuccess() {
+    document.getElementById('success-modal').classList.remove('hidden');
+    document.getElementById('success-modal').classList.add('flex');
+  }
+  function closeSuccess() {
+    document.getElementById('success-modal').classList.add('hidden');
+    document.getElementById('success-modal').classList.remove('flex');
+  }
+</script>
+</body>
+</html>

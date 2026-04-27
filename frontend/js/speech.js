@@ -192,8 +192,12 @@ const SpeechCapture = {
             this.stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     channelCount:      1,
-                    echoCancellation:  true,   // remove mic echo from room reflections
-                    noiseSuppression:  true,   // browser-level denoising (free, hardware-accelerated)
+                    echoCancellation:  false,  // DISABLED — browser/OS echo cancellers are
+                                               // device-specific and cause cross-device ECAPA drift.
+                    noiseSuppression:  false,  // DISABLED — same reason. Browser denoisers vary
+                                               // by Chrome/Edge/Firefox + OS + driver, so the
+                                               // spectrum reaching ECAPA is not consistent across
+                                               // devices. Backend CMVN handles channel normalization.
                     autoGainControl:   false,  // DISABLED — AGC introduces session-varying compression
                                                // that degrades ECAPA speaker-embedding consistency.
                                                // Backend CMVN + _autoGain handle level normalization.

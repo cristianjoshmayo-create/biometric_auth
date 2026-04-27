@@ -118,6 +118,10 @@ async def serve_auth_flow_js():
 async def serve_keystroke_js():
     return _serve_js(os.path.join(frontend_dir, "js", "keystroke.js"))
 
+@app.get("/static/js/reset.js")
+async def serve_reset_js():
+    return _serve_js(os.path.join(frontend_dir, "js", "reset.js"))
+
 @app.get("/static/pages/enroll.html")
 async def serve_enroll_html():
     return _serve_html(os.path.join(frontend_dir, "pages", "enroll.html"))
@@ -125,6 +129,14 @@ async def serve_enroll_html():
 @app.get("/static/pages/login.html")
 async def serve_login_html():
     return _serve_html(os.path.join(frontend_dir, "pages", "login.html"))
+
+@app.get("/static/pages/forgot-password.html")
+async def serve_forgot_password_html():
+    return _serve_html(os.path.join(frontend_dir, "pages", "forgot-password.html"))
+
+@app.get("/static/pages/reset.html")
+async def serve_reset_html():
+    return _serve_html(os.path.join(frontend_dir, "pages", "reset.html"))
 
 
 app.mount("/static", StaticFiles(directory=frontend_dir), name="static")

@@ -117,13 +117,20 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Cosine similarity threshold.
-# ECAPA-TDNN embeddings are tightly clustered per speaker so 0.75 is a
+# ECAPA-TDNN embeddings are tightly clustered per speaker so 0.68 is a
 # conservative but reliable operating point for short passphrases.
-# Lower = more permissive (fewer false rejects, more false accepts).
-# Higher = stricter (fewer false accepts, more false rejects).
-DEFAULT_THRESHOLD = 0.65
+# Bumped from 0.65 → 0.68 in Phase 2 because max-cosine over a multi-slot
+# profile inflates scores slightly compared with cosine-vs-mean.
+DEFAULT_THRESHOLD = 0.68
 
 EMBEDDING_DIM = 192   # ECAPA-TDNN output dimension
+
+# Multi-embedding profile caps (Phase 2: adaptive cross-device coverage).
+# Profile = up to MAX_ENROLL enrollment slots + up to MAX_ADAPTIVE adaptive
+# slots. Enrollment slots are protected; adaptive slots use FIFO eviction
+# so the most recent device/condition embeddings dominate.
+MAX_ENROLL   = 5
+MAX_ADAPTIVE = 5
 
 # Model is cached here after the first download so it survives server restarts.
 _PRETRAINED_DIR = os.path.join(
@@ -150,7 +157,20 @@ def _load_profile(username: str) -> Optional[dict]:
     if not os.path.exists(path):
         return None
     with open(path, "rb") as f:
-        return pickle.load(f)
+        profile = pickle.load(f)
+    # Phase 2 backward-compat migration: old profiles store `embeddings` as
+    # a flat list of float-lists. Convert each to a tagged slot dict so we
+    # can distinguish enrollment from adaptive entries and apply FIFO
+    # eviction on the adaptive ones only.
+    embs = profile.get("embeddings", [])
+    if embs and isinstance(embs[0], list):
+        from datetime import datetime as _dt, timezone as _tz
+        ts = _dt.now(_tz.utc).isoformat()
+        profile["embeddings"] = [
+            {"vec": e, "source": "enrollment", "ts": ts} for e in embs
+        ]
+        _save_profile(profile)
+    return profile
 
 def _save_profile(data: dict):
     os.makedirs(_model_dir(), exist_ok=True)
@@ -272,52 +292,106 @@ def extract_embedding(audio: np.ndarray, sr: int = 16000) -> Optional[List[float
 #  ENROLLMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_enrollment(username: str, embedding: List[float]) -> dict:
-    """
-    Append a new enrollment embedding and recompute the mean voice profile.
-
-    Called by enroll.py after each voice recording. No separate training step
-    needed — the profile updates immediately so auth works after 1 recording.
-
-    Parameters
-    ----------
-    username  : str
-    embedding : list of 192 floats from extract_embedding()
-
-    Returns
-    -------
-    dict with success flag and current enrollment count.
-    """
-    emb = np.array(embedding, dtype=np.float32)
-
-    if len(emb) != EMBEDDING_DIM:
-        return {"error": f"Expected {EMBEDDING_DIM}-dim embedding, got {len(emb)}"}
-
-    profile = _load_profile(username) or {
+def _new_profile(username: str) -> dict:
+    return {
         "username":       username,
-        "embeddings":     [],
-        "mean_embedding": None,
+        "embeddings":     [],            # list of {vec, source, ts}
+        "mean_embedding": None,          # kept for diagnostics; auth uses max-cosine
         "threshold":      DEFAULT_THRESHOLD,
         "n_enrollment":   0,
     }
 
-    profile["embeddings"].append(emb.tolist())
-    profile["n_enrollment"] = len(profile["embeddings"])
+def _recompute_mean(profile: dict) -> None:
+    """Refresh the diagnostic mean_embedding + n_enrollment counters."""
+    slots = profile.get("embeddings", [])
+    if not slots:
+        profile["mean_embedding"] = None
+        profile["n_enrollment"]   = 0
+        return
+    vecs = np.array([s["vec"] for s in slots], dtype=np.float32)
+    mean = vecs.mean(axis=0)
+    mean = mean / (np.linalg.norm(mean) + 1e-10)
+    profile["mean_embedding"] = mean.tolist()
+    profile["n_enrollment"]   = sum(1 for s in slots if s.get("source") == "enrollment")
 
-    # Recompute L2-normalised mean embedding
-    emb_matrix = np.array(profile["embeddings"], dtype=np.float32)  # (N, 192)
-    mean_emb   = emb_matrix.mean(axis=0)
-    norm       = np.linalg.norm(mean_emb)
-    mean_emb   = mean_emb / (norm + 1e-10)
+def save_enrollment(username: str, embedding: List[float]) -> dict:
+    """
+    Append a new ENROLLMENT slot to the multi-embedding voice profile.
 
-    profile["mean_embedding"] = mean_emb.tolist()
+    Called by enroll.py after each voice recording. No separate training step
+    needed — the profile updates immediately so auth works after 1 recording.
+    Enrollment slots are protected (never evicted by the adaptive FIFO).
+    """
+    emb = np.array(embedding, dtype=np.float32)
+    if len(emb) != EMBEDDING_DIM:
+        return {"error": f"Expected {EMBEDDING_DIM}-dim embedding, got {len(emb)}"}
+
+    profile = _load_profile(username) or _new_profile(username)
+
+    from datetime import datetime as _dt, timezone as _tz
+    ts = _dt.now(_tz.utc).isoformat()
+
+    enroll_slots = [s for s in profile["embeddings"] if s.get("source") == "enrollment"]
+    other_slots  = [s for s in profile["embeddings"] if s.get("source") != "enrollment"]
+    enroll_slots.append({"vec": emb.tolist(), "source": "enrollment", "ts": ts})
+    if len(enroll_slots) > MAX_ENROLL:
+        # Cap enrollment slots too — keep most recent.
+        enroll_slots = enroll_slots[-MAX_ENROLL:]
+    profile["embeddings"] = enroll_slots + other_slots
+
+    _recompute_mean(profile)
     _save_profile(profile)
 
-    print(f"  ✅ ECAPA: saved enrollment #{profile['n_enrollment']} for '{username}'")
+    n_total = len(profile["embeddings"])
+    print(f"  ✅ ECAPA: enrollment slot saved for '{username}' "
+          f"(enroll={profile['n_enrollment']}, total={n_total})")
     return {
         "success":      True,
         "n_enrollment": profile["n_enrollment"],
         "threshold":    profile["threshold"],
+    }
+
+
+def append_adaptive(username: str, embedding: List[float]) -> dict:
+    """
+    Append an ADAPTIVE slot from a confidently-passed login session.
+
+    Used to silently register new devices/conditions: when fusion (or
+    high-margin voice) confirms identity, the login embedding is added so
+    the next login on the same device hits it via max-cosine and passes
+    voice alone.
+
+    FIFO eviction at MAX_ADAPTIVE; enrollment slots are never touched.
+    Caller is responsible for the margin gate (don't reinforce noise).
+    """
+    emb = np.array(embedding, dtype=np.float32)
+    if len(emb) != EMBEDDING_DIM:
+        return {"error": f"Expected {EMBEDDING_DIM}-dim embedding, got {len(emb)}"}
+
+    profile = _load_profile(username)
+    if profile is None:
+        return {"error": f"No ECAPA profile for '{username}' — cannot append adaptive."}
+
+    from datetime import datetime as _dt, timezone as _tz
+    ts = _dt.now(_tz.utc).isoformat()
+
+    enroll_slots   = [s for s in profile["embeddings"] if s.get("source") == "enrollment"]
+    adaptive_slots = [s for s in profile["embeddings"] if s.get("source") != "enrollment"]
+    adaptive_slots.append({"vec": emb.tolist(), "source": "adaptive", "ts": ts})
+    if len(adaptive_slots) > MAX_ADAPTIVE:
+        # FIFO: drop the oldest adaptive slot.
+        adaptive_slots = adaptive_slots[-MAX_ADAPTIVE:]
+    profile["embeddings"] = enroll_slots + adaptive_slots
+
+    _recompute_mean(profile)
+    _save_profile(profile)
+
+    print(f"  💾 ECAPA: adaptive slot appended for '{username}' "
+          f"(enroll={len(enroll_slots)}, adaptive={len(adaptive_slots)})")
+    return {
+        "success":   True,
+        "n_enroll":  len(enroll_slots),
+        "n_adaptive": len(adaptive_slots),
     }
 
 
@@ -364,37 +438,62 @@ def predict_voice(username: str, embedding: List[float]) -> dict:
             "error":       f"No ECAPA profile for '{username}'. Enroll voice first.",
         }
 
-    mean_emb   = np.array(profile["mean_embedding"], dtype=np.float32)
-    login_emb  = np.array(embedding, dtype=np.float32)
+    slots = profile.get("embeddings", [])
+    if not slots:
+        return {
+            "match":       False,
+            "similarity":  0.0,
+            "threshold":   DEFAULT_THRESHOLD,
+            "confidence":  0.0,
+            "fused_score": 0.0,
+            "error":       f"No embeddings stored for '{username}'.",
+        }
 
-    # L2-normalise login embedding
-    norm      = np.linalg.norm(login_emb)
-    login_emb = login_emb / (norm + 1e-10)
+    login_emb = np.array(embedding, dtype=np.float32)
+    login_emb = login_emb / (np.linalg.norm(login_emb) + 1e-10)
 
-    similarity = cosine_similarity(login_emb, mean_emb)
-    threshold  = profile.get("threshold", DEFAULT_THRESHOLD)
-    # Be more lenient if user only has few enrollment samples
-    n = profile.get("n_enrollment", 1)
-    if n <= 2:
-        threshold -= 0.05   # only 1-2 samples — profile less reliable
-    elif n >= 5:
-        threshold += 0.02   # many samples — profile is robust, can be stricter
-    match      = similarity >= threshold
+    # Phase 2: max cosine over every stored slot. The slot pool covers
+    # different devices / acoustic conditions; the device-matched slot
+    # wins, so cross-device drift no longer drags the score down through
+    # averaging.
+    best_sim    = -1.0
+    best_source = None
+    for s in slots:
+        v = np.array(s["vec"], dtype=np.float32)
+        sim = cosine_similarity(login_emb, v)
+        if sim > best_sim:
+            best_sim    = sim
+            best_source = s.get("source", "?")
+
+    n_enroll   = sum(1 for s in slots if s.get("source") == "enrollment")
+    n_adaptive = len(slots) - n_enroll
+
+    threshold = profile.get("threshold", DEFAULT_THRESHOLD)
+    # Soften threshold for cold-start users with a thin enrollment set;
+    # max-of-N already absorbs the +0.02 bump that the old mean-based
+    # logic applied at n>=5, so we no longer add it.
+    if n_enroll <= 2:
+        threshold -= 0.05
+
+    match = best_sim >= threshold
 
     print(
         f"\n  ECAPA-TDNN '{username}': "
-        f"similarity={similarity:.4f}  threshold={threshold:.2f}  "
-        f"n_enrolled={profile['n_enrollment']}  "
-        f"→ {'✅ MATCH' if match else '❌ REJECT'}"
+        f"max_sim={best_sim:.4f} (best_slot={best_source})  "
+        f"threshold={threshold:.2f}  "
+        f"slots=enroll:{n_enroll}+adapt:{n_adaptive}  "
+        f"→ {'MATCH' if match else 'REJECT'}"
     )
 
     return {
         "match":        bool(match),
-        "similarity":   round(similarity, 4),
+        "similarity":   round(best_sim, 4),
         "threshold":    round(threshold, 2),
-        "confidence":   round(similarity * 100, 2),
-        "fused_score":  round(similarity * 100, 2),
-        "n_enrollment": profile["n_enrollment"],
+        "confidence":   round(best_sim * 100, 2),
+        "fused_score":  round(best_sim * 100, 2),
+        "n_enrollment": n_enroll,
+        "n_adaptive":   n_adaptive,
+        "best_slot":    best_source,
     }
 
 

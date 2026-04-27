@@ -88,13 +88,37 @@ function moveToKeystrokeAuth() {
     document.getElementById("dot-keystroke")
         .classList.replace("bg-gray-700", "bg-purple-600");
 
-    // Clear any leftover text from previous attempt
+    // Clear any leftover text from previous attempt and re-enable the input
+    // (it's disabled on submit, so a re-auth round must explicitly re-enable it).
     const input = document.getElementById("keystroke-input");
-    if (input) input.value = "";
+    if (input) {
+        input.value = "";
+        input.disabled = false;
+    }
 
     KeystrokeCapture.reset();
     KeystrokeCapture.attach("keystroke-input");
     document.getElementById("keystroke-status").textContent = "Start typing when ready";
+
+    // TypingDNA-style auto-submit: fire submitKeystrokeAuth() as soon as the
+    // typed phrase matches the target. 120ms delay lets the final keyup land
+    // in KeystrokeCapture before features are extracted.
+    if (input) {
+        let _submitPending = false;
+        input.onkeyup = () => {
+            if (_submitPending) return;
+            const trimmed = input.value.trim();
+            const target  = KeystrokeCapture.targetPhrase;
+            if (trimmed === target) {
+                _submitPending = true;
+                input.value    = target;
+                setTimeout(() => {
+                    input.disabled = true;
+                    submitKeystrokeAuth();
+                }, 120);
+            }
+        };
+    }
 }
 
 async function submitKeystrokeAuth() {
@@ -142,14 +166,14 @@ async function submitKeystrokeAuth() {
         } else if (_ksPassed) {
             // Passed threshold but not high-confidence — add voice for fusion
             status.textContent =
-                `✅ Keystroke matched (${(_ksScore * 100).toFixed(1)}%) — confirming with voice…`;
+                `✅ Keystroke matched — confirming with voice…`;
             status.className = "text-center text-sm mb-4 text-green-400";
             setTimeout(() => moveToVoiceAuth(), 1200);
         } else {
             // Low keystroke confidence — voice needed for fusion decision
             recordFailedAttempt();
             status.textContent =
-                `⚠️ Keystroke confidence low (${(_ksScore * 100).toFixed(1)}%) — confirming with voice for fusion…`;
+                `⚠️ Keystroke uncertain — confirming with voice…`;
             status.className = "text-center text-sm mb-4 text-yellow-400";
             setTimeout(() => moveToVoiceAuth(), 1200);
         }
@@ -248,10 +272,8 @@ async function onVoiceAuthComplete(fullFeatureDict) {
             showSuccess("Fusion & Decision Module", fuseResult.fused_score);
         } else {
             recordFailedAttempt();
-            const reason = fuseResult.reason ? ` (${fuseResult.reason})` : "";
             status.textContent =
-                `❌ Combined confidence too low ` +
-                `(fused: ${(fuseResult.fused_score * 100).toFixed(1)}%)${reason} — proceeding to security question…`;
+                `❌ Additional verification needed — proceeding to security question…`;
             status.className = "text-center text-sm mb-4 text-red-400";
             setTimeout(() => moveToSecurityAuth(), 1000);
         }
@@ -303,17 +325,20 @@ async function submitSecurityAuth() {
     status.className   = "text-center text-sm mb-4 text-yellow-400";
 
     try {
-        const result = await Api.verifySecurityQuestion(authUsername, answer);
+        const result = await Api.verifySecurityQuestion(authUsername, answer, _ksScore);
 
         if (result.authenticated) {
-            // Correct answer confirms knowledge. Grant only if voice biometric
-            // already passed this session — security Q alone is not enough,
-            // since an attacker with stolen password + guessed answer would
-            // otherwise bypass biometrics. Voice-passed covers hand-injury
-            // cases (keystroke unreliable but voice healthy).
-            if (_voicePassed) {
+            // Injury fallback: grant only if voice passed AND keystroke was
+            // above the hard-veto floor (0.45). A sub-0.45 ks means a
+            // different person typed — that's not a hand injury, that's a
+            // split-modality attack, and we must not let the security Q
+            // rescue it. Must stay in sync with KS_HARD_VETO in routers/auth.py.
+            const KS_HARD_VETO = 0.45;
+            const ksAboveVeto  = typeof _ksScore === "number" && _ksScore >= KS_HARD_VETO;
+
+            if (_voicePassed && ksAboveVeto) {
                 status.textContent =
-                    `✅ Identity confirmed (voice biometric verified, ${(_voiceScore * 100).toFixed(1)}%).`;
+                    `✅ Identity confirmed (voice biometric verified).`;
                 status.className = "text-center text-sm mb-4 text-green-400";
                 setTimeout(() => {
                     showSuccess("Security Question + Voice Biometric", _voiceScore);
@@ -321,9 +346,10 @@ async function submitSecurityAuth() {
                 return;
             }
 
-            // Voice did not pass — require biometric re-auth
+            // Either voice didn't pass, or keystroke was below the hard-veto
+            // floor (impostor typing pattern). Require full biometric re-auth.
             status.textContent =
-                "✅ Identity confirmed, but voice biometric must also verify. Please re-authenticate.";
+                "✅ Identity confirmed, but biometric verification must complete. Please re-authenticate.";
             status.className = "text-center text-sm mb-4 text-yellow-400";
 
             _ksScore     = null;
@@ -361,8 +387,9 @@ function showSuccess(method, confidence) {
     document.getElementById("success-section").classList.remove("hidden");
     document.getElementById("success-method").textContent =
         `Verified via: ${method}`;
-    document.getElementById("success-confidence").textContent =
-        `Confidence: ${(confidence * 100).toFixed(1)}%`;
+    // Confidence display intentionally omitted — not shown to end users.
+    const confEl = document.getElementById("success-confidence");
+    if (confEl) confEl.textContent = "";
     // Persist session context for the dashboard's re-auth flow.
     try {
         sessionStorage.setItem("authUsername", authUsername || "");

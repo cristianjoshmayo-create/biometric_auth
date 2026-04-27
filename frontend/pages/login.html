@@ -6,6 +6,10 @@
     <title>Biometric Login</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        input[type="password"]::-ms-reveal,
+        input[type="password"]::-ms-clear { display: none; }
+    </style>
 </head>
 <body class="min-h-screen bg-gray-950 flex items-center justify-center p-4">
 
@@ -65,6 +69,7 @@
                     id="username-input"
                     type="email"
                     placeholder="Enter your email address"
+                    onkeydown="if(event.key==='Enter') submitLogin()"
                     class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
                            outline-none focus:ring-2 focus:ring-purple-500
                            border border-gray-700"
@@ -72,15 +77,20 @@
             </div>
             <div class="mb-4">
                 <label class="text-gray-300 text-sm font-medium block mb-2">Password</label>
-                <input
-                    id="password-input"
-                    type="password"
-                    placeholder="Enter your password"
-                    class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
-                           outline-none focus:ring-2 focus:ring-purple-500
-                           border border-gray-700"
-                    onkeydown="if(event.key==='Enter') submitLogin()"
-                />
+                <div class="relative">
+                    <input
+                        id="password-input"
+                        type="password"
+                        placeholder="Enter your password"
+                        class="w-full bg-gray-800 text-white rounded-lg pl-4 pr-11 py-3
+                               outline-none focus:ring-2 focus:ring-purple-500
+                               border border-gray-700"
+                        onkeydown="if(event.key==='Enter') submitLogin()"
+                    />
+                    <button type="button" tabindex="-1"
+                        onclick="const i=this.previousElementSibling; i.type=i.type==='password'?'text':'password'; this.textContent=i.type==='password'?'👁':'🙈';"
+                        class="absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-200 select-none">👁</button>
+                </div>
             </div>
             <p id="login-status" class="text-center text-sm mb-4 text-gray-500"></p>
             <button
@@ -90,7 +100,11 @@
             >
                 Login
             </button>
-            <p class="text-center text-gray-500 text-sm mt-4">
+            <p class="text-center text-gray-500 text-sm mt-3">
+                <a href="/static/pages/forgot-password.html"
+                   class="text-purple-400 hover:underline">Forgot password?</a>
+            </p>
+            <p class="text-center text-gray-500 text-sm mt-2">
                 Not enrolled?
                 <a href="/static/pages/enroll.html" class="text-purple-400 hover:underline">Register here</a>
             </p>
@@ -134,7 +148,7 @@
         <div id="voice-section" class="hidden">
             <div class="bg-yellow-900 border border-yellow-600 rounded-lg p-3 mb-4 text-center">
                 <p class="text-yellow-400 text-sm">
-                    ⚠️ Keystroke confidence low — please confirm with voice for fusion.
+                    ⚠️ Additional verification needed — please confirm with voice.
                 </p>
             </div>
             <div class="bg-gray-800 rounded-lg p-4 mb-4 text-center border border-gray-700">
@@ -195,14 +209,20 @@
                 </p>
             </div>
             <p id="security-question-text" class="text-gray-300 text-sm font-medium mb-3"></p>
-            <input
-                id="security-answer-input"
-                type="password"
-                placeholder="Your answer..."
-                class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
-                       mb-4 outline-none focus:ring-2 focus:ring-purple-500
-                       border border-gray-700"
-            />
+            <div class="relative mb-4">
+                <input
+                    id="security-answer-input"
+                    type="password"
+                    placeholder="Your answer..."
+                    onkeydown="if(event.key==='Enter') submitSecurityAuth()"
+                    class="w-full bg-gray-800 text-white rounded-lg pl-4 pr-11 py-3
+                           outline-none focus:ring-2 focus:ring-purple-500
+                           border border-gray-700"
+                />
+                <button type="button" tabindex="-1"
+                    onclick="const i=this.previousElementSibling; i.type=i.type==='password'?'text':'password'; this.textContent=i.type==='password'?'👁':'🙈';"
+                    class="absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-200 select-none">👁</button>
+            </div>
             <p id="security-status" class="text-center text-sm mb-4 text-gray-500"></p>
             <button
                 onclick="submitSecurityAuth()"

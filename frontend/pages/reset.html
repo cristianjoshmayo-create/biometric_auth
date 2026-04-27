@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reset Password</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        input[type="password"]::-ms-reveal,
+        input[type="password"]::-ms-clear { display: none; }
+    </style>
+</head>
+<body class="min-h-screen bg-gray-950 flex items-center justify-center p-4">
+
+    <div class="bg-gray-900 rounded-2xl shadow-2xl w-full max-w-md p-8">
+
+        <!-- Header -->
+        <div class="text-center mb-6">
+            <div class="text-4xl mb-3">🔑</div>
+            <h1 class="text-white text-2xl font-bold">Reset Password</h1>
+            <p id="header-sub" class="text-gray-400 text-sm mt-1">
+                Verify your biometrics before setting a new password.
+            </p>
+        </div>
+
+        <!-- Step indicator -->
+        <div id="step-indicator" class="mb-6 hidden">
+            <div class="flex justify-between items-center">
+                <div class="flex flex-col items-center">
+                    <div id="dot-1" class="w-8 h-8 rounded-full bg-purple-600 flex items-center justify-center text-white text-sm font-bold">1</div>
+                    <span class="text-xs text-gray-400 mt-1">Keystroke</span>
+                </div>
+                <div class="flex-1 h-1 bg-gray-700 mx-2"><div id="line-1" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div></div>
+                <div class="flex flex-col items-center">
+                    <div id="dot-2" class="w-8 h-8 rounded-full bg-gray-700 flex items-center justify-center text-white text-sm font-bold">2</div>
+                    <span class="text-xs text-gray-400 mt-1">Voice</span>
+                </div>
+                <div class="flex-1 h-1 bg-gray-700 mx-2"><div id="line-2" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div></div>
+                <div class="flex flex-col items-center">
+                    <div id="dot-3" class="w-8 h-8 rounded-full bg-gray-700 flex items-center justify-center text-white text-sm font-bold">3</div>
+                    <span class="text-xs text-gray-400 mt-1">New Password</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Loading / invalid token -->
+        <div id="loading-section" class="text-center">
+            <p class="text-gray-400 text-sm">Loading reset session…</p>
+        </div>
+        <div id="invalid-section" class="hidden text-center">
+            <div class="text-5xl mb-3">⚠️</div>
+            <h2 class="text-white text-lg font-semibold mb-2">Link Invalid or Expired</h2>
+            <p class="text-gray-400 text-sm mb-6">
+                This reset link is no longer valid. Please request a new one.
+            </p>
+            <a href="/static/pages/forgot-password.html"
+               class="block w-full bg-purple-600 hover:bg-purple-700 text-white
+                      font-semibold py-3 rounded-lg transition-colors duration-200 text-center">
+                Request New Link
+            </a>
+        </div>
+
+        <!-- Step 1: Keystroke -->
+        <div id="keystroke-section" class="hidden">
+            <div class="bg-gray-800 rounded-lg p-4 mb-4 text-center border border-gray-700">
+                <p class="text-gray-400 text-xs mb-1">TYPE THIS PHRASE:</p>
+                <p class="phrase-display text-purple-400 font-mono text-base font-semibold">—</p>
+            </div>
+            <input
+                id="keystroke-input"
+                type="text"
+                placeholder="Type the phrase here..."
+                class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
+                       mb-3 outline-none focus:ring-2 focus:ring-purple-500
+                       font-mono border border-gray-700"
+                autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+            />
+            <p id="keystroke-status" class="text-center text-sm mb-3 text-gray-500">
+                Type the phrase at your natural pace
+            </p>
+            <button
+                onclick="submitResetKeystroke()"
+                class="w-full bg-purple-600 hover:bg-purple-700 text-white
+                       font-semibold py-3 rounded-lg transition-colors duration-200"
+            >
+                Verify Keystroke
+            </button>
+        </div>
+
+        <!-- Step 2: Voice -->
+        <div id="voice-section" class="hidden">
+            <div class="bg-gray-800 rounded-lg p-4 mb-4 text-center border border-gray-700">
+                <p class="text-gray-400 text-xs mb-1">SAY THIS PHRASE:</p>
+                <p class="phrase-display text-purple-400 font-mono text-base font-semibold">—</p>
+            </div>
+            <div class="flex flex-col items-center mb-4">
+                <div id="recording-indicator" class="relative flex items-center justify-center">
+                    <div id="mic-ring-1" class="absolute w-24 h-24 rounded-full border-2 border-purple-500 opacity-0 scale-75 transition-all duration-500"></div>
+                    <div id="mic-ring-2" class="absolute w-32 h-32 rounded-full border-2 border-purple-400 opacity-0 scale-75 transition-all duration-700"></div>
+                    <div id="mic-circle"
+                         class="relative w-20 h-20 rounded-full bg-gray-700 flex items-center justify-center transition-all duration-300 cursor-pointer"
+                         onclick="startResetVoice()">
+                        <svg id="mic-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                             fill="none" stroke="currentColor" stroke-width="2"
+                             stroke-linecap="round" stroke-linejoin="round"
+                             class="w-9 h-9 text-gray-400 transition-colors duration-300">
+                            <rect x="9" y="2" width="6" height="13" rx="3"/>
+                            <path d="M5 10a7 7 0 0 0 14 0"/>
+                            <line x1="12" y1="19" x2="12" y2="22"/>
+                            <line x1="8"  y1="22" x2="16" y2="22"/>
+                        </svg>
+                    </div>
+                </div>
+                <span id="diag-text" class="text-gray-500 text-xs mt-3 text-center"></span>
+            </div>
+            <p id="voice-status" class="text-center text-sm mb-4 text-gray-500">
+                Click record when ready
+            </p>
+            <button
+                id="record-btn"
+                onclick="startResetVoice()"
+                class="w-full bg-red-600 hover:bg-red-700 text-white
+                       font-semibold py-3 rounded-lg transition-colors duration-200"
+            >
+                🎤 Start Recording
+            </button>
+        </div>
+
+        <!-- Step 3: New Password -->
+        <div id="password-section" class="hidden">
+            <div class="bg-green-900/30 border border-green-600 rounded-lg p-3 mb-4 text-center">
+                <p class="text-green-400 text-sm">
+                    ✅ Biometric verification passed. Set a new password.
+                </p>
+            </div>
+            <label class="text-gray-300 text-sm font-medium block mb-2">New Password</label>
+            <div class="relative mb-3">
+                <input
+                    id="new-password"
+                    type="password"
+                    placeholder="At least 8 characters"
+                    onkeydown="if(event.key==='Enter') submitResetPassword()"
+                    class="w-full bg-gray-800 text-white rounded-lg pl-4 pr-11 py-3
+                           outline-none focus:ring-2 focus:ring-purple-500 border border-gray-700"
+                />
+                <button type="button" tabindex="-1"
+                    onclick="const i=this.previousElementSibling; i.type=i.type==='password'?'text':'password'; this.textContent=i.type==='password'?'👁':'🙈';"
+                    class="absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-200 select-none">👁</button>
+            </div>
+            <label class="text-gray-300 text-sm font-medium block mb-2">Confirm Password</label>
+            <div class="relative mb-3">
+                <input
+                    id="new-password-confirm"
+                    type="password"
+                    placeholder="Retype the password"
+                    onkeydown="if(event.key==='Enter') submitResetPassword()"
+                    class="w-full bg-gray-800 text-white rounded-lg pl-4 pr-11 py-3
+                           outline-none focus:ring-2 focus:ring-purple-500 border border-gray-700"
+                />
+                <button type="button" tabindex="-1"
+                    onclick="const i=this.previousElementSibling; i.type=i.type==='password'?'text':'password'; this.textContent=i.type==='password'?'👁':'🙈';"
+                    class="absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-200 select-none">👁</button>
+            </div>
+            <p id="password-status" class="text-center text-sm mb-4 text-gray-500"></p>
+            <button
+                onclick="submitResetPassword()"
+                class="w-full bg-green-600 hover:bg-green-700 text-white
+                       font-semibold py-3 rounded-lg transition-colors duration-200"
+            >
+                Change Password
+            </button>
+        </div>
+
+        <!-- Success -->
+        <div id="success-section" class="hidden text-center">
+            <div class="text-6xl mb-4">✅</div>
+            <h2 class="text-white text-xl font-bold mb-2">Password Updated</h2>
+            <p class="text-gray-400 text-sm mb-6">
+                Your password was successfully changed. A confirmation email was sent to your inbox.
+            </p>
+            <a href="/static/pages/login.html"
+               class="block w-full bg-purple-600 hover:bg-purple-700 text-white
+                      font-semibold py-3 rounded-lg transition-colors duration-200 text-center">
+                Go to Login
+            </a>
+        </div>
+
+        <!-- Failure -->
+        <div id="denied-section" class="hidden text-center">
+            <div class="text-6xl mb-4">🚫</div>
+            <h2 class="text-red-400 text-xl font-bold mb-2">Reset Rejected</h2>
+            <p class="text-gray-400 text-sm mb-6">
+                Biometric verification failed. Your account is still safe.<br>
+                If this was you, try requesting a new reset link.
+            </p>
+            <a href="/static/pages/forgot-password.html"
+               class="block w-full bg-gray-700 hover:bg-gray-600 text-white
+                      font-semibold py-3 rounded-lg transition-colors duration-200 text-center">
+                Try Again
+            </a>
+        </div>
+    </div>
+
+    <script src="/static/js/keystroke.js?v=11"></script>
+    <script src="/static/js/speech.js?v=14"></script>
+    <script src="/static/js/api.js"></script>
+    <script src="/static/js/reset.js?v=1"></script>
+</body>
+</html>

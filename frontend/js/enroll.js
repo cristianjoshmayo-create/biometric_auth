@@ -147,37 +147,26 @@ async function submitPassword() {
         return;
     }
 
-    status.textContent = "⏳ Creating account...";
+    status.textContent = "⏳ Sending verification email...";
     status.className   = "text-center text-sm mb-4 text-yellow-400";
 
     try {
         const result = await Api.enrollUser(email, password);
 
-        if (result.success) {
+        if (result.success && result.verification_sent) {
             currentUsername = email;
             currentPassword = password;
-            currentPhrase   = result.phrase || "biometric voice keystroke authentication";
 
-            // Set the phrase in KeystrokeCapture so it validates against this user's phrase
-            KeystrokeCapture.setPhrase(currentPhrase);
-
-            // Update all phrase display elements in enrollment
-            document.querySelectorAll(".phrase-display").forEach(el => {
-                el.textContent = currentPhrase;
-            });
-
-            status.textContent = "✅ Account created!";
-            status.className   = "text-center text-sm mb-4 text-green-400";
-
-            // Show step indicator and go straight to keystroke enrollment
+            // Swap to the "check your email" screen and start polling.
             document.getElementById("username-section").classList.add("hidden");
-            document.getElementById("step-indicator").classList.remove("hidden");
-            document.getElementById("step1-dot").querySelector("div")
-                .classList.replace("bg-gray-700", "bg-purple-600");
-
-            setTimeout(() => moveToKeystrokeEnrollment(), 800);
+            document.getElementById("verify-email-address").textContent = email;
+            document.getElementById("verify-email-section").classList.remove("hidden");
+            startVerificationPolling(email);
+        } else if (result.detail) {
+            status.textContent = "❌ " + result.detail;
+            status.className   = "text-center text-sm mb-4 text-red-400";
         } else {
-            status.textContent = "❌ " + (result.detail || "Failed.");
+            status.textContent = "❌ Failed to send verification email.";
             status.className   = "text-center text-sm mb-4 text-red-400";
         }
     } catch (err) {
@@ -185,6 +174,65 @@ async function submitPassword() {
         status.className   = "text-center text-sm mb-4 text-red-400";
         console.error("Account creation error:", err);
     }
+}
+
+// ── Email verification polling ───────────────────────────────────────────
+let _verifyPollTimer = null;
+let _verifyPollStart = 0;
+const VERIFY_POLL_INTERVAL_MS = 3000;
+const VERIFY_POLL_TIMEOUT_MS  = 15 * 60 * 1000;  // matches backend TTL
+
+function startVerificationPolling(email) {
+    _verifyPollStart = Date.now();
+    stopVerificationPolling();
+    _verifyPollTimer = setInterval(() => pollVerification(email), VERIFY_POLL_INTERVAL_MS);
+    pollVerification(email);
+}
+
+function stopVerificationPolling() {
+    if (_verifyPollTimer) {
+        clearInterval(_verifyPollTimer);
+        _verifyPollTimer = null;
+    }
+}
+
+async function pollVerification(email) {
+    if (Date.now() - _verifyPollStart > VERIFY_POLL_TIMEOUT_MS) {
+        stopVerificationPolling();
+        const label = document.getElementById("verify-wait-label");
+        if (label) { label.textContent = "Link expired — please try again."; label.className = "text-red-400 text-xs ml-2"; }
+        return;
+    }
+    try {
+        const res = await Api.checkEmailVerified(email);
+        if (res && res.verified) {
+            stopVerificationPolling();
+            currentPhrase = res.phrase || "biometric voice keystroke authentication";
+
+            KeystrokeCapture.setPhrase(currentPhrase);
+            document.querySelectorAll(".phrase-display").forEach(el => {
+                el.textContent = currentPhrase;
+            });
+
+            document.getElementById("verify-email-section").classList.add("hidden");
+            document.getElementById("step-indicator").classList.remove("hidden");
+            document.getElementById("step1-dot").querySelector("div")
+                .classList.replace("bg-gray-700", "bg-purple-600");
+
+            setTimeout(() => moveToKeystrokeEnrollment(), 400);
+        }
+    } catch (err) {
+        console.warn("verification poll failed:", err);
+    }
+}
+
+function resendVerification() {
+    // "Use a different email" — return user to the account-setup screen.
+    stopVerificationPolling();
+    document.getElementById("verify-email-section").classList.add("hidden");
+    document.getElementById("username-section").classList.remove("hidden");
+    const s = document.getElementById("password-status");
+    if (s) { s.textContent = ""; s.className = "text-center text-sm mb-4 text-gray-500"; }
 }
 
 // ── Step 1: Keystroke Enrollment ──────────────────────────────────────────

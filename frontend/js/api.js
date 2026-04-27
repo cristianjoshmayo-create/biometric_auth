@@ -53,6 +53,11 @@ const Api = {
         return res.json();
     },
 
+    async checkEmailVerified(email) {
+        const res = await fetch(`${API_BASE}/enroll/check-verified?email=${encodeURIComponent(email)}`);
+        return res.json();
+    },
+
     async enrollKeystroke(username, features) {
         const res = await fetch(`${API_BASE}/enroll/keystroke`, {
             method:  "POST",
@@ -123,11 +128,55 @@ const Api = {
         return res.json();
     },
 
-    async verifySecurityQuestion(username, answer) {
+    async verifySecurityQuestion(username, answer, ks_score = null) {
         const res = await fetch(`${API_BASE}/auth/security`, {
             method:  "POST",
             headers: { "Content-Type": "application/json" },
-            body:    JSON.stringify({ username, answer })
+            body:    JSON.stringify({ username, answer, ks_score })
+        });
+        return res.json();
+    },
+
+    // ── Forgot password / reset ──────────────────────────────────────────
+    async forgotPassword(email) {
+        const res = await fetch(`${API_BASE}/auth/forgot-password`, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({ email })
+        });
+        return res.json();
+    },
+
+    async resetInfo(token) {
+        const res = await fetch(`${API_BASE}/auth/reset-password/info?token=${encodeURIComponent(token)}`);
+        return res.json();
+    },
+
+    async resetKeystroke(token, features) {
+        const res = await fetch(`${API_BASE}/auth/reset-password/keystroke`, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({ token, username: "", ...features })
+        });
+        return res.json();
+    },
+
+    async resetVoice(token, fullFeatureDict) {
+        const payload = _buildVoicePayload("", fullFeatureDict);
+        payload.token = token;
+        const res = await fetch(`${API_BASE}/auth/reset-password/voice`, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify(payload)
+        });
+        return res.json();
+    },
+
+    async resetSubmit(token, newPassword) {
+        const res = await fetch(`${API_BASE}/auth/reset-password/submit`, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({ token, new_password: newPassword })
         });
         return res.json();
     },

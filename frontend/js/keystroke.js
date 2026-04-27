@@ -143,13 +143,20 @@ const KeystrokeCapture = {
 
         this._attachedInputId = inputElementId;
 
-        // Remove browser auto-focus so the user always clicks in deliberately
-        input.blur();
+        // Auto-focus so the user can start typing without clicking first.
+        // Safe because startTime is only set on the first real keydown —
+        // pre-typing idle time is never recorded. The focus event handler
+        // above resets state and sets isCapturing=true, same as a manual click.
+        // If the element is already the active element (e.g. caller focused it
+        // before calling attach()), input.focus() is a no-op and the focus
+        // event never fires — invoke the handler directly so isCapturing flips.
+        if (document.activeElement === input) {
+            this._boundFocus();
+        } else {
+            input.focus();
+        }
 
-        // Show the idle indicator immediately so the user knows what to do
-        this._updateFocusIndicator(input, false);
-
-        console.log('[KeystrokeCapture] Attached to:', inputElementId, '— waiting for focus');
+        console.log('[KeystrokeCapture] Attached to:', inputElementId, '— focused, waiting for input');
     },
 
     // Show / hide a small visual indicator so the user always knows when capture

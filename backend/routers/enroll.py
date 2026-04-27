@@ -1,7 +1,8 @@
 # backend/routers/enroll.py
 # IMPROVED v2: better noise rejection in extract-mfcc, 62-feature extraction
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
@@ -15,11 +16,14 @@ import tempfile
 import os
 import bcrypt
 import random
+import secrets
+import time
 
 from database.db import get_db
 from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQuestion
 from schemas import VoiceFeatures
 from utils.crypto import encrypt
+from utils.email_sender import send_verification_email
 import threading
 import sys
 
@@ -281,8 +285,30 @@ class ClearEnrollPayload(BaseModel):
 #  ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Pending email verifications ────────────────────────────────────────────
+# In-memory cache: token -> {email, password_hash, created_at}
+# Lost on server restart — fine for PoC. 15-minute TTL.
+_PENDING_VERIFICATIONS: dict = {}
+_PENDING_TTL_SECONDS = 15 * 60
+
+
+def _prune_expired_pending():
+    now = time.time()
+    expired = [t for t, v in _PENDING_VERIFICATIONS.items()
+               if now - v["created_at"] > _PENDING_TTL_SECONDS]
+    for t in expired:
+        _PENDING_VERIFICATIONS.pop(t, None)
+
+
+def _find_pending_by_email(email: str):
+    for tok, v in _PENDING_VERIFICATIONS.items():
+        if v["email"] == email:
+            return tok, v
+    return None, None
+
+
 @router.post("/user")
-def create_user(payload: UserCreate, db: Session = Depends(get_db)):
+def create_user(payload: UserCreate, request: Request, db: Session = Depends(get_db)):
     # Validate and normalise email
     try:
         email = _validate_email(payload.username)
@@ -296,26 +322,134 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
     if len(payload.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
+    _prune_expired_pending()
+
+    # If a pending verification already exists for this email, replace it
+    # (user probably requested a re-send or lost the prior email).
+    old_tok, _ = _find_pending_by_email(email)
+    if old_tok:
+        _PENDING_VERIFICATIONS.pop(old_tok, None)
+
     hashed = bcrypt.hashpw(
         payload.password.encode('utf-8'),
         bcrypt.gensalt()
     ).decode('utf-8')
 
+    token = secrets.token_urlsafe(32)
+    _PENDING_VERIFICATIONS[token] = {
+        "email": email,
+        "password_hash": hashed,
+        "created_at": time.time(),
+    }
+
+    # Build the verification link. Prefer APP_BASE_URL env var; else derive
+    # from the incoming request (works for localhost and ngrok tunnels).
+    base_url = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
+    if not base_url:
+        base_url = str(request.base_url).rstrip("/")
+    verify_link = f"{base_url}/api/enroll/verify-email?token={token}"
+
+    sent = send_verification_email(email, verify_link)
+    if not sent:
+        _PENDING_VERIFICATIONS.pop(token, None)
+        raise HTTPException(status_code=502, detail="Failed to send verification email. Please try again.")
+
+    return {
+        "success": True,
+        "verification_sent": True,
+        "message": f"We sent a verification link to {email}. Click the link in your inbox to continue.",
+        "email": email,
+    }
+
+
+@router.get("/verify-email", response_class=HTMLResponse)
+def verify_email(token: str, db: Session = Depends(get_db)):
+    """User clicks the magic link → create the User row, then show a success page."""
+    _prune_expired_pending()
+
+    pending = _PENDING_VERIFICATIONS.get(token)
+    if not pending:
+        return HTMLResponse(_result_page(
+            ok=False,
+            title="Link Invalid or Expired",
+            msg="This verification link is no longer valid. Please return to the enrollment page and try again."
+        ), status_code=400)
+
+    email = pending["email"]
+    password_hash = pending["password_hash"]
+
+    # Someone may have already completed enrollment (or link reused) — handle gracefully.
+    existing = db.query(User).filter(User.username == email).first()
+    if existing:
+        _PENDING_VERIFICATIONS.pop(token, None)
+        return HTMLResponse(_result_page(
+            ok=True,
+            title="Email Already Verified",
+            msg="This email is already verified. You can close this tab and return to the enrollment page."
+        ))
+
     plain_phrase     = _generate_phrase(db)
     encrypted_phrase = encrypt(plain_phrase)
 
-    new_user = User(username=email, password_hash=hashed, phrase=encrypted_phrase)
+    new_user = User(username=email, password_hash=password_hash, phrase=encrypted_phrase)
     db.add(new_user)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="An account with this email already exists. Please log in instead.")
-    db.refresh(new_user)
+        _PENDING_VERIFICATIONS.pop(token, None)
+        return HTMLResponse(_result_page(
+            ok=False,
+            title="Account Already Exists",
+            msg="An account with this email was created by another request. Please log in instead."
+        ), status_code=409)
 
-    # Return plaintext phrase to the frontend (shown to user during enrollment).
-    # Only the encrypted version is stored in the database.
-    return {"success": True, "message": "User created", "user_id": new_user.id, "phrase": plain_phrase}
+    _PENDING_VERIFICATIONS.pop(token, None)
+
+    return HTMLResponse(_result_page(
+        ok=True,
+        title="Email Verified!",
+        msg="You can close this tab and return to the enrollment page — it will continue automatically."
+    ))
+
+
+@router.get("/check-verified")
+def check_verified(email: str, db: Session = Depends(get_db)):
+    """Frontend polls this after sending a verification email."""
+    try:
+        email = _validate_email(email)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid email")
+
+    user = db.query(User).filter(User.username == email).first()
+    if user:
+        from utils.crypto import decrypt
+        return {
+            "verified": True,
+            "phrase": decrypt(user.phrase) if user.phrase else "",
+        }
+    return {"verified": False}
+
+
+def _result_page(ok: bool, title: str, msg: str) -> str:
+    icon  = "✅" if ok else "⚠️"
+    color = "#22c55e" if ok else "#f59e0b"
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{title}</title>
+<style>
+  body {{ margin:0; font-family:Arial,sans-serif; background:#0b0b0f; color:#eee;
+         min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }}
+  .card {{ background:#17171f; border-radius:16px; padding:40px; max-width:460px; text-align:center;
+          box-shadow:0 10px 40px rgba(0,0,0,0.5); }}
+  .icon {{ font-size:56px; margin-bottom:12px; }}
+  h1 {{ color:{color}; margin:0 0 12px 0; font-size:22px; }}
+  p {{ color:#bbb; line-height:1.6; }}
+</style></head>
+<body><div class="card">
+  <div class="icon">{icon}</div>
+  <h1>{title}</h1>
+  <p>{msg}</p>
+</div></body></html>"""
 
 
 @router.post("/keystroke")

@@ -1,6 +1,6 @@
 # backend/routers/auth.py
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from pydantic import BaseModel
@@ -12,10 +12,183 @@ import os
 import sys
 import subprocess
 import bcrypt  # ← ADDED
+import threading
+import time
+from datetime import datetime, timezone, timedelta
 
 from utils.fusion import fuse_keystroke_scores
 from utils.crypto import decrypt
 from utils.debug_logger import log_auth_stage, log_error
+from utils.email_sender import (
+    send_anomaly_alert, send_unlock_email,
+    send_password_reset_email, send_password_changed_email,
+)
+import secrets
+
+
+# ── Anomaly alert state ───────────────────────────────────────────────────────
+# Per-(email, event_type) cooldown so fat-fingered retries don't spam the user.
+_ALERT_COOLDOWN_SECONDS = 10 * 60
+_last_alert_sent: dict = {}  # (email, event_type) -> timestamp
+
+# Password-failure tracker for trigger #2: 3+ failures in 10 minutes.
+_PW_FAIL_WINDOW_SECONDS = 10 * 60
+_PW_FAIL_THRESHOLD      = 3
+_pw_fail_log: dict = {}  # email -> [timestamp, ...]
+
+# Phase 2 — pending voice embeddings cache.
+# verify_voice always populates this with the login session's ECAPA embedding.
+# /fuse consumes it on a granted decision so the adaptive slot is appended
+# even when voice ALONE failed (cross-device cold-start: keystroke validates
+# identity, the voice sample becomes a trusted Device-B embedding).
+# Bounded eviction (oldest first) so a stalled login can't grow it forever.
+_PENDING_VOICE_TTL_SECONDS = 5 * 60
+_pending_voice_embeddings: dict = {}  # email_lower -> (timestamp, embedding_list)
+
+def _stash_pending_voice(email: str, embedding: list) -> None:
+    if not email or not embedding:
+        return
+    now = time.time()
+    cutoff = now - _PENDING_VOICE_TTL_SECONDS
+    # Drop expired entries to bound memory.
+    for k in [k for k, (ts, _) in _pending_voice_embeddings.items() if ts < cutoff]:
+        _pending_voice_embeddings.pop(k, None)
+    _pending_voice_embeddings[email.lower()] = (now, embedding)
+
+def _pop_pending_voice(email: str) -> Optional[list]:
+    if not email:
+        return None
+    item = _pending_voice_embeddings.pop(email.lower(), None)
+    if not item:
+        return None
+    ts, emb = item
+    if time.time() - ts > _PENDING_VOICE_TTL_SECONDS:
+        return None
+    return emb
+
+
+def _request_info(request: Optional[Request]) -> dict:
+    if request is None:
+        return {"ip": "-", "user_agent": "-"}
+    try:
+        ip = request.client.host if request.client else "-"
+    except Exception:
+        ip = "-"
+    ua = request.headers.get("user-agent", "-") if request else "-"
+    return {"ip": ip, "user_agent": ua}
+
+
+def _now_strings() -> tuple[str, str]:
+    now_utc = datetime.now(timezone.utc)
+    local   = now_utc.astimezone(timezone(timedelta(hours=8)))  # Asia/Manila UTC+8
+    return (now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            local.strftime("%Y-%m-%d %H:%M:%S (Asia/Manila)"))
+
+
+def _maybe_alert(email: str, event_type: str, summary: str,
+                 request: Optional[Request], reason: str = "",
+                 scores: Optional[dict] = None) -> None:
+    """Fire-and-forget anomaly alert with per-user per-event cooldown."""
+    if not email:
+        return
+    now = time.time()
+    key = (email.lower(), event_type)
+    last = _last_alert_sent.get(key, 0)
+    if now - last < _ALERT_COOLDOWN_SECONDS:
+        return
+    _last_alert_sent[key] = now
+
+    ts_utc, ts_local = _now_strings()
+    req = _request_info(request)
+    details = {
+        "summary":    summary,
+        "timestamp":  ts_utc,
+        "local_time": ts_local,
+        "ip":         req["ip"],
+        "user_agent": req["user_agent"],
+        "reason":     reason,
+        "scores":     scores or {},
+    }
+
+    def _run():
+        try:
+            send_anomaly_alert(email, event_type, details)
+        except Exception as e:
+            print(f"[anomaly] alert send failed for {email}: {type(e).__name__}: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _record_password_failure(email: str) -> int:
+    """Record a password failure timestamp; return count within the window."""
+    now = time.time()
+    cutoff = now - _PW_FAIL_WINDOW_SECONDS
+    arr = [t for t in _pw_fail_log.get(email, []) if t >= cutoff]
+    arr.append(now)
+    _pw_fail_log[email] = arr
+    return len(arr)
+
+
+def _reset_password_failures(email: str) -> None:
+    _pw_fail_log.pop(email, None)
+
+
+# ── Account unlock tokens (for /security 3-strike lockout recovery) ───────────
+_PENDING_UNLOCKS: dict = {}          # token -> {"email": str, "created_at": float}
+_UNLOCK_TTL_SECONDS = 30 * 60        # 30 minutes
+
+
+def _prune_expired_unlocks():
+    now = time.time()
+    expired = [t for t, v in _PENDING_UNLOCKS.items()
+               if now - v["created_at"] > _UNLOCK_TTL_SECONDS]
+    for t in expired:
+        _PENDING_UNLOCKS.pop(t, None)
+
+
+def _issue_unlock_token(email: str) -> str:
+    _prune_expired_unlocks()
+    # Invalidate any prior token for this email so only the latest link works.
+    for tok in [t for t, v in _PENDING_UNLOCKS.items() if v["email"] == email]:
+        _PENDING_UNLOCKS.pop(tok, None)
+    token = secrets.token_urlsafe(32)
+    _PENDING_UNLOCKS[token] = {"email": email, "created_at": time.time()}
+    return token
+
+
+# ── Password-reset tokens (forgot-password flow) ──────────────────────────────
+_PENDING_RESETS: dict = {}          # token -> {email, created_at, ks_verified, voice_verified}
+_RESET_TTL_SECONDS = 15 * 60        # 15 minutes
+_RESET_COOLDOWN_SECONDS = 10 * 60   # one reset link per email per 10 minutes
+_last_reset_request: dict = {}      # email -> timestamp of last link issued
+
+
+def _prune_expired_resets():
+    now = time.time()
+    expired = [t for t, v in _PENDING_RESETS.items()
+               if now - v["created_at"] > _RESET_TTL_SECONDS]
+    for t in expired:
+        _PENDING_RESETS.pop(t, None)
+
+
+def _get_reset_entry(token: str):
+    _prune_expired_resets()
+    return _PENDING_RESETS.get(token)
+
+
+def _issue_reset_token(email: str) -> str:
+    _prune_expired_resets()
+    for tok in [t for t, v in _PENDING_RESETS.items() if v["email"] == email]:
+        _PENDING_RESETS.pop(tok, None)
+    token = secrets.token_urlsafe(32)
+    _PENDING_RESETS[token] = {
+        "email":         email,
+        "created_at":    time.time(),
+        "ks_verified":   False,
+        "voice_verified": False,
+    }
+    _last_reset_request[email] = time.time()
+    return token
 
 # ── Pending keystroke sample cache ────────────────────────────────────────────
 # Keystroke samples are only saved after the full multimodal login is granted.
@@ -144,6 +317,10 @@ class VoiceAuth(VoiceFeatures):
 class SecurityAuth(BaseModel):
     username: str
     answer:   str
+    # Session's most recent keystroke score (0..1). Used server-side to
+    # refuse the security-question shortcut when keystroke was hard-vetoed
+    # (sub-KS_HARD_VETO = different typist, not a hand injury).
+    ks_score: float | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,7 +467,7 @@ def _consecutive_denials(db: Session, user_id: int, method: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/password")
-def verify_password(payload: PasswordAuth, db: Session = Depends(get_db)):
+def verify_password(payload: PasswordAuth, request: Request, db: Session = Depends(get_db)):
     # Normalise email — lowercase so login works regardless of capitalisation
     email = payload.username.strip().lower()
     user = db.query(User).filter(User.username == email).first()
@@ -307,6 +484,22 @@ def verify_password(payload: PasswordAuth, db: Session = Depends(get_db)):
     )
 
     print(f"[password] '{email}' → {'PASS' if authenticated else 'FAIL'}")
+
+    # ── Anomaly: repeated password failures ─────────────────────────────────
+    if authenticated:
+        _reset_password_failures(email)
+    else:
+        fail_count = _record_password_failure(email)
+        if fail_count >= _PW_FAIL_THRESHOLD:
+            _maybe_alert(
+                email=email,
+                event_type="Repeated password failures",
+                summary=(f"{fail_count} failed password attempts on your account "
+                         f"within the last 10 minutes."),
+                request=request,
+                reason=f"{fail_count} failures in {_PW_FAIL_WINDOW_SECONDS // 60}-minute window",
+                scores={"failed_attempts": fail_count},
+            )
 
     log_attempt(db, user.id, "password",
                 1.0 if authenticated else 0.0,
@@ -524,7 +717,7 @@ def _save_keystroke_sample(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/keystroke")
-def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
+def verify_keystroke(payload: KeystrokeAuth, request: Request, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == payload.username).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -689,6 +882,10 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                 hard_reject   = False
                 reject_reason = ""
 
+                DWELL_Z_LIMIT = 3.0
+                CPM_Z_LIMIT   = 5.0
+                MAH_FLOOR     = 0.15
+
                 fn_list = list(feat_names)
                 def _fv(name):
                     try:
@@ -704,7 +901,7 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                     l_dwell     = _fv('dwell_mean')
                     if l_dwell is not None:
                         dwell_z = abs(l_dwell - e_dwell) / e_dwell_std
-                        if dwell_z > 3.0:
+                        if dwell_z > DWELL_Z_LIMIT:
                             hard_reject   = True
                             reject_reason = (f"dwell_mean z={dwell_z:.1f} "
                                              f"(live={l_dwell:.0f}ms enrolled={e_dwell:.0f}ms)")
@@ -717,13 +914,13 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                     l_cpm     = _fv('typing_speed_cpm')
                     if l_cpm is not None:
                         cpm_z = abs(l_cpm - e_cpm) / e_cpm_std
-                        if cpm_z > 5.0:
+                        if cpm_z > CPM_Z_LIMIT:
                             hard_reject   = True
                             reject_reason = (f"typing_speed_cpm z={cpm_z:.1f} "
                                              f"(live={l_cpm:.0f} enrolled={e_cpm:.0f})")
 
-                # Gate 3: Mahalanobis hard floor
-                if not hard_reject and mah_score < 0.15:
+                # Gate 3: Mahalanobis hard floor (standalone)
+                if not hard_reject and mah_score < MAH_FLOOR:
                     hard_reject   = True
                     reject_reason = (f"Mahalanobis floor breach "
                                      f"(mah={mah_score:.4f}, d_sq_norm={d_sq_norm:.2f})")
@@ -732,6 +929,10 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
                     confidence    = 0.0
                     authenticated = False
                     print(f"  ⛔ Hard reject: {reject_reason}")
+                    # No standalone email here — a single bad-rhythm attempt
+                    # can false-positive for inconsistent typers. If the attempt
+                    # is actually an impostor, voice + fusion will deny next and
+                    # the "Biometrics failed after correct password" email fires.
                 else:
                     confidence    = fuse_keystroke_scores(rf_score, mah_score)
                     authenticated = confidence >= threshold
@@ -829,14 +1030,22 @@ def verify_keystroke(payload: KeystrokeAuth, db: Session = Depends(get_db)):
     #
     # Case B (keystroke failed, voice recovery will run): defer to /fuse —
     # it only saves if the *full* multi-factor pipeline grants access.
-    if authenticated:
+    # Save policy aligned with the frontend's grant policy:
+    #   ≥ 0.90  → keystroke alone grants access (frontend skips voice).
+    #             Save immediately.
+    #   < 0.90  → frontend still routes through voice + /fuse. Defer the
+    #             save: cache the sample and let /fuse persist it ONLY if
+    #             fusion grants access. This prevents polluting the training
+    #             pool with samples from sessions where the user ultimately
+    #             needed voice to recover (or failed entirely).
+    if authenticated and confidence >= 0.90:
         _save_keystroke_sample(
             db, user, payload, source="login_ks",
             ks_score=float(confidence),
             effective_threshold=float(_log_thr) if _log_thr is not None else None,
         )
     elif confidence > 0:
-        # Case B: low confidence, voice recovery path — hold for fusion
+        # Uncertain band or sub-threshold — voice + fusion will decide.
         _pending_ks_samples[payload.username] = payload
         print(f"  ⏳ Keystroke sample cached — will save only if fusion grants access")
 
@@ -958,8 +1167,30 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
     phrase_error    = ""
 
     if transcript and expected_phrase:
+        # Whisper biases toward digit transcription ("60" instead of "sixty",
+        # "3" instead of "three"). Map 0–99 back to words so digit/word
+        # variants compare equal.
+        _DIGIT_ONES = ["zero","one","two","three","four","five","six","seven","eight","nine",
+                       "ten","eleven","twelve","thirteen","fourteen","fifteen","sixteen",
+                       "seventeen","eighteen","nineteen"]
+        _DIGIT_TENS = ["","","twenty","thirty","forty","fifty","sixty","seventy","eighty","ninety"]
+        def _num_to_words(n: int) -> str:
+            if n < 20:
+                return _DIGIT_ONES[n]
+            tens, ones = divmod(n, 10)
+            return _DIGIT_TENS[tens] + (" " + _DIGIT_ONES[ones] if ones else "")
+        def _digits_to_words(s: str) -> str:
+            def repl(m):
+                try:
+                    n = int(m.group(0))
+                except ValueError:
+                    return m.group(0)
+                return _num_to_words(n) if 0 <= n <= 99 else m.group(0)
+            return re.sub(r"\d+", repl, s)
+
         def _norm(s):
             s = s.lower()
+            s = _digits_to_words(s)
             s = re.sub(r"[^a-z0-9\s]", "", s)
             return re.sub(r"\s+", " ", s).strip()
 
@@ -1029,6 +1260,10 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
         extra={
             "ecapa_similarity": locals().get('ecapa_r', {}).get('similarity') if 'ecapa_r' in locals() else None,
             "ecapa_threshold":  locals().get('ecapa_r', {}).get('threshold') if 'ecapa_r' in locals() else None,
+            "ecapa_z_score":    locals().get('ecapa_r', {}).get('z_score') if 'ecapa_r' in locals() else None,
+            "ecapa_method":     locals().get('ecapa_r', {}).get('method') if 'ecapa_r' in locals() else None,
+            "ecapa_cohort_n":   locals().get('ecapa_r', {}).get('cohort_n') if 'ecapa_r' in locals() else None,
+            "ecapa_cohort_mean":locals().get('ecapa_r', {}).get('cohort_mean') if 'ecapa_r' in locals() else None,
             "ecapa_note":       locals().get('ecapa_r', {}).get('error') if 'ecapa_r' in locals() else None,
             "transcript":       transcript or None,
             "expected_phrase":  expected_phrase or None,
@@ -1042,18 +1277,34 @@ def verify_voice(payload: VoiceAuth, db: Session = Depends(get_db)):
         },
     )
 
-    # ── Adaptive learning: update ECAPA profile with new login embedding ────
-    # ECAPA needs no retraining — just append the new embedding to the profile
-    # so the mean vector gradually adapts to the user's voice over time.
-    if authenticated:
-        try:
-            from ml.voice_ecapa import save_enrollment as ecapa_enroll
-            ecapa_embedding = getattr(payload, 'ecapa_embedding', []) or []
-            if ecapa_embedding:
-                ecapa_enroll(payload.username, ecapa_embedding)
-                print(f"  💾 ECAPA profile updated with login embedding")
-        except Exception as _e:
-            print(f"  ⚠️ ECAPA profile update skipped: {_e}")
+    # ── Phase 2 adaptive learning ──────────────────────────────────────────
+    # Voice profile is a multi-slot pool (max-cosine). On a confidently
+    # passing voice-alone session we append the embedding as an adaptive
+    # slot so future logins on this device hit it via max-cosine.
+    #
+    # Margin gate: only adapt when similarity is at least +0.05 above the
+    # decision threshold. Borderline passes are not reinforced — that
+    # prevents an attacker who scores right at threshold from getting
+    # their voice baked in.
+    #
+    # If voice failed here, we do NOT append. We DO stash the embedding
+    # in the pending cache so /fuse can append it if fusion later grants
+    # access (cross-device cold-start: keystroke validates identity, the
+    # voice sample becomes a trusted Device-B embedding).
+    ecapa_embedding = getattr(payload, 'ecapa_embedding', []) or []
+    if ecapa_embedding:
+        ecapa_sim = float(locals().get('ecapa_r', {}).get('similarity', 0.0)) if 'ecapa_r' in locals() else 0.0
+        ecapa_thr = float(locals().get('ecapa_r', {}).get('threshold', 0.68)) if 'ecapa_r' in locals() else 0.68
+        if authenticated and (ecapa_sim >= ecapa_thr + 0.05):
+            try:
+                from ml.voice_ecapa import append_adaptive as ecapa_append
+                ecapa_append(payload.username, ecapa_embedding)
+            except Exception as _e:
+                print(f"  ⚠️ ECAPA adaptive append skipped: {_e}")
+        else:
+            # Stash for the fusion path. Always — fusion may grant even
+            # when voice alone scored low.
+            _stash_pending_voice(payload.username, ecapa_embedding)
 
     return {
         "authenticated": bool(authenticated),
@@ -1100,7 +1351,7 @@ def get_security_question(payload: PasswordAuth, db: Session = Depends(get_db)):
 
 
 @router.post("/security")
-def verify_security(payload: SecurityAuth, db: Session = Depends(get_db)):
+def verify_security(payload: SecurityAuth, request: Request, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == payload.username).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1109,10 +1360,22 @@ def verify_security(payload: SecurityAuth, db: Session = Depends(get_db)):
     if not sq:
         raise HTTPException(status_code=404, detail="No security question found")
 
-    authenticated = bcrypt.checkpw(
+    answer_ok = bcrypt.checkpw(
         payload.answer.strip().lower().encode(),
         sq.answer_hash.encode('utf-8')
     )
+
+    # Hard-veto gate: even a correct answer does NOT grant if the session's
+    # keystroke was below the split-modality floor. Must match KS_HARD_VETO
+    # in the /fuse endpoint. ks_score=None means the client skipped sending
+    # it — treat as veto so old/tampered clients cannot bypass.
+    KS_HARD_VETO = 0.45
+    ks_vetoed    = (payload.ks_score is None) or (payload.ks_score < KS_HARD_VETO)
+    authenticated = answer_ok and not ks_vetoed
+
+    if answer_ok and ks_vetoed:
+        print(f"[security] '{payload.username}' → answer OK but ks_vetoed "
+              f"(ks={payload.ks_score}); refusing shortcut")
 
     print(f"[security] '{payload.username}' → {'PASS' if authenticated else 'FAIL'}")
 
@@ -1130,16 +1393,276 @@ def verify_security(payload: SecurityAuth, db: Session = Depends(get_db)):
         # Recovery path: password already passed, so a wrong answer here is
         # high-signal impostor behavior. 3-strike buffer absorbs typos.
         sq_denials = _consecutive_denials(db, user.id, "security_question")
-        if sq_denials >= 3:
+        if sq_denials >= 3 and not user.is_flagged:
             user.is_flagged = True
             db.commit()
             print(f"  ⚠️ User '{payload.username}' flagged after {sq_denials} security Q failures")
+
+            # Issue an unlock token and email a recovery link.
+            token = _issue_unlock_token(payload.username.strip().lower())
+            base_url = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
+            if not base_url:
+                base_url = str(request.base_url).rstrip("/")
+            unlock_link = f"{base_url}/api/auth/unlock-account?token={token}"
+
+            def _send_unlock():
+                try:
+                    send_unlock_email(payload.username.strip().lower(), unlock_link)
+                except Exception as e:
+                    print(f"[unlock] email send failed: {type(e).__name__}: {e}")
+
+            threading.Thread(target=_send_unlock, daemon=True).start()
 
     return {
         "authenticated": authenticated,
         "confidence":    1.0 if authenticated else 0.0,
         "flagged":       bool(user.is_flagged),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ACCOUNT UNLOCK (recovery from 3-strike security-question lockout)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from fastapi.responses import HTMLResponse as _HTMLResponse
+
+
+def _unlock_result_page(ok: bool, title: str, msg: str) -> str:
+    icon  = "✅" if ok else "⚠️"
+    color = "#22c55e" if ok else "#f59e0b"
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{title}</title>
+<style>
+  body {{ margin:0; font-family:Arial,sans-serif; background:#0b0b0f; color:#eee;
+         min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }}
+  .card {{ background:#17171f; border-radius:16px; padding:40px; max-width:460px; text-align:center;
+          box-shadow:0 10px 40px rgba(0,0,0,0.5); }}
+  .icon {{ font-size:56px; margin-bottom:12px; }}
+  h1 {{ color:{color}; margin:0 0 12px 0; font-size:22px; }}
+  p {{ color:#bbb; line-height:1.6; }}
+  a.btn {{ display:inline-block; margin-top:20px; background:#7c3aed; color:#fff;
+           padding:10px 22px; border-radius:8px; text-decoration:none; font-weight:600; }}
+</style></head>
+<body><div class="card">
+  <div class="icon">{icon}</div>
+  <h1>{title}</h1>
+  <p>{msg}</p>
+  <a class="btn" href="/static/pages/login.html">Go to Login</a>
+</div></body></html>"""
+
+
+@router.get("/unlock-account", response_class=_HTMLResponse)
+def unlock_account(token: str, db: Session = Depends(get_db)):
+    """
+    Single-use recovery link — consumed by the user clicking the magic link
+    in the lockout email. Clears is_flagged on the user row and resets their
+    consecutive-security-question denial streak so they can attempt login
+    again from scratch.
+    """
+    _prune_expired_unlocks()
+
+    entry = _PENDING_UNLOCKS.pop(token, None)  # single-use: pop immediately
+    if not entry:
+        return _HTMLResponse(_unlock_result_page(
+            ok=False,
+            title="Link Invalid or Expired",
+            msg="This unlock link is no longer valid. It may have expired, "
+                "already been used, or been superseded by a newer link."
+        ), status_code=400)
+
+    email = entry["email"]
+    user = db.query(User).filter(User.username == email).first()
+    if not user:
+        return _HTMLResponse(_unlock_result_page(
+            ok=False,
+            title="Account Not Found",
+            msg="We couldn't locate the account associated with this unlock link."
+        ), status_code=404)
+
+    user.is_flagged = False
+    db.commit()
+    print(f"[unlock] account '{email}' unlocked via recovery link")
+
+    return _HTMLResponse(_unlock_result_page(
+        ok=True,
+        title="Account Unlocked",
+        msg="Your account has been unlocked. You can now log in again."
+    ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FORGOT PASSWORD  (biometric-gated, Option C-strict)
+#
+#  Flow:
+#    1. User → POST /forgot-password {email}
+#       Server issues a 15-min single-use token, emails a magic link.
+#    2. User clicks link → lands on /static/pages/reset.html?token=…
+#       Page calls /reset-password/info to display email + phrase.
+#    3. Page runs keystroke challenge → POST /reset-password/keystroke
+#       Server runs normal keystroke verification internally; if it passes,
+#       marks ks_verified=True on the reset-token state.
+#    4. Page runs voice challenge → POST /reset-password/voice
+#       Same pattern — marks voice_verified=True on pass.
+#    5. Both passed → page shows new-password form → POST /reset-password/submit
+#       Server requires both flags; updates bcrypt hash; emails confirmation.
+#
+#  Why two-phase (challenge + submit) instead of one combined endpoint:
+#  the user shouldn't fill out a new-password form if biometrics are going to
+#  fail anyway. Two-phase gives honest UX.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ForgotPasswordPayload(BaseModel):
+    email: str
+
+
+class ResetKeystrokePayload(KeystrokeAuth):
+    token: str
+
+
+class ResetVoicePayload(VoiceAuth):
+    token: str
+
+
+class ResetSubmitPayload(BaseModel):
+    token:        str
+    new_password: str
+
+
+@router.post("/forgot-password")
+def forgot_password(payload: ForgotPasswordPayload, request: Request, db: Session = Depends(get_db)):
+    email = payload.email.strip().lower()
+    # Always respond with the same success message regardless of whether the
+    # email exists — so attackers can't use this endpoint to enumerate accounts.
+    generic_resp = {
+        "success": True,
+        "message": (f"If an account exists for {email}, a reset link has been sent. "
+                    f"Check your inbox (and spam folder)."),
+    }
+
+    # Per-email cooldown to prevent link-spam abuse
+    now = time.time()
+    last = _last_reset_request.get(email, 0)
+    if now - last < _RESET_COOLDOWN_SECONDS:
+        print(f"[forgot-password] cooldown active for {email} — skipping send")
+        return generic_resp
+
+    user = db.query(User).filter(User.username == email).first()
+    if not user:
+        # Still update cooldown slot so probing doesn't reveal existence
+        _last_reset_request[email] = now
+        print(f"[forgot-password] no account for {email} — returning generic success")
+        return generic_resp
+
+    token = _issue_reset_token(email)
+    base_url = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
+    if not base_url:
+        base_url = str(request.base_url).rstrip("/")
+    reset_link = f"{base_url}/static/pages/reset.html?token={token}"
+
+    def _send():
+        try:
+            send_password_reset_email(email, reset_link)
+        except Exception as e:
+            print(f"[forgot-password] send failed: {type(e).__name__}: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+    return generic_resp
+
+
+@router.get("/reset-password/info")
+def reset_password_info(token: str, db: Session = Depends(get_db)):
+    """Called by reset.html to get the user's email + phrase for the challenge."""
+    entry = _get_reset_entry(token)
+    if not entry:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
+    user = db.query(User).filter(User.username == entry["email"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return {
+        "email":          entry["email"],
+        "phrase":         decrypt(user.phrase) if user.phrase else "",
+        "ks_verified":    entry["ks_verified"],
+        "voice_verified": entry["voice_verified"],
+    }
+
+
+@router.post("/reset-password/keystroke")
+def reset_password_keystroke(payload: ResetKeystrokePayload, request: Request,
+                             db: Session = Depends(get_db)):
+    entry = _get_reset_entry(payload.token)
+    if not entry:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
+
+    # Force the payload's username to the token's email — the client can't choose
+    # which user to verify against.
+    ks_data = payload.dict(exclude={"token"})
+    ks_data["username"] = entry["email"]
+    ks_payload = KeystrokeAuth(**ks_data)
+
+    result = verify_keystroke(ks_payload, request, db)
+    # Mirror login pass bar: confidence >= 0.55 (same as /fuse entry gate)
+    passed = bool(result.get("authenticated")) and float(result.get("confidence", 0.0)) >= 0.55
+    if passed:
+        entry["ks_verified"] = True
+    return {**result, "reset_ks_verified": entry["ks_verified"]}
+
+
+@router.post("/reset-password/voice")
+def reset_password_voice(payload: ResetVoicePayload, db: Session = Depends(get_db)):
+    entry = _get_reset_entry(payload.token)
+    if not entry:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
+
+    voice_data = payload.dict(exclude={"token"})
+    voice_data["username"] = entry["email"]
+    voice_payload = VoiceAuth(**voice_data)
+
+    result = verify_voice(voice_payload, db)
+    passed = bool(result.get("authenticated"))
+    if passed:
+        entry["voice_verified"] = True
+    return {**result, "reset_voice_verified": entry["voice_verified"]}
+
+
+@router.post("/reset-password/submit")
+def reset_password_submit(payload: ResetSubmitPayload, db: Session = Depends(get_db)):
+    entry = _get_reset_entry(payload.token)
+    if not entry:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
+    if not (entry["ks_verified"] and entry["voice_verified"]):
+        raise HTTPException(status_code=403,
+                            detail="Biometric challenge not completed")
+    if len(payload.new_password) < 8:
+        raise HTTPException(status_code=400,
+                            detail="Password must be at least 8 characters")
+
+    user = db.query(User).filter(User.username == entry["email"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    new_hash = bcrypt.hashpw(
+        payload.new_password.encode("utf-8"),
+        bcrypt.gensalt()
+    ).decode("utf-8")
+    user.password_hash = new_hash
+    # A password reset is also a good time to clear any lingering lock state.
+    user.is_flagged = False
+    db.commit()
+
+    # Single-use token — consume it.
+    _PENDING_RESETS.pop(payload.token, None)
+    _reset_password_failures(entry["email"])
+
+    def _send_confirm():
+        try:
+            send_password_changed_email(entry["email"])
+        except Exception as e:
+            print(f"[reset-password] confirmation send failed: {type(e).__name__}: {e}")
+
+    threading.Thread(target=_send_confirm, daemon=True).start()
+    print(f"[reset-password] password updated for '{entry['email']}'")
+    return {"success": True, "message": "Password updated. You can now log in with your new password."}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1155,7 +1678,7 @@ class FusionRequest(BaseModel):
 
 
 @router.post("/fuse")
-def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
+def fuse_scores(payload: FusionRequest, request: Request, db: Session = Depends(get_db)):
     """
     Authoritative multimodal fusion endpoint — adaptive threshold.
 
@@ -1206,23 +1729,38 @@ def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
         case_label              = "A (ks-passed, voice-confirms)"
     else:
         # Case B: KS failed — voice is recovery, stricter threshold.
-        # Threshold at 0.62 (not 0.65) so a strong voice ≥0.95 can still
-        # recover when ks=0.0: 0.65*0.95 = 0.6175 ≈ 0.62.
+        # Tightened from 0.62 to 0.65 after empirical evidence that an
+        # impostor (non-sibling classmate) scored ks=0.48 against asther,
+        # above the 0.45 hard-veto floor. At the old 0.62, a ks=0.48 +
+        # genuine-user voice ≥0.70 would grant in a split-modality setup.
+        # At 0.65, the same ks=0.48 needs voice ≥0.74 — reachable by the
+        # real user (typical 0.77–0.85) but not by an impostor speaker.
         base_ks_w, base_voice_w = 0.35, 0.65
-        FUSED_THRESHOLD         = 0.62
+        FUSED_THRESHOLD         = 0.65
         case_label              = "B (ks-failed, voice-recovery)"
 
     # Scale keystroke weight by measured reliability; voice absorbs the rest.
     ks_w    = base_ks_w * ks_reliability
     voice_w = 1.0 - ks_w
 
+    # Case B keystroke hard-veto. Defends against split-modality attacks where
+    # an impostor types and the genuine user supplies the voice: a clearly
+    # impostor-pattern keystroke (well below threshold) cannot be rescued by
+    # voice alone, no matter how strong. Voice recovery is reserved for
+    # borderline keystroke failures, not fundamental rejections.
+    KS_HARD_VETO = 0.45
+    ks_vetoed    = (not payload.keystroke_passed) and (ks < KS_HARD_VETO)
+
     fused          = ks_w * ks + voice_w * voice
     voice_floor_ok = voice >= VOICE_FLOOR
-    granted        = (fused >= FUSED_THRESHOLD) and voice_floor_ok
+    granted        = (fused >= FUSED_THRESHOLD) and voice_floor_ok and (not ks_vetoed)
 
     reason = ""
     if not granted:
-        if not voice_floor_ok:
+        if ks_vetoed:
+            reason = (f"ks {ks:.2f} below hard-veto floor {KS_HARD_VETO} "
+                      f"(impostor typing pattern; voice cannot recover)")
+        elif not voice_floor_ok:
             reason = f"voice {voice:.2f} below floor {VOICE_FLOOR}"
         else:
             reason = f"fused {fused:.2f} below threshold {FUSED_THRESHOLD}"
@@ -1244,6 +1782,33 @@ def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
                     "granted" if granted else "denied",
                     template_maturity=fuse_maturity)
 
+    # ── Anomaly: biometrics failed after the correct password was entered ──
+    if not granted:
+        if ks_vetoed:
+            _alert_event   = "Possible split-modality attack"
+            _alert_summary = ("A login attempt on your account had a typing pattern "
+                              "that does not match yours at all, but the voice did. "
+                              "This pattern can occur when someone else types your "
+                              "passphrase and you (or a recording of you) supplies "
+                              "the voice. Access was denied.")
+        else:
+            _alert_event   = "Biometrics failed after correct password"
+            _alert_summary = ("A login attempt on your account passed the password check "
+                              "but failed the biometric verification (keystroke + voice).")
+        _maybe_alert(
+            email=payload.username,
+            event_type=_alert_event,
+            summary=_alert_summary,
+            request=request,
+            reason=reason,
+            scores={
+                "keystroke_score": round(float(ks),    3),
+                "voice_score":     round(float(voice), 3),
+                "fused_score":     round(float(fused), 3),
+                "threshold":       round(float(FUSED_THRESHOLD), 3),
+            },
+        )
+
     log_auth_stage(
         "fusion", payload.username,
         "granted" if granted else "denied",
@@ -1260,6 +1825,8 @@ def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
             "ks_reliability":  round(ks_reliability, 3),
             "voice_floor_ok":  bool(voice_floor_ok),
             "voice_floor":     VOICE_FLOOR,
+            "ks_hard_veto":    KS_HARD_VETO,
+            "ks_vetoed":       bool(ks_vetoed),
             "maturity":        locals().get('fuse_maturity'),
             "reason":          reason or None,
         },
@@ -1281,6 +1848,22 @@ def fuse_scores(payload: FusionRequest, db: Session = Depends(get_db)):
         discarded = _pending_ks_samples.pop(payload.username, None)
         if discarded:
             print(f"  🗑️ Cached keystroke sample discarded (login denied)")
+
+    # ── Phase 2: adaptive voice slot via fusion grant ────────────────────────
+    # Cross-device cold-start handler. When keystroke validated identity
+    # (fusion granted) but voice alone scored low, the voice sample is
+    # still trusted — keystroke confirmed the user. Append it as an
+    # adaptive slot so this device is silently registered; future logins
+    # on this device hit the new slot via max-cosine and pass voice alone.
+    pending_voice = _pop_pending_voice(payload.username)
+    if granted and pending_voice:
+        try:
+            from ml.voice_ecapa import append_adaptive as ecapa_append
+            ecapa_append(payload.username, pending_voice)
+            print(f"  💾 ECAPA adaptive slot appended via fusion grant "
+                  f"(voice={voice:.3f}, ks={ks:.3f})")
+        except Exception as _e:
+            print(f"  ⚠️ ECAPA adaptive append (fusion) skipped: {_e}")
 
     return {
         "granted":         granted,
