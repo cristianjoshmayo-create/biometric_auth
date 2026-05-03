@@ -1,283 +1,650 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="light">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Biometric Login</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>Multimodal Auth | Biometric Login</title>
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
     <link rel="stylesheet" href="/static/css/style.css">
+    <script>
+      tailwind.config = {
+        darkMode: "class",
+        theme: { extend: {
+          fontFamily: { headline:["Inter","sans-serif"], body:["Inter","sans-serif"], mono:["JetBrains Mono","monospace"] },
+          borderRadius: { DEFAULT:"0.5rem", lg:"0.5rem", xl:"1.5rem", full:"9999px" }
+        }}
+      }
+    </script>
     <style>
-        input[type="password"]::-ms-reveal,
-        input[type="password"]::-ms-clear { display: none; }
+      :root {
+        --color-background:#f9f9ff; --color-surface:#f9f9ff;
+        --color-surface-container-lowest:#ffffff; --color-surface-container-low:#f1f3ff;
+        --color-surface-container:#e9edff; --color-surface-container-high:#e1e8fd;
+        --color-surface-container-highest:#dce2f7;
+        --color-on-surface:#141b2b; --color-on-surface-variant:#434655;
+        --color-outline:#737686; --color-outline-variant:#c3c6d7;
+        --color-primary:#004ac6; --color-on-primary:#ffffff;
+        --color-primary-container:#2563eb; --color-on-primary-container:#eeefff;
+        --color-error:#ba1a1a; --color-error-container:#ffdad6; --color-on-error-container:#93000a;
+        --navbar-bg:#ffffff;
+        --card-shadow:0 32px 64px -12px rgba(20,27,43,0.06);
+      }
+      .dark {
+        --color-background:#111827; --color-surface:#111827;
+        --color-surface-container-lowest:#0d1117; --color-surface-container-low:#161e2e;
+        --color-surface-container:#1a2235; --color-surface-container-high:#1f2a3e;
+        --color-surface-container-highest:#243148;
+        --color-on-surface:#e2e6f8; --color-on-surface-variant:#a8adc5;
+        --color-outline:#6b7090; --color-outline-variant:#2e3550;
+        --color-primary:#93b4ff; --color-on-primary:#002882;
+        --color-primary-container:#3d70f0; --color-on-primary-container:#dce8ff;
+        --navbar-bg:#0d1117;
+        --card-shadow:0 32px 64px -12px rgba(0,0,0,0.4);
+      }
+      body { background-color:var(--color-background); color:var(--color-on-surface); font-family:Inter,sans-serif; }
+      .design-card { background:var(--color-surface-container-lowest); border:1px solid color-mix(in srgb,var(--color-outline-variant) 15%,transparent); box-shadow:var(--card-shadow); }
+      .design-input { background:var(--color-surface-container-highest); color:var(--color-on-surface); border:1px solid var(--color-outline-variant); }
+      .design-input::placeholder { color:var(--color-outline); }
+      .design-input:focus { border-color:var(--color-primary); box-shadow:0 0 0 4px color-mix(in srgb,var(--color-primary) 20%,transparent); outline:none; }
+      .design-btn-primary { background:var(--color-primary-container); color:var(--color-on-primary-container); }
+      .design-btn-primary:hover { background:var(--color-primary); }
+      .design-btn-error { background:var(--color-error-container); color:var(--color-on-error-container); }
+      .design-btn-error:hover { filter:brightness(0.95); }
+      .design-banner-info { background:var(--color-surface-container-low); border-left:4px solid var(--color-primary); color:var(--color-on-surface-variant); }
+      .design-banner-warn { background:#fff4e5; border-left:4px solid #b56300; color:#5b3000; }
+      .dark .design-banner-warn { background:#3a2a14; color:#ffcc99; border-left-color:#ffb56b; }
+      .signature-gradient { background:linear-gradient(135deg,#004ac6 0%,#2563eb 100%); }
+      .text-on-surface { color:var(--color-on-surface); }
+      .text-on-surface-variant { color:var(--color-on-surface-variant); }
+      .text-primary { color:var(--color-primary); }
+      .bg-surface-container-low { background:var(--color-surface-container-low); }
+      .bg-surface-container-highest { background:var(--color-surface-container-highest); }
+      .border-outline-variant { border-color:var(--color-outline-variant); }
+      .material-symbols-outlined { font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 24; }
+      input[type="password"]::-ms-reveal, input[type="password"]::-ms-clear { display:none; }
+      *, *::before, *::after { transition: background-color 0.2s ease, border-color 0.2s ease, color 0.15s ease; }
+
+      /* Re-skin JS-managed dot classes so login flow stepper looks right on light surface */
+      #step-indicator .bg-gray-700 { background-color:var(--color-surface-container-highest) !important; color:var(--color-on-surface-variant) !important; }
+      #step-indicator .bg-purple-600 { background-color:var(--color-primary-container) !important; color:var(--color-on-primary-container) !important; }
+      #attempts-indicator .bg-gray-700 { background-color:var(--color-outline-variant) !important; }
+      #attempts-indicator .bg-red-500 { background-color:var(--color-error) !important; }
+
+      /* Wide-layout breakout when keystroke / voice step is active (mirrors enroll.html) */
+      body:has(#keystroke-section:not(.hidden)) main > .relative.z-10,
+      body:has(#voice-section:not(.hidden))     main > .relative.z-10 { max-width: 64rem; }
+      body:has(#keystroke-section:not(.hidden)) .design-card,
+      body:has(#voice-section:not(.hidden))     .design-card { background:transparent; border:0; box-shadow:none; padding:0; }
+      body:has(#keystroke-section:not(.hidden)) .design-card > div.flex.flex-col.items-center,
+      body:has(#voice-section:not(.hidden))     .design-card > div.flex.flex-col.items-center { display:none; }
+      body:has(#keystroke-section:not(.hidden)) #step-indicator,
+      body:has(#voice-section:not(.hidden))     #step-indicator { display:none; }
+
+      /* Status pill (matches enroll) */
+      .ks-pill { display:inline-flex; align-items:center; gap:0.5rem; font-size:0.75rem; font-weight:500; padding:0.375rem 0.75rem; border-radius:9999px; transition:all 0.2s; }
+      .ks-pill-dot { width:0.375rem; height:0.375rem; border-radius:9999px; }
     </style>
 </head>
-<body class="min-h-screen bg-gray-950 flex items-center justify-center p-4">
+<body class="min-h-screen flex flex-col">
 
-    <div class="bg-gray-900 rounded-2xl shadow-2xl w-full max-w-md p-8">
+<!-- ── Navbar ── -->
+<nav class="w-full top-0 flex justify-between items-center px-6 py-4 z-50 sticky shadow-[0_1px_0_rgba(20,27,43,0.04)]" style="background:var(--navbar-bg);">
+  <div class="flex items-center gap-2">
+    <div class="w-8 h-8 signature-gradient rounded-lg flex items-center justify-center">
+      <span class="material-symbols-outlined text-white text-sm" style="font-variation-settings:'FILL' 1;">security</span>
+    </div>
+    <span class="text-xl font-semibold tracking-tight text-primary">Multimodal Auth</span>
+  </div>
+  <div class="flex items-center gap-4">
+    <button onclick="toggleDark()" id="theme-btn" class="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors active:scale-95">
+      <span id="theme-icon" class="material-symbols-outlined" style="color:var(--color-on-surface-variant);">dark_mode</span>
+    </button>
+  </div>
+</nav>
 
-        <!-- Header -->
-        <div class="text-center mb-8">
-            <div class="text-4xl mb-3">🔐</div>
-            <h1 class="text-white text-2xl font-bold">Biometric Login</h1>
-            <p class="text-gray-400 text-sm mt-1">Verify your identity to continue</p>
+<main class="flex-grow flex items-center justify-center px-4 py-12 relative overflow-hidden">
+  <!-- background blobs -->
+  <div class="absolute inset-0 z-0 pointer-events-none opacity-40">
+    <div class="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] rounded-full blur-[120px]" style="background:#dbe1ff;"></div>
+    <div class="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] rounded-full blur-[120px]" style="background:#acbfff;"></div>
+  </div>
+
+  <div class="relative z-10 w-full max-w-md">
+    <div class="design-card rounded-xl p-8 md:p-10">
+
+      <!-- Header -->
+      <div class="flex flex-col items-center text-center mb-8">
+        <div class="w-16 h-16 rounded-full flex items-center justify-center mb-6" style="background:color-mix(in srgb,var(--color-primary-container) 15%,transparent);color:var(--color-primary-container);">
+          <span class="material-symbols-outlined text-4xl" style="font-variation-settings:'FILL' 1;">shield_lock</span>
         </div>
+        <h1 class="text-2xl font-bold tracking-tight font-headline text-on-surface mb-2">Biometric Login</h1>
+        <p class="text-on-surface-variant text-sm">Verify your identity to continue.</p>
+      </div>
 
-        <!-- Step Indicator (3 steps) -->
-        <div id="step-indicator" class="hidden mb-6">
-            <div class="flex justify-between items-center">
-                <!-- Step 1: Keystroke -->
-                <div class="flex flex-col items-center">
-                    <div id="dot-keystroke"
-                         class="w-8 h-8 rounded-full bg-gray-700 flex
-                                items-center justify-center text-white text-sm font-bold">
-                        1
-                    </div>
-                    <span class="text-xs text-gray-400 mt-1">Keystroke</span>
-                </div>
-                <div class="flex-1 h-1 bg-gray-700 mx-2">
-                    <div id="line-1" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
-                </div>
-                <!-- Step 2: Voice -->
-                <div class="flex flex-col items-center">
-                    <div id="dot-voice"
-                         class="w-8 h-8 rounded-full bg-gray-700 flex
-                                items-center justify-center text-white text-sm font-bold">
-                        2
-                    </div>
-                    <span class="text-xs text-gray-400 mt-1">Voice</span>
-                </div>
-                <div class="flex-1 h-1 bg-gray-700 mx-2">
-                    <div id="line-2" class="h-1 bg-purple-600 w-0 transition-all duration-500"></div>
-                </div>
-                <!-- Step 3: Security -->
-                <div class="flex flex-col items-center">
-                    <div id="dot-security"
-                         class="w-8 h-8 rounded-full bg-gray-700 flex
-                                items-center justify-center text-white text-sm font-bold">
-                        3
-                    </div>
-                    <span class="text-xs text-gray-400 mt-1">Security</span>
-                </div>
-            </div>
-        </div>
+      <!-- Step Indicator (3 steps) -->
+      <div id="step-indicator" class="hidden mb-6">
+          <div class="flex justify-between items-center">
+              <div class="flex flex-col items-center">
+                  <div id="dot-keystroke" class="w-8 h-8 rounded-full bg-gray-700 flex items-center justify-center text-sm font-bold">1</div>
+                  <span class="text-xs text-on-surface-variant mt-1">Keystroke</span>
+              </div>
+              <div class="flex-1 h-1 mx-2" style="background:var(--color-surface-container-highest);">
+                  <div id="line-1" class="h-1 w-0 transition-all duration-500" style="background:var(--color-primary-container);"></div>
+              </div>
+              <div class="flex flex-col items-center">
+                  <div id="dot-voice" class="w-8 h-8 rounded-full bg-gray-700 flex items-center justify-center text-sm font-bold">2</div>
+                  <span class="text-xs text-on-surface-variant mt-1">Voice</span>
+              </div>
+              <div class="flex-1 h-1 mx-2" style="background:var(--color-surface-container-highest);">
+                  <div id="line-2" class="h-1 w-0 transition-all duration-500" style="background:var(--color-primary-container);"></div>
+              </div>
+              <div class="flex flex-col items-center">
+                  <div id="dot-security" class="w-8 h-8 rounded-full bg-gray-700 flex items-center justify-center text-sm font-bold">3</div>
+                  <span class="text-xs text-on-surface-variant mt-1">Security</span>
+              </div>
+          </div>
+      </div>
 
-        <!-- Section 0: Username + Password (standard login form) -->
-        <div id="login-section">
-            <div class="mb-4">
-                <label class="text-gray-300 text-sm font-medium block mb-2">Email Address</label>
-                <input
-                    id="username-input"
-                    type="email"
-                    placeholder="Enter your email address"
-                    onkeydown="if(event.key==='Enter') submitLogin()"
-                    class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
-                           outline-none focus:ring-2 focus:ring-purple-500
-                           border border-gray-700"
-                />
-            </div>
-            <div class="mb-4">
-                <label class="text-gray-300 text-sm font-medium block mb-2">Password</label>
-                <div class="relative">
-                    <input
-                        id="password-input"
-                        type="password"
-                        placeholder="Enter your password"
-                        class="w-full bg-gray-800 text-white rounded-lg pl-4 pr-11 py-3
-                               outline-none focus:ring-2 focus:ring-purple-500
-                               border border-gray-700"
-                        onkeydown="if(event.key==='Enter') submitLogin()"
-                    />
-                    <button type="button" tabindex="-1"
-                        onclick="const i=this.previousElementSibling; i.type=i.type==='password'?'text':'password'; this.textContent=i.type==='password'?'👁':'🙈';"
-                        class="absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-200 select-none">👁</button>
-                </div>
-            </div>
-            <p id="login-status" class="text-center text-sm mb-4 text-gray-500"></p>
-            <button
-                onclick="submitLogin()"
-                class="w-full bg-purple-600 hover:bg-purple-700 text-white
-                       font-semibold py-3 rounded-lg transition-colors duration-200"
-            >
-                Login
-            </button>
-            <p class="text-center text-gray-500 text-sm mt-3">
-                <a href="/static/pages/forgot-password.html"
-                   class="text-purple-400 hover:underline">Forgot password?</a>
-            </p>
-            <p class="text-center text-gray-500 text-sm mt-2">
-                Not enrolled?
-                <a href="/static/pages/enroll.html" class="text-purple-400 hover:underline">Register here</a>
-            </p>
-        </div>
+      <!-- Section 0: Username + Password -->
+      <div id="login-section">
+          <div class="space-y-2 mb-4">
+              <label class="block text-sm font-medium text-on-surface-variant ml-1">Email Address</label>
+              <div class="relative">
+                  <span class="absolute left-3 top-1/2 -translate-y-1/2 material-symbols-outlined" style="color:var(--color-outline);">mail</span>
+                  <input id="username-input" type="email" placeholder="name@company.com"
+                         onkeydown="if(event.key==='Enter') submitLogin()"
+                         class="design-input w-full pl-10 pr-4 py-3 rounded-lg text-sm transition-all"/>
+              </div>
+          </div>
+          <div class="space-y-2 mb-4">
+              <div class="flex justify-between items-center px-1">
+                <label class="text-sm font-medium text-on-surface-variant">Password</label>
+                <a href="/static/pages/forgot-password.html" class="text-xs font-semibold text-primary hover:underline">Forgot?</a>
+              </div>
+              <div class="relative">
+                  <span class="absolute left-3 top-1/2 -translate-y-1/2 material-symbols-outlined" style="color:var(--color-outline);">lock</span>
+                  <input id="password-input" type="password" placeholder="••••••••"
+                         onkeydown="if(event.key==='Enter') submitLogin()"
+                         class="design-input w-full pl-10 pr-11 py-3 rounded-lg text-sm transition-all"/>
+                  <button type="button" tabindex="-1"
+                      onclick="const i=this.previousElementSibling; i.type=i.type==='password'?'text':'password'; this.querySelector('span').textContent=i.type==='password'?'visibility':'visibility_off';"
+                      class="absolute inset-y-0 right-0 flex items-center px-3 select-none hover:text-on-surface" style="color:var(--color-outline);">
+                      <span class="material-symbols-outlined text-xl">visibility</span>
+                  </button>
+              </div>
+          </div>
+          <p id="login-status" class="text-center text-sm mb-4 text-on-surface-variant"></p>
+          <button onclick="submitLogin()"
+                  class="design-btn-primary w-full py-3.5 font-semibold rounded-lg shadow-lg transition-all active:scale-[0.98] flex items-center justify-center gap-2">
+              <span>Login</span>
+              <span class="material-symbols-outlined text-xl">fingerprint</span>
+          </button>
+          <p class="text-center text-on-surface-variant text-sm mt-6">
+              Not enrolled?
+              <a href="/static/pages/enroll.html" class="text-primary font-semibold hover:underline">Register here</a>
+          </p>
+      </div>
 
-        <!-- Section 1: Keystroke -->
-        <div id="keystroke-section" class="hidden">
-            <div class="bg-blue-900 border border-blue-600 rounded-lg p-3 mb-4 text-center">
-                <p class="text-blue-300 text-sm">
-                    ✅ Credentials verified. Now verify your typing pattern.
-                </p>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-4 mb-4 text-center border border-gray-700">
-                <p class="text-gray-400 text-xs mb-1">TYPE THIS PHRASE:</p>
-                <p class="phrase-display text-purple-400 font-mono text-base font-semibold">
-                    Loading your phrase…
-                </p>
-            </div>
-            <input
-                id="keystroke-input"
-                type="text"
-                placeholder="Type the phrase here..."
-                class="w-full bg-gray-800 text-white rounded-lg px-4 py-3
-                       mb-4 outline-none focus:ring-2 focus:ring-purple-500
-                       font-mono border border-gray-700"
-                autocomplete="off"
-            />
-            <p id="keystroke-status" class="text-center text-sm mb-4 text-gray-500">
-                Start typing when ready
-            </p>
-            <button
-                onclick="submitKeystrokeAuth()"
-                class="w-full bg-purple-600 hover:bg-purple-700 text-white
-                       font-semibold py-3 rounded-lg transition-colors duration-200"
-            >
-                Verify Keystroke
-            </button>
-        </div>
+      <!-- Section 1: Keystroke (wide layout — matches enroll) -->
+      <div id="keystroke-section" class="hidden">
+          <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              <!-- Left: phrase + input -->
+              <div class="lg:col-span-8 space-y-5">
+                  <div class="rounded-xl p-6 space-y-4" style="background:var(--color-surface-container-low);">
+                      <div class="flex justify-between items-center">
+                          <h2 class="text-xl font-semibold text-on-surface">Verification Phrase</h2>
+                          <span class="text-xs font-medium px-2 py-1 rounded text-on-surface-variant"
+                                style="background:var(--color-surface-container-highest);">Login Attempt</span>
+                      </div>
+                      <p class="text-on-surface-variant text-sm">
+                          Credentials verified. Type the phrase below at your natural rhythm.
+                      </p>
+                      <div class="rounded-r-lg p-5 border-l-4"
+                           style="background:var(--color-surface-container-lowest);border-left-color:var(--color-primary-container);">
+                          <p class="phrase-display font-mono text-lg tracking-tight leading-relaxed text-on-surface select-none">
+                              Loading your phrase…
+                          </p>
+                      </div>
+                  </div>
 
-        <!-- Section 2: Voice -->
-        <div id="voice-section" class="hidden">
-            <div class="bg-yellow-900 border border-yellow-600 rounded-lg p-3 mb-4 text-center">
-                <p class="text-yellow-400 text-sm">
-                    ⚠️ Additional verification needed — please confirm with voice.
-                </p>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-4 mb-4 text-center border border-gray-700">
-                <p class="text-gray-400 text-xs mb-1">SAY THIS PHRASE:</p>
-                <p class="phrase-display text-purple-400 font-mono text-base font-semibold">
-                    Loading your phrase…
-                </p>
-            </div>
-            <!-- Mic visual -->
-            <div class="flex flex-col items-center mb-4">
-                <div id="recording-indicator" class="relative flex items-center justify-center">
-                    <!-- Ripple rings (shown when recording) -->
-                    <div id="mic-ring-1" class="absolute w-24 h-24 rounded-full border-2 border-purple-500 opacity-0 scale-75 transition-all duration-500"></div>
-                    <div id="mic-ring-2" class="absolute w-32 h-32 rounded-full border-2 border-purple-400 opacity-0 scale-75 transition-all duration-700"></div>
-                    <!-- Mic SVG button -->
-                    <div id="mic-circle"
-                         class="relative w-20 h-20 rounded-full bg-gray-700 flex items-center justify-center transition-all duration-300 cursor-pointer"
-                         onclick="startVoiceAuth()">
-                        <svg id="mic-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
-                             fill="none" stroke="currentColor" stroke-width="2"
-                             stroke-linecap="round" stroke-linejoin="round"
-                             class="w-9 h-9 text-gray-400 transition-colors duration-300">
-                            <rect x="9" y="2" width="6" height="13" rx="3"/>
-                            <path d="M5 10a7 7 0 0 0 14 0"/>
-                            <line x1="12" y1="19" x2="12" y2="22"/>
-                            <line x1="8"  y1="22" x2="16" y2="22"/>
-                        </svg>
-                    </div>
-                </div>
-                <span id="diag-text" class="text-gray-500 text-xs mt-3 text-center"></span>
-            </div>
-            <p id="voice-status" class="text-center text-sm mb-4 text-gray-500">
-                Click record when ready
-            </p>
-            <button
-                id="record-btn"
-                onclick="startVoiceAuth()"
-                class="w-full bg-red-600 hover:bg-red-700 text-white
-                       font-semibold py-3 rounded-lg transition-colors duration-200 mb-2"
-            >
-                🎤 Start Recording
-            </button>
-            <button
-                id="try-again-btn"
-                onclick="resetVoiceAuth()"
-                class="w-full bg-gray-700 hover:bg-gray-600 text-white
-                       text-sm py-2 rounded-lg transition-colors duration-200"
-            >
-                ↩ Try Again
-            </button>
-        </div>
+                  <div class="space-y-2">
+                      <input id="keystroke-input" type="text"
+                             placeholder="Start typing the phrase here..."
+                             class="w-full rounded-xl px-6 py-5 font-mono text-lg outline-none transition-all"
+                             style="background:var(--color-surface-container-highest);color:var(--color-on-surface);border:1px solid var(--color-outline-variant);"
+                             autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"/>
+                      <div class="flex items-center justify-between px-1">
+                          <span class="text-xs text-on-surface-variant opacity-70">
+                              Verify your typing rhythm to continue
+                          </span>
+                          <span id="ks-pill" class="ks-pill"
+                                style="background:var(--color-surface-container-highest);color:var(--color-on-surface-variant);">
+                              <span id="ks-pill-dot" class="ks-pill-dot" style="background:var(--color-outline);"></span>
+                              <span id="ks-pill-text">Type the phrase to verify</span>
+                          </span>
+                      </div>
+                  </div>
 
-        <!-- Section 3: Security Question -->
-        <div id="security-section" class="hidden">
-            <div class="bg-yellow-900 border border-yellow-600 rounded-lg p-3 mb-4 text-center">
-                <p class="text-yellow-400 text-sm">
-                    ⚠️ Biometric verification failed. Answer your security question.
-                </p>
-            </div>
-            <p id="security-question-text" class="text-gray-300 text-sm font-medium mb-3"></p>
-            <div class="relative mb-4">
-                <input
-                    id="security-answer-input"
-                    type="password"
-                    placeholder="Your answer..."
-                    onkeydown="if(event.key==='Enter') submitSecurityAuth()"
-                    class="w-full bg-gray-800 text-white rounded-lg pl-4 pr-11 py-3
-                           outline-none focus:ring-2 focus:ring-purple-500
-                           border border-gray-700"
-                />
-                <button type="button" tabindex="-1"
-                    onclick="const i=this.previousElementSibling; i.type=i.type==='password'?'text':'password'; this.textContent=i.type==='password'?'👁':'🙈';"
-                    class="absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-200 select-none">👁</button>
-            </div>
-            <p id="security-status" class="text-center text-sm mb-4 text-gray-500"></p>
-            <button
-                onclick="submitSecurityAuth()"
-                class="w-full bg-blue-600 hover:bg-blue-700 text-white
-                       font-semibold py-3 rounded-lg transition-colors duration-200"
-            >
-                Verify Answer
-            </button>
-        </div>
+                  <p id="keystroke-status" class="text-center text-sm text-on-surface-variant">Start typing when ready</p>
 
-        <!-- Access Granted -->
-        <div id="success-section" class="hidden text-center">
-            <div class="text-6xl mb-4">✅</div>
-            <h2 class="text-white text-xl font-bold mb-2">Access Granted!</h2>
-            <p id="success-method" class="text-gray-400 text-sm mb-2"></p>
-            <p id="success-confidence" class="text-green-400 text-sm mb-6"></p>
-            <a href="/static/pages/dashboard.html"
-               class="block w-full bg-purple-600 hover:bg-purple-700 text-white
-                      font-semibold py-3 rounded-lg transition-colors duration-200 text-center">
-                Go to Dashboard
-            </a>
-        </div>
+                  <button onclick="submitKeystrokeAuth()"
+                          class="design-btn-primary w-full py-3.5 font-semibold rounded-lg shadow-lg transition-all active:scale-[0.98] flex items-center justify-center gap-2">
+                      <span>Verify Keystroke</span>
+                      <span class="material-symbols-outlined text-xl">arrow_forward</span>
+                  </button>
+              </div>
 
-        <!-- Access Denied -->
-        <div id="denied-section" class="hidden text-center">
-            <div class="text-6xl mb-4">🚫</div>
-            <h2 class="text-red-400 text-xl font-bold mb-2">Access Denied</h2>
-            <p class="text-gray-400 text-sm mb-2">All verification methods failed.</p>
-            <p class="text-red-400 text-sm mb-6">
-                Your account has been flagged for suspicious activity.
-            </p>
-            <button
-                onclick="resetLogin()"
-                class="w-full bg-gray-700 hover:bg-gray-600 text-white
-                       font-semibold py-3 rounded-lg transition-colors duration-200"
-            >
-                Try Again
-            </button>
-        </div>
+              <!-- Right: Live Analysis + Expert Tip -->
+              <div class="lg:col-span-4 space-y-5">
+                  <div class="rounded-xl p-6 space-y-5" style="background:var(--color-surface-container-low);">
+                      <h3 class="text-base font-semibold flex items-center gap-2 text-on-surface">
+                          <span class="material-symbols-outlined text-primary">analytics</span>
+                          Live Analysis
+                      </h3>
 
-        <!-- Failed attempts indicator -->
-        <div id="attempts-indicator" class="hidden mt-4">
-            <div class="flex justify-center gap-2">
-                <div id="fail-1" class="w-3 h-3 rounded-full bg-gray-700"></div>
-                <div id="fail-2" class="w-3 h-3 rounded-full bg-gray-700"></div>
-                <div id="fail-3" class="w-3 h-3 rounded-full bg-gray-700"></div>
-            </div>
-            <p class="text-center text-gray-500 text-xs mt-2">Failed attempts</p>
-        </div>
+                      <div class="space-y-2">
+                          <div class="flex justify-between items-end">
+                              <span class="text-sm text-on-surface-variant">Typing Speed</span>
+                              <span id="ks-wpm" class="text-sm font-bold text-on-surface">0 WPM</span>
+                          </div>
+                          <div class="h-2 w-full rounded-full" style="background:var(--color-surface-container-highest);">
+                              <div id="ks-speed-bar" class="h-full rounded-full transition-all duration-500"
+                                   style="width:0%;background:#10b981;"></div>
+                          </div>
+                      </div>
+
+                      <div class="space-y-2">
+                          <div class="flex justify-between items-end">
+                              <span class="text-sm text-on-surface-variant">Consistency</span>
+                              <span id="ks-cons" class="text-sm font-bold text-on-surface">—</span>
+                          </div>
+                          <div class="h-2 w-full rounded-full" style="background:var(--color-surface-container-highest);">
+                              <div id="ks-cons-bar" class="h-full rounded-full transition-all duration-500"
+                                   style="width:0%;background:var(--color-primary);"></div>
+                          </div>
+                      </div>
+
+                      <div class="space-y-2">
+                          <div class="flex justify-between items-end">
+                              <span class="text-sm text-on-surface-variant">Flight Time Profile</span>
+                              <span id="ks-flight-avg" class="text-xs text-on-surface-variant">avg —</span>
+                          </div>
+                          <div id="ks-flight-bars" class="flex items-end justify-between h-16 gap-1">
+                              <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+                              <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+                              <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+                              <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+                              <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+                              <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+                              <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+                          </div>
+                          <div class="flex justify-between text-[10px] text-on-surface-variant opacity-60 px-0.5">
+                              <span>oldest</span><span>newest</span>
+                          </div>
+                      </div>
+                  </div>
+
+                  <div class="rounded-xl p-5 relative overflow-hidden" style="background:#bc4800;color:#ffede6;">
+                      <div class="relative z-10">
+                          <div class="flex items-center gap-2 mb-2">
+                              <span class="material-symbols-outlined text-sm">info</span>
+                              <span class="text-xs font-bold uppercase tracking-wider">Expert Tip</span>
+                          </div>
+                          <p class="text-sm leading-relaxed opacity-90">
+                              Type naturally — the way you usually do. Don't try to be fast or careful;
+                              your rhythm is what we recognise.
+                          </p>
+                      </div>
+                      <span class="material-symbols-outlined absolute -bottom-4 -right-4 text-8xl opacity-10 rotate-12">keyboard</span>
+                  </div>
+              </div>
+          </div>
+      </div>
+
+      <!-- Section 2: Voice (wide layout — matches enroll) -->
+      <div id="voice-section" class="hidden">
+          <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+              <!-- Left: heading, warning banner, controls -->
+              <div class="lg:col-span-5 space-y-6">
+                  <h1 class="text-3xl font-semibold tracking-tight leading-tight text-on-surface">
+                      Confirm with your voice
+                  </h1>
+                  <p class="text-on-surface-variant">
+                      Additional verification needed. Speak the phrase to confirm your identity.
+                  </p>
+
+                  <div class="design-banner-warn p-4 rounded-r-lg flex items-start gap-3 text-left">
+                      <span class="material-symbols-outlined mt-0.5">warning</span>
+                      <p class="text-sm leading-relaxed">Keystroke score was inconclusive — voice will fuse with it.</p>
+                  </div>
+
+                  <button id="record-btn" onclick="startVoiceAuth()"
+                          class="w-full py-4 font-semibold rounded-lg transition-all active:scale-[0.98] flex items-center justify-center gap-2 hover:brightness-110 shadow-lg"
+                          style="background:#bc4800;color:#ffede6;">
+                      <span class="material-symbols-outlined" style="font-variation-settings:'FILL' 1;">mic</span>
+                      <span>🎤 Start Recording</span>
+                  </button>
+
+                  <button id="try-again-btn" onclick="resetVoiceAuth()"
+                          class="w-full text-sm py-2 rounded-lg transition-colors duration-200"
+                          style="background:var(--color-surface-container-high);color:var(--color-on-surface);">
+                      ↩ Try Again
+                  </button>
+              </div>
+
+              <!-- Right: phrase + visualizer -->
+              <div class="lg:col-span-7 rounded-xl p-8 lg:p-10 shadow-sm space-y-8"
+                   style="background:var(--color-surface-container-lowest);border:1px solid color-mix(in srgb,var(--color-outline-variant) 15%,transparent);">
+
+                  <div class="rounded-xl p-8 relative overflow-hidden text-center"
+                       style="background:var(--color-surface-container-low);">
+                      <span class="absolute top-3 left-4 text-[10px] font-bold tracking-widest uppercase opacity-50 text-on-surface-variant">
+                          Authentication Phrase
+                      </span>
+                      <p class="phrase-display text-xl md:text-2xl font-medium tracking-tight leading-relaxed text-on-surface mt-2">
+                          Loading your phrase…
+                      </p>
+                  </div>
+
+                  <!-- Visualizer -->
+                  <div class="flex flex-col items-center gap-5">
+                      <div id="recording-indicator" class="relative flex items-center justify-center h-48 w-48">
+                          <div class="absolute inset-0 rounded-full" style="border:4px solid var(--color-surface-container-highest);"></div>
+                          <div id="mic-ring-2" class="absolute inset-0 rounded-full transition-all duration-700"
+                               style="border:2px solid var(--color-primary-container);opacity:0;transform:scale(0.75);"></div>
+                          <div id="mic-ring-1" class="absolute inset-3 rounded-full transition-all duration-500"
+                               style="border:2px solid var(--color-primary);opacity:0;transform:scale(0.75);"></div>
+                          <div id="mic-circle"
+                               class="relative h-24 w-24 rounded-full flex items-center justify-center cursor-pointer z-10 transition-colors duration-300"
+                               style="background:#374151;"
+                               onclick="startVoiceAuth()">
+                              <svg id="mic-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                                   fill="none" stroke="#9ca3af" stroke-width="2"
+                                   stroke-linecap="round" stroke-linejoin="round" class="w-10 h-10 transition-colors duration-300">
+                                  <rect x="9" y="2" width="6" height="13" rx="3"/>
+                                  <path d="M5 10a7 7 0 0 0 14 0"/>
+                                  <line x1="12" y1="19" x2="12" y2="22"/>
+                                  <line x1="8"  y1="22" x2="16" y2="22"/>
+                              </svg>
+                          </div>
+                      </div>
+                      <span id="diag-text" class="text-on-surface-variant text-xs text-center"></span>
+                      <p id="voice-status" class="text-center text-sm text-on-surface-variant">
+                          Tap the mic or the button to begin recording.
+                      </p>
+                  </div>
+              </div>
+          </div>
+
+          <!-- Bottom info cards -->
+          <div class="mt-10 grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div class="p-5 rounded-xl" style="background:var(--color-surface-container-low);">
+                  <span class="material-symbols-outlined text-primary mb-2">verified_user</span>
+                  <h3 class="font-medium text-sm mb-1 text-on-surface">Encrypted Storage</h3>
+                  <p class="text-xs text-on-surface-variant leading-relaxed">
+                      Voiceprints are stored as embeddings, never raw audio.
+                  </p>
+              </div>
+              <div class="p-5 rounded-xl" style="background:var(--color-surface-container-low);">
+                  <span class="material-symbols-outlined text-primary mb-2">graphic_eq</span>
+                  <h3 class="font-medium text-sm mb-1 text-on-surface">Speaker Verification</h3>
+                  <p class="text-xs text-on-surface-variant leading-relaxed">
+                      ECAPA-TDNN matches your voiceprint with high precision.
+                  </p>
+              </div>
+          </div>
+      </div>
+
+      <!-- Section 3: Security Question -->
+      <div id="security-section" class="hidden">
+          <div class="design-banner-warn p-4 rounded-r-lg flex items-start gap-3 text-left mb-6">
+              <span class="material-symbols-outlined mt-0.5">warning</span>
+              <p class="text-sm leading-relaxed">Biometric verification failed. Answer your security question.</p>
+          </div>
+          <p id="security-question-text" class="text-on-surface text-sm font-medium mb-3"></p>
+          <div class="relative mb-4">
+              <input id="security-answer-input" type="password" placeholder="Your answer..."
+                     autocomplete="new-password" autocorrect="off" autocapitalize="off"
+                     spellcheck="false" data-lpignore="true" data-form-type="other"
+                     onkeydown="if(event.key==='Enter') submitSecurityAuth()"
+                     class="design-input w-full pl-4 pr-11 py-3 rounded-lg text-sm transition-all"/>
+              <button type="button" tabindex="-1"
+                  onclick="const i=this.previousElementSibling; i.type=i.type==='password'?'text':'password'; this.querySelector('span').textContent=i.type==='password'?'visibility':'visibility_off';"
+                  class="absolute inset-y-0 right-0 flex items-center px-3 select-none hover:text-on-surface" style="color:var(--color-outline);">
+                  <span class="material-symbols-outlined text-xl">visibility</span>
+              </button>
+          </div>
+          <p id="security-status" class="text-center text-sm mb-4 text-on-surface-variant"></p>
+          <button onclick="submitSecurityAuth()"
+                  class="design-btn-primary w-full py-3.5 font-semibold rounded-lg shadow-lg transition-all active:scale-[0.98]">
+              Verify Answer
+          </button>
+      </div>
+
+      <!-- Access Granted -->
+      <div id="success-section" class="hidden text-center">
+          <div class="w-20 h-20 signature-gradient rounded-full flex items-center justify-center mx-auto mb-6 shadow-xl">
+            <span class="material-symbols-outlined text-white text-4xl" style="font-variation-settings:'FILL' 1;">verified_user</span>
+          </div>
+          <h2 class="text-on-surface text-2xl font-bold mb-2">Access Granted</h2>
+          <p id="success-method" class="text-on-surface-variant text-sm mb-2"></p>
+          <p id="success-confidence" class="text-sm mb-6" style="color:#059669;"></p>
+          <a href="/static/pages/dashboard.html"
+             class="design-btn-primary block w-full py-3.5 font-semibold rounded-lg shadow-lg transition-all text-center">
+              Go to Dashboard
+          </a>
+      </div>
+
+      <!-- Access Denied -->
+      <div id="denied-section" class="hidden text-center">
+          <div class="w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-6" style="background:var(--color-error-container);color:var(--color-on-error-container);">
+            <span class="material-symbols-outlined text-4xl" style="font-variation-settings:'FILL' 1;">block</span>
+          </div>
+          <h2 class="text-2xl font-bold mb-2" style="color:var(--color-error);">Access Denied</h2>
+          <p class="text-on-surface-variant text-sm mb-2">All verification methods failed.</p>
+          <p class="text-sm mb-6" style="color:var(--color-error);">
+              Your account has been flagged for suspicious activity.
+          </p>
+          <button onclick="resetLogin()"
+                  class="design-btn-error w-full py-3.5 font-semibold rounded-lg transition-all">
+              Try Again
+          </button>
+      </div>
+
+      <!-- Failed attempts indicator -->
+      <div id="attempts-indicator" class="hidden mt-6">
+          <div class="flex justify-center gap-2">
+              <div id="fail-1" class="w-3 h-3 rounded-full bg-gray-700"></div>
+              <div id="fail-2" class="w-3 h-3 rounded-full bg-gray-700"></div>
+              <div id="fail-3" class="w-3 h-3 rounded-full bg-gray-700"></div>
+          </div>
+          <p class="text-center text-on-surface-variant text-xs mt-2">Failed attempts</p>
+      </div>
 
     </div>
 
-    <script src="/static/js/keystroke.js?v=11"></script>
-    <script src="/static/js/speech.js?v=14"></script>
-    <script src="/static/js/api.js"></script>
-    <script src="/static/js/auth_flow.js?v=11"></script>
+    <footer class="mt-8 text-center">
+        <p class="text-xs text-on-surface-variant tracking-wide">© 2026  AUTHENTICATION SYSTEMS.</p>
+    </footer>
+  </div>
+</main>
+
+<script>
+  function toggleDark() {
+    const html = document.documentElement;
+    html.classList.toggle('dark');
+    const isDark = html.classList.contains('dark');
+    document.getElementById('theme-icon').textContent = isDark ? 'light_mode' : 'dark_mode';
+    localStorage.setItem('theme', isDark ? 'dark' : 'light');
+  }
+  if (localStorage.getItem('theme') === 'dark') {
+    document.documentElement.classList.add('dark');
+    document.documentElement.classList.remove('light');
+    document.addEventListener('DOMContentLoaded', () => {
+      const icon = document.getElementById('theme-icon');
+      if (icon) icon.textContent = 'light_mode';
+    });
+  }
+</script>
+
+<script src="/static/js/keystroke.js?v=11"></script>
+<script src="/static/js/speech.js?v=14"></script>
+<script src="/static/js/api.js"></script>
+<script src="/static/js/auth_flow.js?v=12"></script>
+
+<!-- Live Analysis (flight bars + WPM + consistency + status pill) — mirrors enroll.html -->
+<script>
+(function () {
+  const FLIGHT_WINDOW = 7;
+  const FLIGHT_MAX_MS = 350;
+  const flightTimes = [];
+  let lastReleaseTs = 0;
+  let firstKeyTs = 0;
+  let attached = false;
+
+  function setPill(state) {
+    const pill = document.getElementById('ks-pill');
+    const dot  = document.getElementById('ks-pill-dot');
+    const text = document.getElementById('ks-pill-text');
+    if (!pill) return;
+    pill.classList.remove('animate-pulse');
+    if (state === 'idle') {
+      pill.style.background = 'var(--color-surface-container-highest)';
+      pill.style.color      = 'var(--color-on-surface-variant)';
+      dot.style.background  = 'var(--color-outline)';
+      text.textContent      = 'Type the phrase to verify';
+    } else if (state === 'typing') {
+      pill.style.background = 'color-mix(in srgb, var(--color-primary-container) 18%, transparent)';
+      pill.style.color      = 'var(--color-primary)';
+      dot.style.background  = 'var(--color-primary-container)';
+      text.textContent      = 'Capturing keystrokes…';
+      pill.classList.add('animate-pulse');
+    } else if (state === 'mismatch') {
+      pill.style.background = 'rgba(217,119,6,0.15)';
+      pill.style.color      = '#b45309';
+      dot.style.background  = '#d97706';
+      text.textContent      = "Keep typing — phrase doesn't match yet";
+    } else if (state === 'captured') {
+      pill.style.background = 'rgba(16,185,129,0.18)';
+      pill.style.color      = '#047857';
+      dot.style.background  = '#10b981';
+      text.textContent      = '✓ Ready to verify';
+    }
+  }
+
+  function renderFlightBars() {
+    const bars = document.querySelectorAll('#ks-flight-bars .ks-flight-bar');
+    if (!bars.length) return;
+    const padding = FLIGHT_WINDOW - flightTimes.length;
+    bars.forEach((bar, i) => {
+      const idx = i - padding;
+      if (idx < 0) {
+        bar.style.height     = '8%';
+        bar.style.background = 'color-mix(in srgb,var(--color-primary-container) 35%,transparent)';
+      } else {
+        const ms = flightTimes[idx];
+        const h  = Math.min(100, Math.max(12, (ms / FLIGHT_MAX_MS) * 100));
+        const isNewest = idx === flightTimes.length - 1;
+        bar.style.height     = h + '%';
+        bar.style.background = isNewest
+          ? 'var(--color-primary-container)'
+          : 'color-mix(in srgb,var(--color-primary-container) 60%,transparent)';
+      }
+    });
+    const avgEl = document.getElementById('ks-flight-avg');
+    if (avgEl) {
+      avgEl.textContent = flightTimes.length === 0
+        ? 'avg —'
+        : `avg ${Math.round(flightTimes.reduce((a,b)=>a+b,0)/flightTimes.length)} ms`;
+    }
+  }
+
+  function updateLiveAnalysis() {
+    const inp = document.getElementById('keystroke-input');
+    if (!inp) return;
+    const v = inp.value;
+
+    if (lastReleaseTs > 0 && firstKeyTs > 0) {
+      const elapsedMin = (lastReleaseTs - firstKeyTs) / 60000;
+      const wpm = elapsedMin > 0 ? Math.min(120, Math.round((v.length / 5) / elapsedMin)) : 0;
+      const wpmEl = document.getElementById('ks-wpm');
+      const speedBar = document.getElementById('ks-speed-bar');
+      if (wpmEl) wpmEl.textContent = wpm + ' WPM';
+      if (speedBar) speedBar.style.width = Math.min(100, (wpm / 80) * 100) + '%';
+    }
+
+    const consEl    = document.getElementById('ks-cons');
+    const consBarEl = document.getElementById('ks-cons-bar');
+    if (consEl && consBarEl) {
+      if (flightTimes.length < 3) {
+        consEl.textContent = '—';
+        consBarEl.style.width = '0%';
+      } else {
+        const mean = flightTimes.reduce((a,b)=>a+b,0) / flightTimes.length;
+        const sd   = Math.sqrt(flightTimes.reduce((s,x)=>s+(x-mean)**2,0) / flightTimes.length);
+        const cv   = mean > 0 ? sd / mean : 1;
+        const cons = Math.max(0, Math.min(100, Math.round((1 - cv) * 100)));
+        consEl.textContent =
+          cons >= 80 ? '✓ Excellent' :
+          cons >= 65 ? '✓ Good'      :
+          cons >= 45 ? '~ Fair'      : '± Varies';
+        consBarEl.style.width = cons + '%';
+      }
+    }
+
+    // Pill state — uses target phrase from KeystrokeCapture if available
+    let target = '';
+    try {
+      target = (typeof KeystrokeCapture !== 'undefined' && KeystrokeCapture.targetPhrase) || '';
+    } catch (_) {}
+    if (!target) {
+      const pd = document.querySelector('#keystroke-section .phrase-display');
+      if (pd && pd.textContent && !/loading/i.test(pd.textContent)) target = pd.textContent.trim();
+    }
+    const trimmed = v.trim();
+    if (!trimmed) setPill('idle');
+    else if (target && trimmed === target) setPill('captured');
+    else if (target && !target.startsWith(trimmed) && trimmed.length >= target.length - 2) setPill('mismatch');
+    else setPill('typing');
+  }
+
+  function onKeyup(e) {
+    if (['Shift','Control','Alt','Meta','CapsLock'].includes(e.key)) return;
+    const now = performance.now();
+    if (firstKeyTs === 0) firstKeyTs = now;
+    if (lastReleaseTs > 0) {
+      const ft = now - lastReleaseTs;
+      if (ft > 30 && ft < 2000) {
+        flightTimes.push(ft);
+        if (flightTimes.length > FLIGHT_WINDOW) flightTimes.shift();
+        renderFlightBars();
+      }
+    }
+    lastReleaseTs = now;
+    updateLiveAnalysis();
+  }
+
+  function attach() {
+    if (attached) return;
+    const inp = document.getElementById('keystroke-input');
+    if (!inp) return;
+    inp.addEventListener('keyup', onKeyup);
+    inp.addEventListener('input', () => {
+      if (inp.value === '') {
+        flightTimes.length = 0;
+        firstKeyTs = 0;
+        lastReleaseTs = 0;
+        renderFlightBars();
+        updateLiveAnalysis();
+      }
+    });
+    attached = true;
+  }
+
+  document.addEventListener('DOMContentLoaded', attach);
+})();
+</script>
 </body>
 </html>

@@ -87,7 +87,11 @@ def load_user_ecapa(username):
     embs = d.get('embeddings')
     if embs is None or len(embs) == 0:
         return None
-    return np.array([np.asarray(e, dtype=np.float64).flatten() for e in embs])
+    vecs = []
+    for e in embs:
+        v = e['vec'] if isinstance(e, dict) else e
+        vecs.append(np.asarray(v, dtype=np.float64).flatten())
+    return np.array(vecs)
 
 
 def loocv_cosine_to_mean(genuine, impostors):

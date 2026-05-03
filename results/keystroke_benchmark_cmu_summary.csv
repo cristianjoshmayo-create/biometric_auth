@@ -1,0 +1,9 @@
+algorithm,n_subjects,mean_eer,std_eer,mean_auc,mean_train_s,mean_infer_ms
+kNN_Manhattan,51,0.0321,0.0220,0.9896,0.001,0.121
+RandomForest,51,0.0421,0.0250,0.9911,0.454,0.688
+SVM_RBF,51,0.0444,0.0252,0.9882,0.009,0.013
+MLP,51,0.0454,0.0251,0.9878,0.252,0.005
+ProfileMatcher_GP,51,0.0498,0.0302,0.9881,0.000,9.887
+LogReg,51,0.0583,0.0349,0.9794,0.007,0.005
+GradientBoosting,51,0.0611,0.0222,0.9724,1.461,0.012
+OneClassSVM,51,0.1056,0.0501,0.9456,0.001,0.006

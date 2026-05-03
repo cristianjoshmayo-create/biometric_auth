@@ -17,6 +17,7 @@
 #   - Logistic Regression (linear baseline)
 #   - One-Class SVM (anomaly-style baseline; trained on genuine only)
 #   - MLP (small dense net)
+#   - ProfileMatcher_GP (Gunetti-Picardi A+R, production cold-start algorithm)
 #
 # Output: results/keystroke_benchmark.csv  +  results/keystroke_benchmark_summary.csv
 #
@@ -60,6 +61,7 @@ from train_keystroke_rf import (
     get_phrase_digraph_pairs,
     get_active_trigraphs,
 )
+from keystroke_profile_matcher import compute_set_match_score, _is_scoring_feature
 
 
 def compute_eer(y_true, y_score):
@@ -131,6 +133,89 @@ def evaluate_one_class_svm(X, y, n_splits=5):
     return np.array(y_true_all), np.array(y_score_all), train_times, infer_times
 
 
+def patch_impostor_zeros(X_imp, feat_names, p_mean, p_std, seed=77):
+    """
+    Mirror train_keystroke_rf._patch_impostor_digraphs: replace zero-padded
+    phrase-specific columns (extra_/key_/trigraph_/per-pair flight_) on
+    real impostor vectors with phrase-plausible but distinct timings.
+
+    Without this, GP A+R masks those zero positions out and the supervised
+    classifiers learn a "zero == impostor" shortcut. Patching produces a
+    fair comparison across all algorithms.
+    """
+    if len(X_imp) == 0:
+        return X_imp
+    rng = np.random.default_rng(seed)
+    aggr_flights = {'flight_mean', 'flight_std', 'flight_median',
+                    'flight_mean_norm', 'flight_std_norm'}
+    dyn_cols = [i for i, n in enumerate(feat_names)
+                if (n.startswith('extra_') or n.startswith('key_')
+                    or n.startswith('trigraph_')
+                    or (n.startswith('flight_') and n not in aggr_flights))]
+    if not dyn_cols:
+        return X_imp
+    out = X_imp.copy()
+    for r in range(len(out)):
+        for col in dyn_cols:
+            if abs(out[r, col]) > 1e-6:
+                continue  # already filled (e.g. synthetic) — leave alone
+            name = feat_names[col]
+            g_mean = p_mean[col]
+            g_std = p_std[col]
+            min_sep = max(g_std * 1.5, g_mean * 0.15, 5.0)
+            val = g_mean
+            for _ in range(20):
+                v = rng.normal(g_mean, g_std * 2.5 + 15.0)
+                if name.startswith('key_'):
+                    v = float(np.clip(v, 20.0, 300.0))
+                elif name.startswith('trigraph_'):
+                    v = float(np.clip(v, 40.0, 500.0))
+                else:
+                    v = float(np.clip(v, 20.0, 300.0))
+                if abs(v - g_mean) >= min_sep:
+                    val = v
+                    break
+            out[r, col] = val
+    return out
+
+
+def evaluate_profile_matcher(X, y, feat_names):
+    """
+    LOOCV evaluation of the Gunetti-Picardi A+R profile matcher.
+
+    For each genuine sample i, score it via set-match against the other
+    n-1 genuine samples. For each impostor, score against the full
+    genuine reference set. No "training" beyond storing the references.
+    """
+    genuine = X[y == 1]
+    impostors = X[y == 0]
+    if len(genuine) < 4:
+        return np.array([]), np.array([]), [], []
+
+    profile_std = np.zeros(X.shape[1])  # accepted but unused by GP scorer
+    y_true_all, y_score_all = [], []
+    train_times, infer_times = [], []
+
+    for i in range(len(genuine)):
+        ref = [genuine[j] for j in range(len(genuine)) if j != i]
+        train_times.append(0.0)  # no training; references just stored
+        t0 = time.perf_counter()
+        r = compute_set_match_score(genuine[i], feat_names, ref, profile_std)
+        infer_times.append((time.perf_counter() - t0) * 1000)
+        y_true_all.append(1)
+        y_score_all.append(r['score'])
+
+    ref_full = [v for v in genuine]
+    for v in impostors:
+        t0 = time.perf_counter()
+        r = compute_set_match_score(v, feat_names, ref_full, profile_std)
+        infer_times.append((time.perf_counter() - t0) * 1000)
+        y_true_all.append(0)
+        y_score_all.append(r['score'])
+
+    return np.array(y_true_all), np.array(y_score_all), train_times, infer_times
+
+
 def evaluate_classifier(name, model, X, y, n_splits=5):
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     y_true_all, y_score_all = [], []
@@ -198,7 +283,14 @@ def build_user_dataset(db, user):
     p_mean = g.mean(axis=0)
     p_std = g.std(axis=0) + 1e-9
 
-    real_imp = [pad(v) for v in cmu] + [pad(v) for v in other_imposters]
+    real_imp_raw = np.array([pad(v) for v in cmu] + [pad(v) for v in other_imposters]) \
+        if (cmu or other_imposters) else np.empty((0, full_len))
+
+    # Phrase-aware patching of zero-padded scoring columns. Mirrors what
+    # train_keystroke_rf.py does in production: prevents GP masking and the
+    # "zero column == impostor" shortcut for supervised models.
+    real_imp_arr = patch_impostor_zeros(real_imp_raw, full_feat_names, p_mean, p_std)
+    real_imp = [v for v in real_imp_arr]
 
     n_synth = max(0, max(400, len(g) * 80) - len(real_imp))
     syn = generate_impostor_samples(p_mean, p_std, n=n_synth, feat_names=full_feat_names) \
@@ -229,7 +321,7 @@ def main():
             if ds is None:
                 print("  skipped (insufficient genuine samples)\n")
                 continue
-            X, y, n_gen, n_real_imp, n_syn, _ = ds
+            X, y, n_gen, n_real_imp, n_syn, feat_names = ds
             print(f"  genuine={n_gen}  real_imp={n_real_imp}  syn_imp={n_syn}  feats={X.shape[1]}")
 
             for name, model in make_models().items():
@@ -271,6 +363,26 @@ def main():
                     print(f"    {'OneClassSVM':18s}  EER={eer:.3f}  AUC={auc:.3f}")
             except Exception as e:
                 print(f"    OneClassSVM       FAILED: {e}")
+
+            # Profile Matcher (Gunetti-Picardi A+R) — production cold-start
+            try:
+                y_t, y_s, tt, it = evaluate_profile_matcher(X, y, feat_names)
+                if len(y_t) > 0 and len(np.unique(y_t)) >= 2:
+                    eer, far, frr, _ = compute_eer(y_t, y_s)
+                    auc = roc_auc_score(y_t, y_s)
+                    row = {
+                        'user': user.username, 'algorithm': 'ProfileMatcher_GP',
+                        'n_genuine': n_gen, 'n_impostor': len(y) - n_gen,
+                        'features': X.shape[1],
+                        'eer': eer, 'far_at_eer': far, 'frr_at_eer': frr,
+                        'auc': auc,
+                        'train_time_s': float(np.mean(tt)) if tt else 0.0,
+                        'infer_time_ms': float(np.mean(it)) if it else 0.0,
+                    }
+                    all_rows.append(row)
+                    print(f"    {'ProfileMatcher_GP':18s}  EER={eer:.3f}  AUC={auc:.3f}")
+            except Exception as e:
+                print(f"    ProfileMatcher_GP FAILED: {e}")
             print()
     finally:
         db.close()

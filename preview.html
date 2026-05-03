@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en" class="light">
+<head>
+<meta charset="UTF-8">
+<title>Multimodal Auth — Design Preview</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
+<script>
+  tailwind.config = {
+    darkMode: "class",
+    theme: { extend: {
+      fontFamily: { headline:["Inter","sans-serif"], body:["Inter","sans-serif"], mono:["JetBrains Mono","monospace"] },
+      borderRadius: { DEFAULT:"0.5rem", lg:"0.5rem", xl:"1.5rem", full:"9999px" }
+    }}
+  }
+</script>
+<style>
+  :root {
+    --color-background:#f9f9ff; --color-surface:#f9f9ff;
+    --color-surface-container-lowest:#ffffff; --color-surface-container-low:#f1f3ff;
+    --color-surface-container:#e9edff; --color-surface-container-high:#e1e8fd;
+    --color-surface-container-highest:#dce2f7;
+    --color-on-surface:#141b2b; --color-on-surface-variant:#434655;
+    --color-outline:#737686; --color-outline-variant:#c3c6d7;
+    --color-primary:#004ac6; --color-on-primary:#ffffff;
+    --color-primary-container:#2563eb; --color-on-primary-container:#eeefff;
+    --color-error:#ba1a1a;
+    --navbar-bg:#ffffff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; height:100%; font-family: Inter, sans-serif; }
+
+  /* Top navigator (dark bar) */
+  .topbar {
+    position: sticky; top: 0; z-index: 100;
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 16px;
+    background: #161e2e; color:#e2e6f8;
+    border-bottom: 1px solid #2e3550;
+  }
+  .topbar .title { font-weight: 600; margin-right: 16px; color:#93b4ff; }
+  .topbar button {
+    background: #1f2a3e; color: #e2e6f8;
+    border: 1px solid #2e3550;
+    padding: 6px 14px; border-radius: 6px;
+    font-size: 13px; cursor: pointer;
+  }
+  .topbar button:hover { background: #243148; }
+  .topbar button.active { background: #3d70f0; border-color: #3d70f0; color: #fff; }
+  .topbar button.sub { font-size: 12px; padding: 5px 10px; opacity: 0.85; }
+  .topbar button.mock { background:#7c3aed; border-color:#7c3aed; }
+  .topbar button.mock:hover { background:#6d28d9; }
+  .topbar .spacer { flex: 1; }
+  .topbar .reload {
+    background: transparent; border: 1px solid #2e3550;
+    padding: 6px 12px; border-radius: 6px; color:#a8adc5;
+    font-size: 12px; cursor: pointer;
+  }
+
+  /* Iframe view */
+  .frame-wrap { height: calc(100vh - 53px); width: 100%; background:#f9f9ff; }
+  iframe { width: 100%; height: 100%; border: 0; display: block; }
+
+  /* Mockup view (rendered inline) */
+  #mockup-view, #dash-mockup-view { display:none; min-height: calc(100vh - 53px); color: var(--color-on-surface); }
+  #mockup-view { background: var(--color-background); }
+  #dash-mockup-view { background: var(--color-surface-container-low); }
+  #mockup-view.show, #dash-mockup-view.show { display:block; }
+  #frame-view.hide { display:none; }
+
+  .signature-gradient { background:linear-gradient(135deg,#004ac6 0%,#2563eb 100%); }
+  .text-on-surface { color:var(--color-on-surface); }
+  .text-on-surface-variant { color:var(--color-on-surface-variant); }
+  .text-primary { color:var(--color-primary); }
+  .material-symbols-outlined { font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 24; }
+</style>
+</head>
+<body>
+
+<!-- ───────────────── Top Navigator ───────────────── -->
+<div class="topbar">
+  <span class="title">🛡️ Multimodal Auth Preview</span>
+  <button data-page="frontend/pages/login.html">Login</button>
+  <button data-page="frontend/pages/enroll.html">Enroll</button>
+  <button data-page="frontend/pages/enroll.html?step=verify" class="sub">↳ Verify</button>
+  <button data-page="frontend/pages/enroll.html?step=keystroke" class="sub">↳ Keystroke</button>
+  <button data-page="frontend/pages/enroll.html?step=voice" class="sub">↳ Voice</button>
+  <button data-page="frontend/pages/enroll.html?step=security" class="sub">↳ Security</button>
+  <button data-page="frontend/pages/enroll.html?step=success" class="sub">↳ Success</button>
+  <button data-page="frontend/pages/dashboard.html?preview=1">Dashboard</button>
+  <button data-page="frontend/pages/forgot-password.html">Forgot Password</button>
+  <button data-page="frontend/pages/reset.html">Reset</button>
+  <button id="mock-btn" class="mock">✨ New Keystroke Mockup</button>
+  <button id="dash-mock-btn" class="mock">✨ New Dashboard Mockup</button>
+  <span class="spacer"></span>
+  <span style="font-size:11px;color:#6b7090;margin-right:8px;">Edit preview.html → reload</span>
+  <button class="reload" onclick="location.reload()">↻ Reload</button>
+</div>
+
+<!-- ───────────────── Iframe View (existing pages) ───────────────── -->
+<div id="frame-view" class="frame-wrap">
+  <iframe id="frame" src="frontend/pages/login.html"></iframe>
+</div>
+
+<!-- ───────────────── Static Mockup: Proposed Keystroke Design ───────────────── -->
+<div id="mockup-view">
+
+<!-- Navbar matches the rest of our pages -->
+<nav class="w-full top-0 flex justify-between items-center px-6 py-4 z-40 sticky shadow-[0_1px_0_rgba(20,27,43,0.04)]" style="background:var(--navbar-bg);">
+  <div class="flex items-center gap-2">
+    <div class="w-8 h-8 signature-gradient rounded-lg flex items-center justify-center">
+      <span class="material-symbols-outlined text-white text-sm" style="font-variation-settings:'FILL' 1;">security</span>
+    </div>
+    <span class="text-xl font-semibold tracking-tight text-primary">Multimodal Auth</span>
+  </div>
+  <div class="flex items-center gap-4 text-sm text-on-surface-variant">
+    Biometric Enrollment
+  </div>
+</nav>
+
+<main class="pt-8 pb-12 px-4 md:px-8 flex flex-col items-center relative">
+  <!-- background blobs -->
+  <div class="fixed top-0 left-0 w-full h-full -z-10 pointer-events-none opacity-40">
+    <div class="absolute top-1/4 -left-20 w-96 h-96 rounded-full blur-[100px]" style="background:#dbe1ff;"></div>
+    <div class="absolute bottom-1/4 -right-20 w-96 h-96 rounded-full blur-[100px]" style="background:#ffdbcd;"></div>
+  </div>
+
+  <!-- Stepper -->
+  <div class="w-full max-w-3xl mb-10">
+    <div class="flex items-center justify-between relative">
+      <div class="absolute top-5 left-10 right-10 h-0.5 -z-10" style="background:var(--color-surface-container-highest);"></div>
+      <div class="flex flex-col items-center gap-3">
+        <div class="w-10 h-10 rounded-full flex items-center justify-center font-bold shadow-lg ring-4"
+             style="background:var(--color-primary-container);color:var(--color-on-primary-container);--tw-ring-color:var(--color-background);">1</div>
+        <span class="text-sm font-semibold text-primary">Keystroke</span>
+      </div>
+      <div class="flex flex-col items-center gap-3">
+        <div class="w-10 h-10 rounded-full flex items-center justify-center font-bold ring-4"
+             style="background:var(--color-surface-container-highest);color:var(--color-on-surface-variant);--tw-ring-color:var(--color-background);">2</div>
+        <span class="text-sm font-medium text-on-surface-variant">Voice</span>
+      </div>
+      <div class="flex flex-col items-center gap-3">
+        <div class="w-10 h-10 rounded-full flex items-center justify-center font-bold ring-4"
+             style="background:var(--color-surface-container-highest);color:var(--color-on-surface-variant);--tw-ring-color:var(--color-background);">3</div>
+        <span class="text-sm font-medium text-on-surface-variant">Security</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main grid -->
+  <div class="w-full max-w-4xl grid grid-cols-1 lg:grid-cols-12 gap-8">
+
+    <!-- Left: phrase + textarea -->
+    <div class="lg:col-span-8 space-y-6">
+      <div class="rounded-xl p-8 space-y-4" style="background:var(--color-surface-container-low);">
+        <div class="flex justify-between items-center">
+          <h2 class="text-xl font-semibold text-on-surface">Verification Phrase</h2>
+          <span id="ks-attempt-label" class="text-xs font-medium px-2 py-1 rounded text-on-surface-variant"
+                style="background:var(--color-surface-container-highest);">Attempt 1 of 5</span>
+        </div>
+        <p class="text-on-surface-variant text-sm">
+          Type the phrase below exactly as shown. Maintain your natural typing rhythm.
+        </p>
+        <div class="rounded-r-lg p-6 border-l-4"
+             style="background:var(--color-surface-container-lowest);border-left-color:var(--color-primary-container);">
+          <p class="font-mono text-xl tracking-tight leading-relaxed text-on-surface select-none">
+            green river silent maple
+          </p>
+        </div>
+        <div class="pt-4 space-y-2">
+          <div class="flex justify-between text-xs font-medium text-on-surface-variant">
+            <span>Completion Progress</span>
+            <span id="ks-pct">0%</span>
+          </div>
+          <div class="w-full h-1.5 rounded-full overflow-hidden" style="background:var(--color-surface-container-highest);">
+            <div id="ks-bar" class="h-full rounded-full transition-all duration-300" style="width:0%;background:var(--color-primary-container);"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="space-y-2">
+        <input id="ks-input" type="text"
+          oninput="mockUpdate()"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();}"
+          autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+          class="w-full rounded-xl px-6 py-5 font-mono text-lg outline-none transition-all"
+          style="background:var(--color-surface-container-highest);color:var(--color-on-surface);border:1px solid var(--color-outline-variant);"
+          placeholder="Start typing the phrase here..."/>
+
+        <!-- Status pill (replaces Submit button — auto-submit system) -->
+        <div class="flex items-center justify-between px-1">
+          <span class="text-xs text-on-surface-variant opacity-70">
+            Press normally — the phrase auto-submits when complete
+          </span>
+          <span id="ks-pill"
+                class="inline-flex items-center gap-2 text-xs font-medium px-3 py-1.5 rounded-full transition-all"
+                style="background:var(--color-surface-container-highest);color:var(--color-on-surface-variant);">
+            <span id="ks-pill-dot" class="w-1.5 h-1.5 rounded-full" style="background:var(--color-outline);"></span>
+            <span id="ks-pill-text">⏎ Auto-submits when phrase matches</span>
+          </span>
+        </div>
+      </div>
+
+      <!-- Mockup-only attempt simulator -->
+      <div class="flex items-center justify-between text-xs text-on-surface-variant px-1">
+        <span class="opacity-70">Mockup: jump to attempt state</span>
+        <div class="flex gap-1">
+          <button onclick="mockSetAttempt(0)" class="px-2 py-1 rounded" style="background:var(--color-surface-container-highest);">0</button>
+          <button onclick="mockSetAttempt(1)" class="px-2 py-1 rounded" style="background:var(--color-surface-container-highest);">1</button>
+          <button onclick="mockSetAttempt(2)" class="px-2 py-1 rounded" style="background:var(--color-surface-container-highest);">2</button>
+          <button onclick="mockSetAttempt(3)" class="px-2 py-1 rounded" style="background:var(--color-surface-container-highest);">3</button>
+          <button onclick="mockSetAttempt(4)" class="px-2 py-1 rounded" style="background:var(--color-surface-container-highest);">4</button>
+          <button onclick="mockSetAttempt(5)" class="px-2 py-1 rounded" style="background:var(--color-surface-container-highest);">5</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: Live Analysis + Expert Tip -->
+    <div class="lg:col-span-4 space-y-6">
+      <div class="rounded-xl p-6 space-y-6" style="background:var(--color-surface-container-low);">
+        <h3 class="text-base font-semibold flex items-center gap-2 text-on-surface">
+          <span class="material-symbols-outlined text-primary">analytics</span>
+          Live Analysis
+        </h3>
+
+        <div class="space-y-2">
+          <div class="flex justify-between items-end">
+            <span class="text-sm text-on-surface-variant">Typing Speed</span>
+            <span id="ks-wpm" class="text-sm font-bold text-on-surface">0 WPM</span>
+          </div>
+          <div class="h-2 w-full rounded-full" style="background:var(--color-surface-container-highest);">
+            <div id="ks-speed-bar" class="h-full rounded-full transition-all duration-500" style="width:0%;background:#10b981;"></div>
+          </div>
+        </div>
+
+        <div class="space-y-2">
+          <div class="flex justify-between items-end">
+            <span class="text-sm text-on-surface-variant">Consistency</span>
+            <span id="ks-cons" class="text-sm font-bold text-on-surface">—</span>
+          </div>
+          <div class="h-2 w-full rounded-full" style="background:var(--color-surface-container-highest);">
+            <div id="ks-cons-bar" class="h-full rounded-full transition-all duration-500" style="width:0%;background:var(--color-primary);"></div>
+          </div>
+        </div>
+
+        <div class="space-y-2">
+          <div class="flex justify-between items-end">
+            <span class="text-sm text-on-surface-variant">Flight Time Profile</span>
+            <span id="ks-flight-avg" class="text-xs text-on-surface-variant">avg —</span>
+          </div>
+          <div id="ks-flight-bars" class="flex items-end justify-between h-16 gap-1">
+            <!-- 7 bars; updated live from last 7 flight times -->
+            <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+            <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+            <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+            <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+            <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+            <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+            <div class="ks-flight-bar w-full rounded-t-sm origin-bottom transition-all duration-300" style="height:8%;background:color-mix(in srgb,var(--color-primary-container) 35%,transparent);"></div>
+          </div>
+          <div class="flex justify-between text-[10px] text-on-surface-variant opacity-60 px-0.5">
+            <span>oldest</span><span>newest</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="rounded-xl p-6 relative overflow-hidden" style="background:#bc4800;color:#ffede6;">
+        <div class="relative z-10">
+          <div class="flex items-center gap-2 mb-2">
+            <span class="material-symbols-outlined text-sm">info</span>
+            <span class="text-xs font-bold uppercase tracking-wider">Expert Tip</span>
+          </div>
+          <p class="text-sm leading-relaxed opacity-90">
+            Keystroke dynamics capture the unique timing patterns of your typing.
+            Don't try to be fast — be yourself.
+          </p>
+        </div>
+        <span class="material-symbols-outlined absolute -bottom-4 -right-4 text-8xl opacity-10 rotate-12">keyboard</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Footer status row -->
+  <div class="mt-10 w-full max-w-4xl flex justify-between items-center text-on-surface-variant">
+    <button class="flex items-center gap-2 text-sm font-medium hover:text-on-surface transition-colors">
+      <span class="material-symbols-outlined text-sm">arrow_back</span>
+      Back to Registration
+    </button>
+    <div class="flex items-center gap-4 text-xs">
+      <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-green-500"></span>Auth Node: Active</span>
+      <span style="color:var(--color-outline);">|</span>
+      <span>Encrypted AES-256</span>
+    </div>
+  </div>
+</main>
+
+</div><!-- /mockup-view -->
+
+<!-- ───────────────── Static Mockup: New Dashboard (proposed look + full features) ───────────────── -->
+<div id="dash-mockup-view">
+
+<!-- Navbar -->
+<nav class="w-full top-0 flex justify-between items-center px-6 py-4 z-40 sticky shadow-[0_1px_0_rgba(20,27,43,0.04)]" style="background:var(--navbar-bg);">
+  <div class="flex items-center gap-2">
+    <div class="w-8 h-8 signature-gradient rounded-lg flex items-center justify-center">
+      <span class="material-symbols-outlined text-white text-sm" style="font-variation-settings:'FILL' 1;">security</span>
+    </div>
+    <span class="text-xl font-semibold tracking-tight text-primary">Multimodal Auth</span>
+  </div>
+  <div class="flex items-center gap-3">
+    <button class="p-2 rounded-full" style="color:var(--color-on-surface-variant);">
+      <span class="material-symbols-outlined">dark_mode</span>
+    </button>
+  </div>
+</nav>
+
+<!-- Secondary nav -->
+<div class="w-full border-b px-6 py-2 flex items-center gap-8"
+     style="background:var(--color-surface-container-lowest);border-color:color-mix(in srgb,var(--color-outline-variant) 20%,transparent);">
+  <a class="text-sm font-semibold border-b-2 pb-2 -mb-2 cursor-pointer text-primary" style="border-color:var(--color-primary);">Dashboard</a>
+  <a class="text-sm cursor-pointer pb-2 -mb-2" style="color:var(--color-on-surface-variant);">Logs</a>
+  <a class="text-sm cursor-pointer pb-2 -mb-2" style="color:var(--color-on-surface-variant);">Devices</a>
+  <div class="ml-auto">
+    <button class="p-2 rounded-full" style="color:var(--color-on-surface-variant);">
+      <span class="material-symbols-outlined">notifications</span>
+    </button>
+  </div>
+</div>
+
+<main class="p-6">
+<div class="max-w-5xl mx-auto space-y-6">
+
+  <!-- Hero welcome row -->
+  <div class="rounded-xl p-6 flex items-center gap-5"
+       style="background:var(--color-surface-container-lowest);border:1px solid color-mix(in srgb,var(--color-outline-variant) 15%,transparent);box-shadow:0 32px 64px -12px rgba(20,27,43,0.06);">
+    <div class="p-4 rounded-full" style="background:color-mix(in srgb,var(--color-primary-container) 12%,transparent);">
+      <span class="material-symbols-outlined text-3xl text-primary" style="font-variation-settings:'FILL' 1;">home</span>
+    </div>
+    <div class="flex-1">
+      <h1 class="text-2xl font-semibold tracking-tight text-on-surface mb-1">Welcome back</h1>
+      <p class="text-sm font-mono text-primary">jane.doe@multimodal-auth.com</p>
+    </div>
+    <span class="px-3 py-1.5 rounded-full text-xs font-semibold text-white shadow-md" style="background:#059669;">
+      ✓ Verified just now
+    </span>
+  </div>
+
+  <!-- Session status -->
+  <div class="rounded-xl p-5 flex items-center justify-between"
+       style="background:var(--color-surface-container-lowest);border:1px solid color-mix(in srgb,var(--color-outline-variant) 15%,transparent);box-shadow:0 32px 64px -12px rgba(20,27,43,0.06);">
+    <div class="flex items-center gap-3">
+      <span class="material-symbols-outlined text-2xl" style="color:#059669;font-variation-settings:'FILL' 1;">check_circle</span>
+      <div>
+        <p class="text-sm font-semibold" style="color:#047857;">Session Active</p>
+        <p class="text-on-surface-variant text-xs mt-0.5">Continuous authentication is monitoring your session.</p>
+      </div>
+    </div>
+    <div class="text-right">
+      <p class="text-on-surface-variant text-[10px] uppercase tracking-widest font-bold">Last verified</p>
+      <p class="text-on-surface text-sm font-mono">12s ago</p>
+    </div>
+  </div>
+
+  <!-- Action cards row -->
+  <div class="grid md:grid-cols-2 gap-6">
+
+    <!-- Profile / Account -->
+    <div class="rounded-xl p-6"
+         style="background:var(--color-surface-container-lowest);border:1px solid color-mix(in srgb,var(--color-outline-variant) 15%,transparent);box-shadow:0 32px 64px -12px rgba(20,27,43,0.06);">
+      <h2 class="text-on-surface font-semibold mb-1 flex items-center gap-2">
+        <span class="material-symbols-outlined text-base text-primary">manage_accounts</span>
+        Profile &amp; Account
+      </h2>
+      <p class="text-on-surface-variant text-xs mb-4">Strong re-auth required (keystroke + voice).</p>
+      <div class="space-y-2">
+        <button class="w-full text-left text-sm px-4 py-3 rounded-lg flex items-center gap-3 transition-colors hover:brightness-95"
+                style="background:var(--color-surface-container-low);color:var(--color-on-surface);">
+          <span class="material-symbols-outlined text-base text-primary">key</span>
+          Change password
+          <span class="ml-auto material-symbols-outlined text-base" style="color:var(--color-outline);">chevron_right</span>
+        </button>
+        <button class="w-full text-left text-sm px-4 py-3 rounded-lg flex items-center gap-3 transition-colors hover:brightness-95"
+                style="background:var(--color-surface-container-low);color:var(--color-on-surface);">
+          <span class="material-symbols-outlined text-base text-primary">help</span>
+          Update security question
+          <span class="ml-auto material-symbols-outlined text-base" style="color:var(--color-outline);">chevron_right</span>
+        </button>
+        <button class="w-full text-left text-sm px-4 py-3 rounded-lg flex items-center gap-3 transition-colors hover:brightness-95"
+                style="background:var(--color-surface-container-low);color:var(--color-on-surface);">
+          <span class="material-symbols-outlined text-base text-primary">mic</span>
+          Re-record voice sample
+          <span class="ml-auto material-symbols-outlined text-base" style="color:var(--color-outline);">chevron_right</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Sensitive info -->
+    <div class="rounded-xl p-6"
+         style="background:var(--color-surface-container-lowest);border:1px solid color-mix(in srgb,var(--color-outline-variant) 15%,transparent);box-shadow:0 32px 64px -12px rgba(20,27,43,0.06);">
+      <h2 class="text-on-surface font-semibold mb-1 flex items-center gap-2">
+        <span class="material-symbols-outlined text-base text-primary">visibility</span>
+        Sensitive Info
+      </h2>
+      <p class="text-on-surface-variant text-xs mb-4">Light re-auth (keystroke only).</p>
+      <div class="space-y-2">
+        <button class="w-full text-left text-sm px-4 py-3 rounded-lg flex items-center gap-3 transition-colors hover:brightness-95"
+                style="background:var(--color-surface-container-low);color:var(--color-on-surface);">
+          <span class="material-symbols-outlined text-base text-primary">vpn_key</span>
+          Show my enrolled phrase
+          <span class="ml-auto material-symbols-outlined text-base" style="color:var(--color-outline);">chevron_right</span>
+        </button>
+        <button class="w-full text-left text-sm px-4 py-3 rounded-lg flex items-center gap-3 transition-colors hover:brightness-95"
+                style="background:var(--color-surface-container-low);color:var(--color-on-surface);">
+          <span class="material-symbols-outlined text-base text-primary">history</span>
+          View full auth history
+          <span class="ml-auto material-symbols-outlined text-base" style="color:var(--color-outline);">chevron_right</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Auth history -->
+  <div class="rounded-xl p-6"
+       style="background:var(--color-surface-container-lowest);border:1px solid color-mix(in srgb,var(--color-outline-variant) 15%,transparent);box-shadow:0 32px 64px -12px rgba(20,27,43,0.06);">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-on-surface font-semibold flex items-center gap-2">
+        <span class="material-symbols-outlined text-base text-primary">analytics</span>
+        Recent Auth Events
+      </h2>
+      <button class="text-xs text-primary hover:underline font-semibold">Refresh</button>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead style="color:var(--color-on-surface-variant);">
+          <tr>
+            <th class="text-left py-2 font-medium">When</th>
+            <th class="text-left py-2 font-medium">Method</th>
+            <th class="text-left py-2 font-medium">Result</th>
+            <th class="text-left py-2 font-medium">Confidence</th>
+          </tr>
+        </thead>
+        <tbody class="font-mono text-on-surface">
+          <tr style="border-top:1px solid color-mix(in srgb,var(--color-outline-variant) 30%,transparent);">
+            <td class="py-2">2026-04-28 14:02</td>
+            <td class="py-2">keystroke + voice</td>
+            <td class="py-2" style="color:#059669;">granted</td>
+            <td class="py-2">94.3%</td>
+          </tr>
+          <tr style="border-top:1px solid color-mix(in srgb,var(--color-outline-variant) 30%,transparent);">
+            <td class="py-2">2026-04-28 13:48</td>
+            <td class="py-2">keystroke</td>
+            <td class="py-2" style="color:#059669;">granted</td>
+            <td class="py-2">87.1%</td>
+          </tr>
+          <tr style="border-top:1px solid color-mix(in srgb,var(--color-outline-variant) 30%,transparent);">
+            <td class="py-2">2026-04-28 13:21</td>
+            <td class="py-2">keystroke</td>
+            <td class="py-2" style="color:#b56300;">uncertain → fusion</td>
+            <td class="py-2">68.5%</td>
+          </tr>
+          <tr style="border-top:1px solid color-mix(in srgb,var(--color-outline-variant) 30%,transparent);">
+            <td class="py-2">2026-04-28 11:05</td>
+            <td class="py-2">keystroke</td>
+            <td class="py-2" style="color:var(--color-error);">denied</td>
+            <td class="py-2">42.1%</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Bottom row: tunnel pill + logout -->
+  <div class="flex items-center justify-between gap-4">
+    <div class="flex items-center gap-3 py-3 px-4 rounded-full border"
+         style="background:var(--color-surface-container-lowest);border-color:color-mix(in srgb,var(--color-outline-variant) 30%,transparent);">
+      <div class="w-2 h-2 rounded-full animate-pulse" style="background:var(--color-primary);"></div>
+      <span class="text-[10px] uppercase tracking-widest font-bold text-on-surface-variant">Encrypted Biometric Tunnel Active</span>
+    </div>
+    <button class="px-5 py-2.5 font-semibold text-sm rounded-lg flex items-center gap-2 transition-all hover:opacity-90 active:scale-[0.98]"
+            style="background:var(--color-error-container);color:var(--color-on-error-container);">
+      <span class="material-symbols-outlined text-base">logout</span>
+      Logout
+    </button>
+  </div>
+
+  <p class="text-center text-xs text-on-surface-variant pt-2">
+    Multimodal Auth v1.0 · Identity Verification Protocol
+  </p>
+</div>
+</main>
+
+</div><!-- /dash-mockup-view -->
+
+<script>
+  const buttons = document.querySelectorAll('.topbar button[data-page]');
+  const frame = document.getElementById('frame');
+  const frameView = document.getElementById('frame-view');
+  const mockupView = document.getElementById('mockup-view');
+  const dashMockupView = document.getElementById('dash-mockup-view');
+  const mockBtn = document.getElementById('mock-btn');
+  const dashMockBtn = document.getElementById('dash-mock-btn');
+
+  function setActive(btn) {
+    document.querySelectorAll('.topbar button').forEach(b => b.classList.remove('active'));
+    if (btn) btn.classList.add('active');
+  }
+  function showFrame() {
+    frameView.classList.remove('hide');
+    mockupView.classList.remove('show');
+    dashMockupView.classList.remove('show');
+  }
+  function showMockup() {
+    frameView.classList.add('hide');
+    mockupView.classList.add('show');
+    dashMockupView.classList.remove('show');
+  }
+  function showDashMockup() {
+    frameView.classList.add('hide');
+    mockupView.classList.remove('show');
+    dashMockupView.classList.add('show');
+  }
+
+  buttons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      frame.src = btn.dataset.page;
+      setActive(btn); showFrame();
+      localStorage.setItem('previewPage', btn.dataset.page);
+      localStorage.setItem('previewMode', 'frame');
+    });
+  });
+
+  mockBtn.addEventListener('click', () => {
+    setActive(mockBtn); showMockup();
+    localStorage.setItem('previewMode', 'mockup');
+  });
+
+  dashMockBtn.addEventListener('click', () => {
+    setActive(dashMockBtn); showDashMockup();
+    localStorage.setItem('previewMode', 'dash-mockup');
+  });
+
+  // Restore last view
+  const mode = localStorage.getItem('previewMode');
+  if (mode === 'mockup') {
+    setActive(mockBtn); showMockup();
+  } else if (mode === 'dash-mockup') {
+    setActive(dashMockBtn); showDashMockup();
+  } else {
+    const last = localStorage.getItem('previewPage');
+    const match = last ? [...buttons].find(b => b.dataset.page === last) : null;
+    if (match) frame.src = last;
+    setActive(match || buttons[0]);
+  }
+
+  // Mock live-analysis (only drives WPM/Consistency now; progress = attempts)
+  const TARGET_ATTEMPTS = 5;
+  let attemptsDone = 0;
+  function renderProgress() {
+    const pct = Math.round((attemptsDone / TARGET_ATTEMPTS) * 100);
+    document.getElementById('ks-pct').textContent = pct + '%';
+    document.getElementById('ks-bar').style.width = pct + '%';
+    const next = Math.min(attemptsDone + 1, TARGET_ATTEMPTS);
+    document.getElementById('ks-attempt-label').textContent =
+      attemptsDone >= TARGET_ATTEMPTS ? `Complete (${TARGET_ATTEMPTS} of ${TARGET_ATTEMPTS})`
+                                      : `Attempt ${next} of ${TARGET_ATTEMPTS}`;
+  }
+  function mockSetAttempt(n) {
+    attemptsDone = Math.max(0, Math.min(TARGET_ATTEMPTS, n));
+    renderProgress();
+  }
+  function mockSubmitAttempt() {
+    if (attemptsDone < TARGET_ATTEMPTS) attemptsDone++;
+    renderProgress();
+    const inp = document.getElementById('ks-input');
+    inp.value = '';
+    flightTimes.length = 0;
+    renderFlightBars();
+    inp.focus();
+  }
+
+  // ── Flight Time Profile (live) ─────────────────────────────────────
+  const FLIGHT_WINDOW = 7;
+  const FLIGHT_MAX_MS = 350;     // 350ms maps to full bar height
+  const flightTimes = [];
+  let lastReleaseTs = 0;
+
+  function renderFlightBars() {
+    const bars = document.querySelectorAll('#ks-flight-bars .ks-flight-bar');
+    // Right-align newest: pad with empty slots on the left
+    const padding = FLIGHT_WINDOW - flightTimes.length;
+    bars.forEach((bar, i) => {
+      const idx = i - padding;
+      if (idx < 0) {
+        bar.style.height     = '8%';
+        bar.style.background = 'color-mix(in srgb,var(--color-primary-container) 35%,transparent)';
+      } else {
+        const ms = flightTimes[idx];
+        const h  = Math.min(100, Math.max(12, (ms / FLIGHT_MAX_MS) * 100));
+        const isNewest = idx === flightTimes.length - 1;
+        bar.style.height     = h + '%';
+        bar.style.background = isNewest
+          ? 'var(--color-primary-container)'
+          : 'color-mix(in srgb,var(--color-primary-container) 60%,transparent)';
+      }
+    });
+    const avgEl = document.getElementById('ks-flight-avg');
+    if (flightTimes.length === 0) {
+      avgEl.textContent = 'avg —';
+    } else {
+      const avg = Math.round(flightTimes.reduce((a,b)=>a+b,0) / flightTimes.length);
+      avgEl.textContent = `avg ${avg} ms`;
+    }
+  }
+  // Listen on the input for keyup → flight = now - lastReleaseTs
+  document.getElementById('ks-input').addEventListener('keyup', (e) => {
+    if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
+    const now = performance.now();
+    if (lastReleaseTs > 0) {
+      const ft = now - lastReleaseTs;
+      if (ft > 30 && ft < 2000) {     // ignore noise
+        flightTimes.push(ft);
+        if (flightTimes.length > FLIGHT_WINDOW) flightTimes.shift();
+        renderFlightBars();
+      }
+    }
+    lastReleaseTs = now;
+  });
+  // Status pill state machine
+  const TARGET_PHRASE = "green river silent maple";
+  function setPill(state) {
+    const pill = document.getElementById('ks-pill');
+    const dot  = document.getElementById('ks-pill-dot');
+    const text = document.getElementById('ks-pill-text');
+    pill.classList.remove('animate-pulse');
+    if (state === 'idle') {
+      pill.style.background = 'var(--color-surface-container-highest)';
+      pill.style.color      = 'var(--color-on-surface-variant)';
+      dot.style.background  = 'var(--color-outline)';
+      text.textContent      = '⏎ Auto-submits when phrase matches';
+    } else if (state === 'typing') {
+      pill.style.background = 'color-mix(in srgb, var(--color-primary-container) 18%, transparent)';
+      pill.style.color      = 'var(--color-primary)';
+      dot.style.background  = 'var(--color-primary-container)';
+      text.textContent      = 'Capturing keystrokes…';
+      pill.classList.add('animate-pulse');
+    } else if (state === 'mismatch') {
+      pill.style.background = 'rgba(217,119,6,0.15)';
+      pill.style.color      = '#b45309';
+      dot.style.background  = '#d97706';
+      text.textContent      = "Keep typing — phrase doesn't match yet";
+    } else if (state === 'captured') {
+      pill.style.background = 'rgba(16,185,129,0.18)';
+      pill.style.color      = '#047857';
+      dot.style.background  = '#10b981';
+      text.textContent      = '✓ Captured';
+    }
+  }
+
+  function mockUpdate() {
+    const inp = document.getElementById('ks-input');
+    const v   = inp.value;
+
+    // Live Analysis flavor
+    const wpm = Math.min(80, Math.round(v.length * 1.5));
+    document.getElementById('ks-wpm').textContent = wpm + ' WPM';
+    document.getElementById('ks-speed-bar').style.width = Math.min(100, wpm * 1.25) + '%';
+
+    // Consistency = derived from flight-time variance (lower CV → higher consistency)
+    const consEl    = document.getElementById('ks-cons');
+    const consBarEl = document.getElementById('ks-cons-bar');
+    if (flightTimes.length < 3) {
+      consEl.textContent = '—';
+      consBarEl.style.width = '0%';
+    } else {
+      const mean = flightTimes.reduce((a,b)=>a+b,0) / flightTimes.length;
+      const sd   = Math.sqrt(flightTimes.reduce((s,x)=>s+(x-mean)**2,0) / flightTimes.length);
+      const cv   = sd / mean;                 // 0 = perfect, ~1 = chaotic
+      const cons = Math.max(0, Math.min(100, Math.round((1 - cv) * 100)));
+      consEl.textContent =
+        cons >= 80 ? '✓ Excellent' :
+        cons >= 65 ? '✓ Good'      :
+        cons >= 45 ? '~ Fair'      : '± Varies';
+      consBarEl.style.width = cons + '%';
+    }
+
+    // Pill state
+    if (v.length === 0) { setPill('idle'); return; }
+    if (v === TARGET_PHRASE) {
+      setPill('captured');
+      inp.readOnly = true;                       // brief lock; readOnly keeps focus (disabled drops it)
+      setTimeout(() => {
+        inp.readOnly = false;
+        mockSubmitAttempt();                     // clears + refocuses
+        setPill('idle');
+      }, 600);
+      return;
+    }
+    // Mismatch detection: any divergence from the target prefix
+    if (!TARGET_PHRASE.startsWith(v) && v.length >= TARGET_PHRASE.length - 2) {
+      setPill('mismatch');
+    } else {
+      setPill('typing');
+    }
+  }
+
+  setPill('idle');
+  renderProgress();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,11 @@
+algorithm,threshold,far_at_thr,frr_at_thr,n_genuine,n_impostor
+RandomForest,0.5500,0.0000,0.5328,244,4880
+RandomForest,0.8000,0.0000,0.7377,244,4880
+GradientBoosting,0.5500,0.0000,0.2172,244,4880
+GradientBoosting,0.8000,0.0000,0.2213,244,4880
+kNN_Manhattan,0.5500,0.0037,0.3238,244,4880
+kNN_Manhattan,0.8000,0.0010,0.4795,244,4880
+LogReg,0.5500,0.0004,0.4016,244,4880
+LogReg,0.8000,0.0000,0.6475,244,4880
+ProfileMatcher_GP,0.5500,0.0000,1.0000,244,4880
+ProfileMatcher_GP,0.8000,0.0000,1.0000,244,4880

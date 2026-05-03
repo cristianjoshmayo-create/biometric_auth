@@ -187,7 +187,31 @@ async function submitKeystrokeAuth() {
 
 
 // ── Step 2: Voice Auth ────────────────────────────────────
-function moveToVoiceAuth() {
+
+// Fetch a fresh server-issued challenge (random word order) and update the
+// voice-prompt display. The backend pops the issued challenge on every
+// /auth/voice POST, so retries MUST refetch — otherwise the server falls back
+// to the canonical stored phrase order while the UI still shows the prior
+// random order, causing a guaranteed mismatch.
+async function refreshVoiceChallenge() {
+    const voicePrompts = document.querySelectorAll("#voice-section .phrase-display");
+    const priorTexts = Array.from(voicePrompts).map(el => el.textContent);
+    voicePrompts.forEach(el => { el.textContent = "Loading prompt…"; });
+    try {
+        const res = await Api.getVoiceChallenge(authUsername);
+        const challenge = res && res.challenge ? res.challenge : "";
+        if (challenge) {
+            voicePrompts.forEach(el => { el.textContent = challenge; });
+        } else {
+            voicePrompts.forEach((el, i) => { el.textContent = priorTexts[i] || ""; });
+        }
+    } catch (e) {
+        console.warn("Could not fetch voice challenge:", e);
+        voicePrompts.forEach((el, i) => { el.textContent = priorTexts[i] || ""; });
+    }
+}
+
+async function moveToVoiceAuth() {
     hideAllSections();
     document.getElementById("step-indicator").classList.remove("hidden");
     document.getElementById("voice-section").classList.remove("hidden");
@@ -196,6 +220,8 @@ function moveToVoiceAuth() {
     document.getElementById("dot-voice")
         .classList.replace("bg-gray-700", "bg-purple-600");
     document.getElementById("line-1").style.width = "100%";
+
+    await refreshVoiceChallenge();
 }
 
 function startVoiceAuth() {
@@ -206,6 +232,9 @@ function startVoiceAuth() {
 
 // Resets the voice step so the user can try a fresh recording
 function resetVoiceAuth() {
+    // Refresh the challenge so the displayed prompt matches what the server
+    // will check on the next /auth/voice POST (each POST pops the prior one).
+    refreshVoiceChallenge();
     SpeechCapture.reset().then(() => {
         const btn      = document.getElementById("record-btn");
         const tryAgain = document.getElementById("try-again-btn");
@@ -238,6 +267,21 @@ async function onVoiceAuthComplete(fullFeatureDict) {
     try {
         const result = await Api.verifyVoice(authUsername, fullFeatureDict);
 
+        // Server's issued challenge wasn't found (TTL expired, server reload,
+        // or already popped). Don't count this as a failed attempt — refetch
+        // a fresh challenge and have the user try again. Without this branch
+        // the server used to silently fall back to the canonical phrase
+        // order, so the displayed prompt and the server-checked phrase would
+        // diverge and legit users could never succeed on that session.
+        if (result.result === "challenge_expired") {
+            status.textContent = "⚠ Voice prompt expired — please record again.";
+            status.className   = "text-center text-sm mb-4 text-yellow-400";
+            if (btn) { btn.disabled = false; btn.textContent = "🎤 Try Again"; btn.onclick = resetVoiceAuth; }
+            if (tryAgain) tryAgain.disabled = false;
+            refreshVoiceChallenge();
+            return;
+        }
+
         _voiceScore  = typeof result.confidence === "number" ? result.confidence : 0.0;
         _voicePassed = result.authenticated === true;
 
@@ -245,8 +289,11 @@ async function onVoiceAuthComplete(fullFeatureDict) {
         if (!_voicePassed && result.phrase_error) {
             status.textContent = `❌ ${result.phrase_error}`;
             status.className   = "text-center text-sm mb-4 text-red-400";
-            if (btn) { btn.disabled = false; btn.textContent = "🎤 Try Again"; }
+            if (btn) { btn.disabled = false; btn.textContent = "🎤 Try Again"; btn.onclick = resetVoiceAuth; }
             if (tryAgain) tryAgain.disabled = false;
+            // Server already popped the previous challenge — refresh so the
+            // displayed prompt matches what the next /auth/voice will check.
+            refreshVoiceChallenge();
             return;
         }
 
@@ -282,8 +329,9 @@ async function onVoiceAuthComplete(fullFeatureDict) {
         console.error(err);
         status.textContent = "❌ Server error. Try again.";
         status.className   = "text-center text-sm mb-4 text-red-400";
-        if (btn) { btn.disabled = false; btn.textContent = "🎤 Try Again"; }
+        if (btn) { btn.disabled = false; btn.textContent = "🎤 Try Again"; btn.onclick = resetVoiceAuth; }
         if (tryAgain) tryAgain.disabled = false;
+        refreshVoiceChallenge();
     }
 }
 
@@ -297,6 +345,10 @@ async function moveToSecurityAuth() {
     // Hide ALL sections cleanly — prevents voice UI bleeding into security section
     hideAllSections();
     document.getElementById("security-section").classList.remove("hidden");
+
+    const _sqInput = document.getElementById("security-answer-input");
+    _sqInput.value = "";
+    setTimeout(() => { _sqInput.value = ""; }, 50);
 
     document.getElementById("dot-security")
         .classList.replace("bg-gray-700", "bg-purple-600");
@@ -328,17 +380,14 @@ async function submitSecurityAuth() {
         const result = await Api.verifySecurityQuestion(authUsername, answer, _ksScore);
 
         if (result.authenticated) {
-            // Injury fallback: grant only if voice passed AND keystroke was
-            // above the hard-veto floor (0.45). A sub-0.45 ks means a
-            // different person typed — that's not a hand injury, that's a
-            // split-modality attack, and we must not let the security Q
-            // rescue it. Must stay in sync with KS_HARD_VETO in routers/auth.py.
-            const KS_HARD_VETO = 0.45;
-            const ksAboveVeto  = typeof _ksScore === "number" && _ksScore >= KS_HARD_VETO;
+            // Injury exemption: voice already passed this session but
+            // keystroke failed → typing is affected, voice isn't, so grant
+            // directly. Any other case → re-authenticate with keystroke + voice.
+            const injuryExempt = _voicePassed && !_ksPassed;
 
-            if (_voicePassed && ksAboveVeto) {
+            if (injuryExempt) {
                 status.textContent =
-                    `✅ Identity confirmed (voice biometric verified).`;
+                    `✅ Identity confirmed (injury fallback — voice biometric verified).`;
                 status.className = "text-center text-sm mb-4 text-green-400";
                 setTimeout(() => {
                     showSuccess("Security Question + Voice Biometric", _voiceScore);
@@ -346,10 +395,8 @@ async function submitSecurityAuth() {
                 return;
             }
 
-            // Either voice didn't pass, or keystroke was below the hard-veto
-            // floor (impostor typing pattern). Require full biometric re-auth.
             status.textContent =
-                "✅ Identity confirmed, but biometric verification must complete. Please re-authenticate.";
+                "✅ Identity confirmed. Please re-authenticate with keystroke and voice.";
             status.className = "text-center text-sm mb-4 text-yellow-400";
 
             _ksScore     = null;

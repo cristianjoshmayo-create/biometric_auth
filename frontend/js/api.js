@@ -119,6 +119,11 @@ const Api = {
         return res.json();
     },
 
+    async getVoiceChallenge(email) {
+        const res = await fetch(`${API_BASE}/auth/voice-challenge/${encodeURIComponent(email)}`);
+        return res.json();
+    },
+
     async getSecurityQuestion(username, password) {
         const res = await fetch(`${API_BASE}/auth/security-question`, {
             method:  "POST",

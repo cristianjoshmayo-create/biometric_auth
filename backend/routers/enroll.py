@@ -24,6 +24,9 @@ from database.models import User, KeystrokeTemplate, VoiceTemplate, SecurityQues
 from schemas import VoiceFeatures
 from utils.crypto import encrypt
 from utils.email_sender import send_verification_email
+from utils.debug_logger import get_logger
+
+_audio_log = get_logger("audio.quality")
 import threading
 import sys
 
@@ -899,14 +902,20 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         snr_db = _estimate_snr(audio, sr)
         print(f"Estimated SNR: {snr_db:.1f} dB")
 
-        # Lowered to 4dB — RNNoise on the frontend already cleaned the audio
-        # before it arrives here, so the SNR we measure is post-denoising.
-        # A 6dB gate on already-cleaned audio was rejecting legitimate users.
-        if snr_db < 4.0:
+        SNR_GATE_DB = 4.0
+        if snr_db < SNR_GATE_DB:
+            _audio_log.info(
+                f"snr_gate -> rejected (snr={snr_db:.2f}dB)",
+                extra={"stage": "audio.quality", "user": username_for_azure or "-",
+                       "extra_data": {"snr_db": round(float(snr_db), 2),
+                                      "gate_db": SNR_GATE_DB,
+                                      "duration_s": round(float(total_duration), 2),
+                                      "decision": "rejected_snr"}},
+            )
             return {
                 "success": False,
                 "detail":  (
-                    f"Audio too noisy (SNR={snr_db:.1f}dB, need ≥4dB). "
+                    f"Audio too noisy (SNR={snr_db:.1f}dB, need ≥{SNR_GATE_DB:.0f}dB). "
                     "Move away from fans or loud speakers and try again."
                 ),
                 "snr_db": snr_db,
@@ -926,6 +935,15 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
         total_energy  = float(np.sum(fft_mag ** 2))
         speech_ratio  = speech_energy / total_energy if total_energy > 0 else 0.0
         print(f"Speech band ratio: {speech_ratio:.2f} (need ≥0.25)")
+        _audio_log.info(
+            f"audio_quality (snr={snr_db:.2f}dB speech_ratio={speech_ratio:.2f})",
+            extra={"stage": "audio.quality", "user": username_for_azure or "-",
+                   "extra_data": {"snr_db": round(float(snr_db), 2),
+                                  "speech_ratio": round(float(speech_ratio), 3),
+                                  "duration_s": round(float(total_duration), 2),
+                                  "gate_db": SNR_GATE_DB,
+                                  "decision": ("rejected_speech_ratio" if speech_ratio < 0.25 else "accepted")}},
+        )
         if speech_ratio < 0.25:
             return {
                 "success": False,
@@ -1207,8 +1225,28 @@ async def extract_mfcc(payload: AudioData, db: Session = Depends(get_db)):
             if _wmodel is None:
                 print("  ⚠  faster-whisper not installed — run: pip install faster-whisper")
             else:
+                # Tuning for short 4-word passphrases:
+                #  • vad_filter=True  → uses Silero VAD to trim leading/trailing
+                #    silence, fixes cases where soft endings get cut ("storm
+                #    weird local grand" → "storm lock").
+                #  • temperature=0.0 (single value, no fallback list) disables
+                #    the temperature-fallback path that triggers hallucinations
+                #    on borderline log-prob ("storm weird" → "Starwood").
+                #  • condition_on_previous_text=False → fresh decoder state per
+                #    request; no cross-utterance contamination.
+                #  • no_speech_threshold lowered (0.6→0.45) and
+                #    compression_ratio_threshold tightened (2.4→2.0) so noisy
+                #    or repetitive output is rejected rather than emitted.
                 _segments, _info = _wmodel.transcribe(
-                    wav_path, language="en", beam_size=5
+                    wav_path,
+                    language="en",
+                    beam_size=5,
+                    temperature=0.0,
+                    vad_filter=True,
+                    vad_parameters={"min_silence_duration_ms": 200},
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.45,
+                    compression_ratio_threshold=2.0,
                 )
                 transcript = " ".join(seg.text for seg in _segments).strip()
                 print(f"  Whisper transcript: '{transcript}'")

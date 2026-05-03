@@ -1,0 +1,3 @@
+algorithm,n_speakers,mean_eer,std_eer,mean_auc
+ECAPA + Cosine,40,0.0004,0.0028,0.9999
+MFCC + Cosine,40,0.0471,0.0532,0.9837

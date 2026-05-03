@@ -1,0 +1,14 @@
+metric,value,notes
+n_genuine_pairs,224,
+n_impostor_pairs,3584,
+n_users,17,
+as_deployed_FAR,0.000000,"impostors granted by production rule (thresholds 0.55/0.80, /fuse case A T=0.58, B T=0.65)"
+as_deployed_FRR,0.441964,genuine denied by production rule
+parametric_EER,0.209821,"sweep on max(ks, 0.45*ks+0.55*voice) with floors/veto enforced"
+parametric_FAR_at_EER,0.000000,
+parametric_FRR_at_EER,0.419643,
+parametric_AUC,0.790179,
+always_fused_EER,0.000419,"baseline: 0.45*ks+0.55*voice, no routing"
+always_fused_FAR_at_EER,0.000837,
+always_fused_FRR_at_EER,0.000000,
+always_fused_AUC,0.999988,

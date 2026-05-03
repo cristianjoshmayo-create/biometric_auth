@@ -1,0 +1,7 @@
+algorithm,dataset,n_trials,auc,eer
+RandomForest,internal,16200,1.0000,0.0000
+RandomForest,CMU,17850,0.9923,0.0442
+ProfileMatcher_GP,internal,16200,0.9993,0.0109
+ProfileMatcher_GP,CMU,17850,0.9852,0.0622
+ECAPA,internal,1904,0.9999,0.0067
+ECAPA,LibriSpeech,16000,0.9999,0.0019
